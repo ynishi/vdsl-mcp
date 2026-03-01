@@ -3148,6 +3148,48 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // --- preflight request tests ---
+
+    #[test]
+    fn preflight_request_full() {
+        let req: VdslPreflightRequest = serde_json::from_str(
+            r#"{"script_file":"gen.lua","working_dir":"/home/user/vdsl","url":"https://example.com","pod_id":"pod_abc","preflight_script":"scripts/custom_preflight.lua"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.script_file, "gen.lua");
+        assert_eq!(req.working_dir, "/home/user/vdsl");
+        assert_eq!(req.url.as_deref(), Some("https://example.com"));
+        assert_eq!(req.pod_id.as_deref(), Some("pod_abc"));
+        assert_eq!(
+            req.preflight_script.as_deref(),
+            Some("scripts/custom_preflight.lua")
+        );
+    }
+
+    #[test]
+    fn preflight_request_minimal() {
+        let req: VdslPreflightRequest =
+            serde_json::from_str(r#"{"script_file":"gen.lua","working_dir":"/home/user/vdsl"}"#)
+                .unwrap();
+        assert_eq!(req.script_file, "gen.lua");
+        assert_eq!(req.working_dir, "/home/user/vdsl");
+        assert!(req.url.is_none());
+        assert!(req.pod_id.is_none());
+        assert!(req.preflight_script.is_none());
+    }
+
+    #[test]
+    fn preflight_request_missing_required() {
+        assert!(serde_json::from_str::<VdslPreflightRequest>(r#"{}"#).is_err());
+        assert!(
+            serde_json::from_str::<VdslPreflightRequest>(r#"{"script_file":"gen.lua"}"#).is_err()
+        );
+        assert!(serde_json::from_str::<VdslPreflightRequest>(
+            r#"{"working_dir":"/home/user/vdsl"}"#
+        )
+        .is_err());
+    }
+
     // --- comfy_api request tests ---
 
     #[test]
