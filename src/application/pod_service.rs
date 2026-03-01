@@ -33,6 +33,11 @@ impl PodService {
         self.cli.delete_pod(pod_id).await.map_err(AppError::from)
     }
 
+    /// Create a new pod from spec JSON.
+    pub async fn create_pod(&self, spec_json: &str) -> Result<serde_json::Value, AppError> {
+        self.cli.create_pod(spec_json).await.map_err(AppError::from)
+    }
+
     /// List network volumes.
     pub async fn list_volumes(&self) -> Result<Vec<serde_json::Value>, AppError> {
         self.cli.list_volumes().await.map_err(AppError::from)

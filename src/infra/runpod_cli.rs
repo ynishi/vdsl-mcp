@@ -77,6 +77,13 @@ impl RunPodCli {
         self.exec(&["pods", "delete-pod", pod_id]).await
     }
 
+    /// Create a new pod.
+    ///
+    /// Equivalent to Lua `M.create_pod(spec, opts)` in runpod.lua L521-546.
+    pub async fn create_pod(&self, spec_json: &str) -> Result<serde_json::Value, DomainError> {
+        self.exec(&["pods", "create-pod", "-j", spec_json]).await
+    }
+
     /// List network volumes.
     ///
     /// Equivalent to Lua `M.volumes(opts)` in runpod.lua L626-633.

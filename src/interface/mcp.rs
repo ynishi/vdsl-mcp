@@ -148,6 +148,30 @@ pub struct VdslConnectRequest {
     pub pod_id: Option<String>,
 }
 
+/// Default spec for ComfyUI pods on RunPod.
+/// Matches Lua `M.COMFY_DEFAULTS` in runpod.lua L36-41.
+const COMFY_DEFAULTS_NAME: &str = "comfyui-vdsl";
+const COMFY_DEFAULTS_TEMPLATE: &str = "cw3nka7d08";
+const COMFY_DEFAULTS_DISK: u32 = 30;
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslPodCreateRequest {
+    /// Network volume ID to attach (from vdsl_volume_list).
+    pub volume_id: String,
+
+    /// GPU type (e.g. "NVIDIA A40", "NVIDIA L4"). Can be a single type or comma-separated list.
+    pub gpu: Option<String>,
+
+    /// Pod name (default: "comfyui-vdsl").
+    pub name: Option<String>,
+
+    /// Datacenter ID (e.g. "EU-SE-1"). Can be a single ID or comma-separated list.
+    pub datacenter: Option<String>,
+
+    /// Container disk size in GB (default: 30).
+    pub disk_gb: Option<u32>,
+}
+
 // =============================================================================
 // Tool implementations
 // =============================================================================
@@ -211,6 +235,72 @@ impl VdslMcpServer {
         let result = svc.stop_pod(&req.pod_id).await.map_err(Self::to_mcp_error)?;
         let output = serde_json::to_string_pretty(&result)
             .unwrap_or_else(|_| format!("{result:?}"));
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    #[tool(
+        name = "vdsl_pod_create",
+        description = "Create a new ComfyUI pod on RunPod. Requires a network volume ID (from vdsl_volume_list). Applies ComfyUI defaults (template, ports, disk) automatically.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn pod_create(
+        &self,
+        Parameters(req): Parameters<VdslPodCreateRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut spec = serde_json::Map::new();
+        spec.insert(
+            "name".into(),
+            serde_json::Value::String(
+                req.name.unwrap_or_else(|| COMFY_DEFAULTS_NAME.to_string()),
+            ),
+        );
+        spec.insert(
+            "templateId".into(),
+            serde_json::Value::String(COMFY_DEFAULTS_TEMPLATE.to_string()),
+        );
+        spec.insert(
+            "containerDiskInGb".into(),
+            serde_json::Value::Number(req.disk_gb.unwrap_or(COMFY_DEFAULTS_DISK).into()),
+        );
+        spec.insert(
+            "ports".into(),
+            serde_json::json!(["8188/http", "22/tcp"]),
+        );
+        spec.insert(
+            "networkVolumeId".into(),
+            serde_json::Value::String(req.volume_id),
+        );
+
+        if let Some(gpu) = req.gpu {
+            let gpu_list: Vec<serde_json::Value> = gpu
+                .split(',')
+                .map(|s| serde_json::Value::String(s.trim().to_string()))
+                .collect();
+            spec.insert("gpuTypeIds".into(), serde_json::Value::Array(gpu_list));
+        }
+
+        if let Some(dc) = req.datacenter {
+            let dc_list: Vec<serde_json::Value> = dc
+                .split(',')
+                .map(|s| serde_json::Value::String(s.trim().to_string()))
+                .collect();
+            spec.insert("dataCenterIds".into(), serde_json::Value::Array(dc_list));
+        }
+
+        let spec_json = serde_json::to_string(&spec).map_err(Self::to_mcp_error)?;
+        let svc = Self::pod_service()?;
+        let result = svc.create_pod(&spec_json).await.map_err(Self::to_mcp_error)?;
+
+        let pod_id = result["id"].as_str().unwrap_or("?");
+        let pod_name = result["name"].as_str().unwrap_or("?");
+        let output = format!(
+            "Pod created: {pod_id} ({pod_name})\n\n{}",
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"))
+        );
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -345,5 +435,35 @@ mod tests {
         let req: VdslConnectRequest = serde_json::from_str("{}").unwrap();
         assert!(req.pod_id.is_none());
         assert!(req.url.is_none());
+    }
+
+    #[test]
+    fn pod_create_request_minimal() {
+        let req: VdslPodCreateRequest =
+            serde_json::from_str(r#"{"volume_id":"vol_001"}"#).unwrap();
+        assert_eq!(req.volume_id, "vol_001");
+        assert!(req.gpu.is_none());
+        assert!(req.name.is_none());
+        assert!(req.datacenter.is_none());
+        assert!(req.disk_gb.is_none());
+    }
+
+    #[test]
+    fn pod_create_request_full() {
+        let req: VdslPodCreateRequest = serde_json::from_str(
+            r#"{"volume_id":"vol_001","gpu":"NVIDIA A40","name":"my-pod","datacenter":"EU-SE-1","disk_gb":50}"#,
+        )
+        .unwrap();
+        assert_eq!(req.volume_id, "vol_001");
+        assert_eq!(req.gpu.as_deref(), Some("NVIDIA A40"));
+        assert_eq!(req.name.as_deref(), Some("my-pod"));
+        assert_eq!(req.datacenter.as_deref(), Some("EU-SE-1"));
+        assert_eq!(req.disk_gb, Some(50));
+    }
+
+    #[test]
+    fn pod_create_request_missing_volume() {
+        let result = serde_json::from_str::<VdslPodCreateRequest>("{}");
+        assert!(result.is_err());
     }
 }
