@@ -14,6 +14,7 @@ schemars = "1.2"
 thiserror = "2"
 anyhow = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "stream"] }
+urlencoding = "2"
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }

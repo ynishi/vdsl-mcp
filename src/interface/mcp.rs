@@ -373,6 +373,10 @@ pub struct VdslGenerateRequest {
 
     /// Timeout in seconds for waiting for completion (default: 300).
     pub timeout: Option<u64>,
+
+    /// Local directory to save output images. When specified, all generated images
+    /// are downloaded from the ComfyUI server to this directory after completion.
+    pub save_dir: Option<String>,
 }
 
 // =============================================================================
@@ -621,9 +625,7 @@ impl VdslMcpServer {
                     n => {
                         let list = format_volume_list(&volumes);
                         return Err(McpError::invalid_params(
-                            format!(
-                                "{n} volumes found — specify volume_id explicitly.\n\n{list}"
-                            ),
+                            format!("{n} volumes found — specify volume_id explicitly.\n\n{list}"),
                             None,
                         ));
                     }
@@ -699,7 +701,10 @@ impl VdslMcpServer {
             }
 
             let spec_json = serde_json::to_string(&spec).map_err(Self::to_mcp_error)?;
-            let result = svc.create_pod(&spec_json).await.map_err(Self::to_mcp_error)?;
+            let result = svc
+                .create_pod(&spec_json)
+                .await
+                .map_err(Self::to_mcp_error)?;
 
             pod_id = result["id"]
                 .as_str()
@@ -926,10 +931,7 @@ impl VdslMcpServer {
         let job_id = resp["id"]
             .as_str()
             .ok_or_else(|| {
-                McpError::internal_error(
-                    format!("download_add returned no job id: {resp:?}"),
-                    None,
-                )
+                McpError::internal_error(format!("download_add returned no job id: {resp:?}"), None)
             })?
             .to_string();
 
@@ -943,8 +945,8 @@ impl VdslMcpServer {
         }
 
         // --- 4. Poll for completion ---
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS);
         let interval = std::time::Duration::from_secs(DOWNLOAD_POLL_INTERVAL_SECS);
 
         let final_status = loop {
@@ -1056,17 +1058,13 @@ impl VdslMcpServer {
         let prompt_id = resp["prompt_id"]
             .as_str()
             .ok_or_else(|| {
-                McpError::internal_error(
-                    format!("no prompt_id in response: {resp}"),
-                    None,
-                )
+                McpError::internal_error(format!("no prompt_id in response: {resp}"), None)
             })?
             .to_string();
 
         // --- 3. Poll for completion ---
         let timeout = req.timeout.unwrap_or(GENERATE_TIMEOUT_SECS);
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
         let interval = std::time::Duration::from_secs(GENERATE_POLL_INTERVAL_SECS);
 
         let entry = loop {
@@ -1079,8 +1077,7 @@ impl VdslMcpServer {
                 if let Some(status) = entry.get("status") {
                     let completed = status["completed"].as_bool().unwrap_or(false);
                     if completed {
-                        let status_str =
-                            status["status_str"].as_str().unwrap_or("unknown");
+                        let status_str = status["status_str"].as_str().unwrap_or("unknown");
                         if status_str == "error" {
                             let mut msg = "ComfyUI execution error".to_string();
                             if let Some(messages) = status["messages"].as_array() {
@@ -1125,6 +1122,29 @@ impl VdslMcpServer {
             }
         }
 
+        // --- 5. Download images locally (if save_dir specified) ---
+        let mut download_log: Vec<String> = Vec::new();
+        if let Some(ref dir) = req.save_dir {
+            let save_path = std::path::Path::new(dir);
+            for img in &images {
+                let filename = match img["filename"].as_str() {
+                    Some(f) => f,
+                    None => continue,
+                };
+                let subfolder = img["subfolder"].as_str().unwrap_or("");
+                let dest = save_path.join(filename);
+
+                match client.download_image(filename, subfolder, &dest).await {
+                    Ok(size) => {
+                        download_log.push(format!("  saved: {} ({size} bytes)", dest.display()));
+                    }
+                    Err(e) => {
+                        download_log.push(format!("  FAILED: {} — {e}", dest.display()));
+                    }
+                }
+            }
+        }
+
         let image_summary: Vec<String> = images
             .iter()
             .enumerate()
@@ -1139,13 +1159,21 @@ impl VdslMcpServer {
             })
             .collect();
 
-        let output = format!(
-            "prompt_id: {prompt_id}\nserver: {url}\nimages: {}\n{}\n\n{}",
+        let mut output = format!(
+            "prompt_id: {prompt_id}\nserver: {url}\nimages: {}\n{}",
             images.len(),
             image_summary.join("\n"),
-            serde_json::to_string_pretty(&images)
-                .unwrap_or_else(|_| format!("{images:?}"))
         );
+
+        if !download_log.is_empty() {
+            output.push_str(&format!("\n\ndownloads:\n{}", download_log.join("\n")));
+        }
+
+        output.push_str(&format!(
+            "\n\n{}",
+            serde_json::to_string_pretty(&images).unwrap_or_else(|_| format!("{images:?}"))
+        ));
+
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 }
@@ -1345,8 +1373,7 @@ mod tests {
 
     #[test]
     fn pod_setup_request_volume_only() {
-        let req: VdslPodSetupRequest =
-            serde_json::from_str(r#"{"volume_id":"vol_abc"}"#).unwrap();
+        let req: VdslPodSetupRequest = serde_json::from_str(r#"{"volume_id":"vol_abc"}"#).unwrap();
         assert_eq!(req.volume_id.as_deref(), Some("vol_abc"));
         assert!(req.gpu.is_none());
     }
@@ -1379,9 +1406,7 @@ mod tests {
     #[test]
     fn download_request_missing_fields() {
         assert!(serde_json::from_str::<VdslDownloadRequest>("{}").is_err());
-        assert!(
-            serde_json::from_str::<VdslDownloadRequest>(r#"{"pod_id":"pod_abc"}"#).is_err()
-        );
+        assert!(serde_json::from_str::<VdslDownloadRequest>(r#"{"pod_id":"pod_abc"}"#).is_err());
     }
 
     // --- Source resolution tests ---
@@ -1429,8 +1454,11 @@ mod tests {
 
     #[test]
     fn resolve_source_url_with_query() {
-        let info = resolve_source("https://civitai.com/api/download/models/12345?type=Model", None)
-            .unwrap();
+        let info = resolve_source(
+            "https://civitai.com/api/download/models/12345?type=Model",
+            None,
+        )
+        .unwrap();
         assert_eq!(info.filename, "12345");
     }
 
@@ -1482,20 +1510,17 @@ mod tests {
 
     #[test]
     fn generate_request_with_file() {
-        let req: VdslGenerateRequest = serde_json::from_str(
-            r#"{"pod_id":"pod_abc","workflow_file":"/tmp/workflow.json"}"#,
-        )
-        .unwrap();
+        let req: VdslGenerateRequest =
+            serde_json::from_str(r#"{"pod_id":"pod_abc","workflow_file":"/tmp/workflow.json"}"#)
+                .unwrap();
         assert!(req.workflow.is_none());
         assert_eq!(req.workflow_file.as_deref(), Some("/tmp/workflow.json"));
     }
 
     #[test]
     fn generate_request_with_timeout() {
-        let req: VdslGenerateRequest = serde_json::from_str(
-            r#"{"pod_id":"pod_abc","workflow":{},"timeout":600}"#,
-        )
-        .unwrap();
+        let req: VdslGenerateRequest =
+            serde_json::from_str(r#"{"pod_id":"pod_abc","workflow":{},"timeout":600}"#).unwrap();
         assert_eq!(req.timeout, Some(600));
     }
 
@@ -1506,5 +1531,21 @@ mod tests {
         assert!(req.workflow.is_none());
         assert!(req.workflow_file.is_none());
         assert!(req.pod_id.is_none());
+        assert!(req.save_dir.is_none());
+    }
+
+    #[test]
+    fn generate_request_with_save_dir() {
+        let req: VdslGenerateRequest =
+            serde_json::from_str(r#"{"pod_id":"pod_abc","workflow":{},"save_dir":"/tmp/output"}"#)
+                .unwrap();
+        assert_eq!(req.save_dir.as_deref(), Some("/tmp/output"));
+    }
+
+    #[test]
+    fn generate_request_save_dir_defaults_none() {
+        let req: VdslGenerateRequest =
+            serde_json::from_str(r#"{"pod_id":"pod_abc","workflow":{}}"#).unwrap();
+        assert!(req.save_dir.is_none());
     }
 }

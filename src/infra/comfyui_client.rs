@@ -97,9 +97,10 @@ impl ComfyUiClient {
             req = req.bearer_auth(token);
         }
 
-        let resp = req.send().await.map_err(|e| {
-            DomainError::ComfyUiConnection(format!("failed to POST /prompt: {e}"))
-        })?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| DomainError::ComfyUiConnection(format!("failed to POST /prompt: {e}")))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -168,6 +169,56 @@ impl ComfyUiClient {
         resp.json()
             .await
             .map_err(|e| DomainError::ComfyUiConnection(format!("invalid JSON from upload: {e}")))
+    }
+
+    /// Download an output image from ComfyUI via `GET /view`.
+    ///
+    /// Fetches `/view?filename=...&subfolder=...&type=output` and saves raw bytes
+    /// to `dest_path`. Creates parent directories if needed.
+    pub async fn download_image(
+        &self,
+        filename: &str,
+        subfolder: &str,
+        dest_path: &Path,
+    ) -> Result<u64, DomainError> {
+        let mut url = format!(
+            "{}/view?filename={}&type=output",
+            self.base_url,
+            urlencoding::encode(filename),
+        );
+        if !subfolder.is_empty() {
+            url.push_str(&format!("&subfolder={}", urlencoding::encode(subfolder)));
+        }
+
+        let resp = self.get_request(&url).send().await.map_err(|e| {
+            DomainError::ComfyUiConnection(format!("failed to GET /view for {filename}: {e}"))
+        })?;
+
+        if !resp.status().is_success() {
+            return Err(DomainError::ComfyUiConnection(format!(
+                "GET /view returned HTTP {} for {filename}",
+                resp.status()
+            )));
+        }
+
+        let bytes = resp.bytes().await.map_err(|e| {
+            DomainError::ComfyUiConnection(format!("failed to read image bytes: {e}"))
+        })?;
+
+        if let Some(parent) = dest_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                DomainError::ComfyUiConnection(format!(
+                    "failed to create directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+
+        tokio::fs::write(dest_path, &bytes).await.map_err(|e| {
+            DomainError::ComfyUiConnection(format!("failed to write {}: {e}", dest_path.display()))
+        })?;
+
+        Ok(bytes.len() as u64)
     }
 
     pub fn base_url(&self) -> &str {
