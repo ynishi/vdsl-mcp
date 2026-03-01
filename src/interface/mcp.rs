@@ -21,6 +21,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::application::pod_service::{resolve_api_key, PodService};
+use crate::domain::models::{format_model_catalog, parse_model_catalog};
 use crate::domain::pod::{format_pod_list, format_volume_list};
 use crate::infra::comfyui_client::{proxy_url, ComfyUiClient};
 use crate::infra::runpod_cli::RunPodCli;
@@ -58,6 +59,16 @@ impl VdslMcpServer {
         let api_key = resolve_api_key().map_err(Self::to_mcp_error)?;
         let cli = RunPodCli::new(api_key);
         Ok(PodService::new(cli))
+    }
+
+    /// Resolve ComfyUI Bearer token from COMFYUI_TOKEN env var.
+    fn comfyui_token() -> Option<String> {
+        std::env::var("COMFYUI_TOKEN").ok().filter(|s| !s.is_empty())
+    }
+
+    /// Build a ComfyUiClient from URL, with env-based token auth.
+    fn comfyui_client(url: String) -> ComfyUiClient {
+        ComfyUiClient::new(url, Self::comfyui_token())
     }
 
     fn to_mcp_error(e: impl std::fmt::Display) -> McpError {
@@ -336,9 +347,9 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslConnectRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let url = match (req.pod_id, req.url) {
-            (Some(id), _) => proxy_url(&id, 8188),
-            (None, Some(u)) => u,
+        let url = match (req.pod_id.as_deref(), req.url.as_deref()) {
+            (Some(id), _) => proxy_url(id, 8188),
+            (None, Some(u)) => u.to_string(),
             (None, None) => {
                 return Err(McpError::invalid_params(
                     "either pod_id or url is required",
@@ -347,7 +358,7 @@ impl VdslMcpServer {
             }
         };
 
-        let client = ComfyUiClient::new(url.clone());
+        let client = Self::comfyui_client(url.clone());
         let stats = client.system_stats().await.map_err(Self::to_mcp_error)?;
 
         let output = format!(
@@ -374,6 +385,37 @@ impl VdslMcpServer {
         let result = svc.delete_pod(&req.pod_id).await.map_err(Self::to_mcp_error)?;
         let output = serde_json::to_string_pretty(&result)
             .unwrap_or_else(|_| format!("{result:?}"));
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    #[tool(
+        name = "vdsl_models",
+        description = "List available models (checkpoints, LoRAs, VAEs, ControlNets, upscalers) on a running ComfyUI instance. Requires a connection URL or pod ID.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn models(
+        &self,
+        Parameters(req): Parameters<VdslConnectRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let url = match (req.pod_id.as_deref(), req.url.as_deref()) {
+            (Some(id), _) => proxy_url(id, 8188),
+            (None, Some(u)) => u.to_string(),
+            (None, None) => {
+                return Err(McpError::invalid_params(
+                    "either pod_id or url is required",
+                    None,
+                ));
+            }
+        };
+
+        let client = Self::comfyui_client(url.clone());
+        let object_info = client.object_info().await.map_err(Self::to_mcp_error)?;
+        let catalog = parse_model_catalog(&object_info);
+        let output = format!("Models on {url}\n\n{}", format_model_catalog(&catalog));
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 }

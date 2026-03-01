@@ -1,6 +1,7 @@
 //! ComfyUI HTTP client.
 //!
 //! Connects to ComfyUI via RunPod proxy URL and queries API endpoints.
+//! Supports optional Bearer token authentication (RunPod proxy auth).
 
 use crate::domain::error::DomainError;
 
@@ -8,22 +9,36 @@ use crate::domain::error::DomainError;
 #[derive(Clone)]
 pub struct ComfyUiClient {
     base_url: String,
+    token: Option<String>,
     http: reqwest::Client,
 }
 
 impl ComfyUiClient {
-    pub fn new(base_url: String) -> Self {
+    pub fn new(base_url: String, token: Option<String>) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { base_url, http }
+        Self {
+            base_url,
+            token,
+            http,
+        }
+    }
+
+    /// Build a GET request with optional Bearer auth header.
+    fn get_request(&self, url: &str) -> reqwest::RequestBuilder {
+        let mut req = self.http.get(url);
+        if let Some(token) = &self.token {
+            req = req.bearer_auth(token);
+        }
+        req
     }
 
     /// Probe /system_stats to verify ComfyUI is responding.
     pub async fn system_stats(&self) -> Result<serde_json::Value, DomainError> {
         let url = format!("{}/system_stats", self.base_url);
-        let resp = self.http.get(&url).send().await.map_err(|e| {
+        let resp = self.get_request(&url).send().await.map_err(|e| {
             DomainError::ComfyUiConnection(format!("failed to reach {url}: {e}"))
         })?;
 
@@ -42,7 +57,7 @@ impl ComfyUiClient {
     /// List available models from /object_info endpoint.
     pub async fn object_info(&self) -> Result<serde_json::Value, DomainError> {
         let url = format!("{}/object_info", self.base_url);
-        let resp = self.http.get(&url).send().await.map_err(|e| {
+        let resp = self.get_request(&url).send().await.map_err(|e| {
             DomainError::ComfyUiConnection(format!("failed to reach {url}: {e}"))
         })?;
 
@@ -84,5 +99,18 @@ mod tests {
     fn proxy_url_custom_port() {
         let url = proxy_url("abc123", 3000);
         assert_eq!(url, "https://abc123-3000.proxy.runpod.net");
+    }
+
+    #[test]
+    fn client_without_token() {
+        let client = ComfyUiClient::new("http://localhost:8188".into(), None);
+        assert_eq!(client.base_url(), "http://localhost:8188");
+    }
+
+    #[test]
+    fn client_with_token() {
+        let client =
+            ComfyUiClient::new("http://localhost:8188".into(), Some("mytoken".into()));
+        assert_eq!(client.base_url(), "http://localhost:8188");
     }
 }
