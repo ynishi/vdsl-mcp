@@ -16,5 +16,6 @@ anyhow = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "stream"] }
 urlencoding = "2"
 tempfile = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]

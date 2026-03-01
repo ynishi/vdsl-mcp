@@ -1583,6 +1583,13 @@ impl VdslMcpServer {
         let work_dir = resolve_working_dir(req.working_dir.as_deref(), req.script_file.as_deref())?;
         let timeout = req.timeout.unwrap_or(SCRIPT_TIMEOUT_SECS);
 
+        // Auto-save inline code to history
+        let saved_path = if let Some(ref code) = req.code {
+            save_inline_script(code, &work_dir)
+        } else {
+            None
+        };
+
         let result = exec_lua(&lua_args, &work_dir, timeout, &[]).await?;
 
         let mut response = format!(
@@ -1590,6 +1597,9 @@ impl VdslMcpServer {
             work_dir.display(),
             result.exit_code,
         );
+        if let Some(ref path) = saved_path {
+            response.push_str(&format!("\nsaved: {}", path.display()));
+        }
         if !result.stdout.is_empty() {
             response.push_str(&format!("\n\n--- stdout ---\n{}", result.stdout));
         }
@@ -1825,6 +1835,13 @@ impl VdslMcpServer {
         let work_dir = resolve_working_dir(req.working_dir.as_deref(), req.script_file.as_deref())?;
         let timeout = req.timeout.unwrap_or(SCRIPT_TIMEOUT_SECS);
 
+        // Auto-save inline code to history
+        let saved_path = if let Some(ref code) = req.code {
+            save_inline_script(code, &work_dir)
+        } else {
+            None
+        };
+
         // --- Phase 1: Compile --- temp dir for workflow JSONs
         let out_dir = tempfile::TempDir::new().map_err(|e| {
             McpError::internal_error(format!("failed to create temp dir: {e}"), None)
@@ -1843,6 +1860,9 @@ impl VdslMcpServer {
         let mut log = Vec::<String>::new();
         log.push(format!("script: {script_label}"));
         log.push(format!("working_dir: {}", work_dir.display()));
+        if let Some(ref path) = saved_path {
+            log.push(format!("saved: {}", path.display()));
+        }
         log.push(format!("compile exit_code: {}", lua_result.exit_code));
 
         if lua_result.exit_code != 0 {
@@ -1996,6 +2016,43 @@ fn resolve_script_source(
             None,
         )),
     }
+}
+
+/// Default subdirectory for inline script history (relative to working_dir).
+const DEFAULT_INLINE_HISTORY_SUBDIR: &str = "scripts/.inline_history";
+
+/// Save inline Lua code to a history directory for future reference.
+///
+/// Resolution order:
+///   1. `VDSL_INLINE_HISTORY_DIR` env var (absolute path)
+///   2. `{working_dir}/scripts/.inline_history/`
+///
+/// File naming: `YYYYMMDD_HHMMSS.lua` (local time).
+/// Returns the saved file path on success, or None if saving failed
+/// (failures are non-fatal — logged but do not block execution).
+fn save_inline_script(code: &str, work_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let history_dir = match std::env::var("VDSL_INLINE_HISTORY_DIR") {
+        Ok(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => work_dir.join(DEFAULT_INLINE_HISTORY_SUBDIR),
+    };
+
+    if let Err(e) = std::fs::create_dir_all(&history_dir) {
+        eprintln!(
+            "inline history: failed to create {}: {e}",
+            history_dir.display()
+        );
+        return None;
+    }
+
+    let now = chrono::Local::now();
+    let filename = now.format("%Y%m%d_%H%M%S.lua").to_string();
+    let dest = unique_dest(&history_dir, &filename);
+
+    if let Err(e) = std::fs::write(&dest, code) {
+        eprintln!("inline history: failed to write {}: {e}", dest.display());
+        return None;
+    }
+    Some(dest)
 }
 
 /// Resolve VDSL working directory (must contain lua/).
@@ -3061,6 +3118,60 @@ mod tests {
         let req: VdslInterruptRequest = serde_json::from_str(r#"{}"#).unwrap();
         assert!(req.url.is_none());
         assert!(req.pod_id.is_none());
+    }
+
+    // --- save_inline_script tests ---
+
+    #[test]
+    fn save_inline_script_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "print('hello')";
+        let result = save_inline_script(code, dir.path());
+        assert!(result.is_some());
+        let path = result.unwrap();
+        assert!(path.exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), code);
+        assert!(path.extension().and_then(|e| e.to_str()) == Some("lua"));
+    }
+
+    #[test]
+    fn save_inline_script_creates_history_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = save_inline_script("x = 1", dir.path());
+        assert!(result.is_some());
+        let path = result.unwrap();
+        let expected_dir = dir.path().join(DEFAULT_INLINE_HISTORY_SUBDIR);
+        assert!(expected_dir.is_dir());
+        assert!(path.starts_with(&expected_dir));
+    }
+
+    #[test]
+    fn save_inline_script_respects_env_override() {
+        let custom_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("VDSL_INLINE_HISTORY_DIR", custom_dir.path());
+        let work_dir = tempfile::tempdir().unwrap();
+        let result = save_inline_script("y = 2", work_dir.path());
+        std::env::remove_var("VDSL_INLINE_HISTORY_DIR");
+
+        assert!(result.is_some());
+        let path = result.unwrap();
+        assert!(path.starts_with(custom_dir.path()));
+        assert!(!path.starts_with(work_dir.path()));
+    }
+
+    #[test]
+    fn save_inline_script_filename_is_lua() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = save_inline_script("z = 3", dir.path());
+        assert!(result.is_some());
+        let path = result.unwrap();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.ends_with(".lua"),
+            "expected .lua extension, got: {name}"
+        );
+        // Format: YYYYMMDD_HHMMSS.lua — 20 chars
+        assert!(name.len() >= 19, "filename too short: {name}");
     }
 
     // --- unique_dest tests ---
