@@ -211,6 +211,23 @@ const COMFY_DEFAULTS_NAME: &str = "comfyui-vdsl";
 const COMFY_DEFAULTS_TEMPLATE: &str = "cw3nka7d08";
 const COMFY_DEFAULTS_DISK: u32 = 30;
 
+/// Max wait time for pod + ComfyUI readiness (seconds).
+const SETUP_TIMEOUT_SECS: u64 = 300;
+/// Interval between readiness polls (seconds).
+const SETUP_POLL_INTERVAL_SECS: u64 = 10;
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslPodSetupRequest {
+    /// Network volume ID. If omitted, auto-detected when exactly one volume exists.
+    pub volume_id: Option<String>,
+
+    /// GPU type (e.g. "NVIDIA A40", "NVIDIA L4"). Can be a single type or comma-separated list.
+    pub gpu: Option<String>,
+
+    /// Datacenter ID (e.g. "EU-SE-1"). Can be a single ID or comma-separated list.
+    pub datacenter: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VdslPodCreateRequest {
     /// Network volume ID to attach (from vdsl_volume_list).
@@ -428,6 +445,175 @@ impl VdslMcpServer {
             .map_err(Self::to_mcp_error)?;
         let output =
             serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"));
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    #[tool(
+        name = "vdsl_pod_setup",
+        description = "Find or create a ComfyUI pod and wait until it's ready. \
+            Searches for an existing 'comfyui-vdsl' pod first; starts it if stopped, \
+            creates a new one if none found. Returns connection info when ComfyUI is responding. \
+            Timeout: 5 minutes.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn pod_setup(
+        &self,
+        Parameters(req): Parameters<VdslPodSetupRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = Self::pod_service()?;
+        let mut log = Vec::<String>::new();
+
+        // --- 1. Resolve volume_id ---
+        let volume_id = match req.volume_id {
+            Some(v) => v,
+            None => {
+                let volumes = svc.list_volumes().await.map_err(Self::to_mcp_error)?;
+                match volumes.len() {
+                    0 => {
+                        return Err(McpError::invalid_params(
+                            "no network volumes found. Create one first via RunPod dashboard.",
+                            None,
+                        ))
+                    }
+                    1 => {
+                        let id = volumes[0]["id"]
+                            .as_str()
+                            .ok_or_else(|| {
+                                McpError::invalid_params("volume has no id field", None)
+                            })?
+                            .to_string();
+                        log.push(format!("Auto-detected volume: {id}"));
+                        id
+                    }
+                    n => {
+                        let list = format_volume_list(&volumes);
+                        return Err(McpError::invalid_params(
+                            format!(
+                                "{n} volumes found — specify volume_id explicitly.\n\n{list}"
+                            ),
+                            None,
+                        ));
+                    }
+                }
+            }
+        };
+
+        // --- 2. Find existing pod ---
+        let pods = svc.list_pods().await.map_err(Self::to_mcp_error)?;
+        let candidate = pods.iter().find(|p| {
+            let name_match = p["name"].as_str() == Some(COMFY_DEFAULTS_NAME);
+            let vol_match = p["networkVolume"]["id"].as_str() == Some(&volume_id)
+                || p["networkVolumeId"].as_str() == Some(&volume_id);
+            name_match && vol_match
+        });
+
+        let pod_id: String;
+
+        if let Some(pod) = candidate {
+            pod_id = pod["id"]
+                .as_str()
+                .ok_or_else(|| McpError::invalid_params("pod has no id field", None))?
+                .to_string();
+            let status = pod["desiredStatus"]
+                .as_str()
+                .or_else(|| pod["status"].as_str())
+                .unwrap_or("unknown");
+
+            log.push(format!("Found existing pod: {pod_id} (status: {status})"));
+
+            if status != "RUNNING" {
+                log.push("Starting pod...".to_string());
+                svc.start_pod(&pod_id).await.map_err(Self::to_mcp_error)?;
+            }
+        } else {
+            // --- 3. Create new pod ---
+            log.push(format!(
+                "No existing pod found for volume {volume_id}. Creating..."
+            ));
+
+            let mut spec = serde_json::Map::new();
+            spec.insert(
+                "name".into(),
+                serde_json::Value::String(COMFY_DEFAULTS_NAME.to_string()),
+            );
+            spec.insert(
+                "templateId".into(),
+                serde_json::Value::String(COMFY_DEFAULTS_TEMPLATE.to_string()),
+            );
+            spec.insert(
+                "containerDiskInGb".into(),
+                serde_json::Value::Number(COMFY_DEFAULTS_DISK.into()),
+            );
+            spec.insert("ports".into(), serde_json::json!(["8188/http", "22/tcp"]));
+            spec.insert(
+                "networkVolumeId".into(),
+                serde_json::Value::String(volume_id),
+            );
+
+            if let Some(gpu) = req.gpu {
+                let gpu_list: Vec<serde_json::Value> = gpu
+                    .split(',')
+                    .map(|s| serde_json::Value::String(s.trim().to_string()))
+                    .collect();
+                spec.insert("gpuTypeIds".into(), serde_json::Value::Array(gpu_list));
+            }
+            if let Some(dc) = req.datacenter {
+                let dc_list: Vec<serde_json::Value> = dc
+                    .split(',')
+                    .map(|s| serde_json::Value::String(s.trim().to_string()))
+                    .collect();
+                spec.insert("dataCenterIds".into(), serde_json::Value::Array(dc_list));
+            }
+
+            let spec_json = serde_json::to_string(&spec).map_err(Self::to_mcp_error)?;
+            let result = svc.create_pod(&spec_json).await.map_err(Self::to_mcp_error)?;
+
+            pod_id = result["id"]
+                .as_str()
+                .ok_or_else(|| McpError::invalid_params("created pod has no id", None))?
+                .to_string();
+            log.push(format!("Created pod: {pod_id}"));
+        }
+
+        // --- 4. Poll for ComfyUI readiness ---
+        let url = proxy_url(&pod_id, 8188);
+        let client = Self::comfyui_client(url.clone());
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(SETUP_TIMEOUT_SECS);
+        let interval = std::time::Duration::from_secs(SETUP_POLL_INTERVAL_SECS);
+
+        log.push(format!("Waiting for ComfyUI at {url} ..."));
+
+        let stats = loop {
+            match client.system_stats().await {
+                Ok(s) => break s,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(interval).await;
+                }
+                Err(e) => {
+                    log.push(format!("Timeout waiting for ComfyUI: {e}"));
+                    return Err(McpError::internal_error(
+                        format!(
+                            "ComfyUI did not become ready within {SETUP_TIMEOUT_SECS}s.\n\n{}",
+                            log.join("\n")
+                        ),
+                        None,
+                    ));
+                }
+            }
+        };
+
+        log.push("ComfyUI is ready.".to_string());
+
+        let output = format!(
+            "{}\n\npod_id: {pod_id}\nurl: {url}\n\n{}",
+            log.join("\n"),
+            serde_json::to_string_pretty(&stats).unwrap_or_else(|_| format!("{stats:?}"))
+        );
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -733,5 +919,32 @@ mod tests {
     fn upload_request_missing_filepath() {
         let result = serde_json::from_str::<VdslUploadRequest>(r#"{"pod_id":"pod_abc"}"#);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn pod_setup_request_empty() {
+        let req: VdslPodSetupRequest = serde_json::from_str("{}").unwrap();
+        assert!(req.volume_id.is_none());
+        assert!(req.gpu.is_none());
+        assert!(req.datacenter.is_none());
+    }
+
+    #[test]
+    fn pod_setup_request_full() {
+        let req: VdslPodSetupRequest = serde_json::from_str(
+            r#"{"volume_id":"vol_001","gpu":"NVIDIA A40","datacenter":"EU-SE-1"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.volume_id.as_deref(), Some("vol_001"));
+        assert_eq!(req.gpu.as_deref(), Some("NVIDIA A40"));
+        assert_eq!(req.datacenter.as_deref(), Some("EU-SE-1"));
+    }
+
+    #[test]
+    fn pod_setup_request_volume_only() {
+        let req: VdslPodSetupRequest =
+            serde_json::from_str(r#"{"volume_id":"vol_abc"}"#).unwrap();
+        assert_eq!(req.volume_id.as_deref(), Some("vol_abc"));
+        assert!(req.gpu.is_none());
     }
 }
