@@ -357,6 +357,10 @@ const GENERATE_TIMEOUT_SECS: u64 = 300;
 const GENERATE_POLL_INTERVAL_SECS: u64 = 2;
 /// Default poll interval for batch generate (seconds) — slightly longer to reduce /history load.
 const BATCH_POLL_INTERVAL_SECS: u64 = 3;
+/// Default timeout for script execution (seconds).
+const SCRIPT_TIMEOUT_SECS: u64 = 600;
+/// Lua package.path prefix for VDSL module resolution.
+const VDSL_PACKAGE_PATH: &str = "lua/?.lua;lua/?/init.lua;scripts/?.lua;";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VdslGenerateRequest {
@@ -405,6 +409,23 @@ pub struct VdslBatchGenerateRequest {
     pub save_dir: Option<String>,
 
     /// Timeout in seconds for the entire batch (default: 300).
+    pub timeout: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslRunScriptRequest {
+    /// Path to a .lua script file to execute. Mutually exclusive with code.
+    pub script_file: Option<String>,
+
+    /// Inline Lua code to execute. Mutually exclusive with script_file.
+    pub code: Option<String>,
+
+    /// Working directory for script execution.
+    /// Must contain lua/ and scripts/ directories for VDSL module resolution.
+    /// If omitted, auto-detected by walking up from script_file's parent.
+    pub working_dir: Option<String>,
+
+    /// Timeout in seconds (default: 600).
     pub timeout: Option<u64>,
 }
 
@@ -1552,6 +1573,171 @@ impl VdslMcpServer {
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
+
+    #[tool(
+        name = "vdsl_run_script",
+        description = "Run a VDSL Lua script via the lua interpreter. \
+            Accepts a script file path or inline code. \
+            Captures stdout and stderr. \
+            The working directory must contain lua/ and scripts/ for VDSL module resolution. \
+            If omitted, auto-detected by walking up from the script's location. \
+            Timeout: 10 minutes (configurable).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn run_script(
+        &self,
+        Parameters(req): Parameters<VdslRunScriptRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        // --- 1. Resolve script source ---
+        let (lua_args, script_label) = match (req.script_file.as_deref(), req.code.as_deref()) {
+            (Some(path), None) => {
+                let p = std::path::Path::new(path);
+                if !p.exists() {
+                    return Err(McpError::invalid_params(
+                        format!("script not found: {path}"),
+                        None,
+                    ));
+                }
+                (vec![path.to_string()], path.to_string())
+            }
+            (None, Some(code)) => {
+                (vec!["-e".to_string(), code.to_string()], "<inline>".to_string())
+            }
+            (Some(_), Some(_)) => {
+                return Err(McpError::invalid_params(
+                    "specify either 'script_file' or 'code', not both",
+                    None,
+                ))
+            }
+            (None, None) => {
+                return Err(McpError::invalid_params(
+                    "either 'script_file' or 'code' is required",
+                    None,
+                ))
+            }
+        };
+
+        // --- 2. Resolve working directory ---
+        let work_dir = match req.working_dir {
+            Some(ref d) => std::path::PathBuf::from(d),
+            None => {
+                // Auto-detect: walk up from script_file to find lua/ directory
+                if let Some(ref path) = req.script_file {
+                    let script_path = std::path::Path::new(path)
+                        .canonicalize()
+                        .map_err(|e| {
+                            McpError::invalid_params(
+                                format!("cannot resolve script path '{path}': {e}"),
+                                None,
+                            )
+                        })?;
+                    let mut dir = script_path.parent();
+                    loop {
+                        match dir {
+                            Some(d) if d.join("lua").is_dir() => break d.to_path_buf(),
+                            Some(d) => dir = d.parent(),
+                            None => {
+                                return Err(McpError::invalid_params(
+                                    format!(
+                                        "cannot auto-detect working_dir: no lua/ directory found \
+                                         above '{path}'. Specify working_dir explicitly."
+                                    ),
+                                    None,
+                                ))
+                            }
+                        }
+                    }
+                } else {
+                    return Err(McpError::invalid_params(
+                        "working_dir is required when using inline code",
+                        None,
+                    ));
+                }
+            }
+        };
+
+        if !work_dir.join("lua").is_dir() {
+            return Err(McpError::invalid_params(
+                format!(
+                    "working_dir '{}' does not contain a lua/ directory",
+                    work_dir.display()
+                ),
+                None,
+            ));
+        }
+
+        // --- 3. Build lua command ---
+        let package_path_setup = format!(
+            "package.path='{VDSL_PACKAGE_PATH}'..package.path"
+        );
+
+        let mut cmd = tokio::process::Command::new("lua");
+        cmd.arg("-e").arg(&package_path_setup);
+        for arg in &lua_args {
+            cmd.arg(arg);
+        }
+        cmd.current_dir(&work_dir);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        // --- 4. Execute with timeout ---
+        let timeout = req.timeout.unwrap_or(SCRIPT_TIMEOUT_SECS);
+        let timeout_dur = std::time::Duration::from_secs(timeout);
+
+        let child = cmd.spawn().map_err(|e| {
+            McpError::internal_error(
+                format!(
+                    "failed to spawn lua: {e}. Is lua installed and on PATH?"
+                ),
+                None,
+            )
+        })?;
+
+        let result = tokio::time::timeout(timeout_dur, child.wait_with_output()).await;
+
+        let output = match result {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                return Err(McpError::internal_error(
+                    format!("lua process error: {e}"),
+                    None,
+                ))
+            }
+            Err(_) => {
+                return Err(McpError::internal_error(
+                    format!("script timed out after {timeout}s: {script_label}"),
+                    None,
+                ))
+            }
+        };
+
+        // --- 5. Build response ---
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let exit_code = output.status.code().unwrap_or(-1);
+
+        let mut response = format!(
+            "script: {script_label}\nworking_dir: {}\nexit_code: {exit_code}",
+            work_dir.display(),
+        );
+
+        if !stdout.is_empty() {
+            response.push_str(&format!("\n\n--- stdout ---\n{stdout}"));
+        }
+        if !stderr.is_empty() {
+            response.push_str(&format!("\n\n--- stderr ---\n{stderr}"));
+        }
+
+        if exit_code != 0 {
+            response.insert_str(0, "FAILED: ");
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(response)]))
+    }
 }
 
 // =============================================================================
@@ -1980,5 +2166,57 @@ mod tests {
         assert!(req.load_dir.is_none());
         assert!(req.save_dir.is_none());
         assert!(req.pod_id.is_none());
+    }
+
+    // --- Run script request tests ---
+
+    #[test]
+    fn run_script_request_with_file() {
+        let req: VdslRunScriptRequest = serde_json::from_str(
+            r#"{"script_file":"/tmp/test.lua","working_dir":"/home/user/vdsl"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.script_file.as_deref(), Some("/tmp/test.lua"));
+        assert_eq!(req.working_dir.as_deref(), Some("/home/user/vdsl"));
+        assert!(req.code.is_none());
+    }
+
+    #[test]
+    fn run_script_request_with_code() {
+        let req: VdslRunScriptRequest = serde_json::from_str(
+            r#"{"code":"print('hello')","working_dir":"/home/user/vdsl"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.code.as_deref(), Some("print('hello')"));
+        assert!(req.script_file.is_none());
+    }
+
+    #[test]
+    fn run_script_request_with_timeout() {
+        let req: VdslRunScriptRequest = serde_json::from_str(
+            r#"{"script_file":"/tmp/test.lua","timeout":120}"#,
+        )
+        .unwrap();
+        assert_eq!(req.timeout, Some(120));
+    }
+
+    #[test]
+    fn run_script_request_empty_is_valid_json() {
+        let req: VdslRunScriptRequest = serde_json::from_str("{}").unwrap();
+        assert!(req.script_file.is_none());
+        assert!(req.code.is_none());
+        assert!(req.working_dir.is_none());
+        assert!(req.timeout.is_none());
+    }
+
+    #[test]
+    fn run_script_request_auto_detect_working_dir() {
+        // working_dir is optional when script_file is provided
+        let req: VdslRunScriptRequest = serde_json::from_str(
+            r#"{"script_file":"/home/user/vdsl/examples/test.lua"}"#,
+        )
+        .unwrap();
+        assert!(req.working_dir.is_none());
+        assert!(req.script_file.is_some());
     }
 }
