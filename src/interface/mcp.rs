@@ -1417,7 +1417,8 @@ impl VdslMcpServer {
 
         // --- 5. Download images locally (if save_dir specified) ---
         let download_log = if let Some(ref dir) = req.save_dir {
-            download_images_to_dir(&client, &images, std::path::Path::new(dir)).await
+            let dl = download_images_to_dir(&client, &images, std::path::Path::new(dir)).await;
+            dl.log
         } else {
             Vec::new()
         };
@@ -1568,7 +1569,8 @@ impl VdslMcpServer {
         let all_images: Vec<&serde_json::Value> = collect_batch_images(&results);
         let download_log = if let Some(ref dir) = req.save_dir {
             let owned: Vec<serde_json::Value> = all_images.iter().map(|v| (*v).clone()).collect();
-            download_images_to_dir(&client, &owned, std::path::Path::new(dir)).await
+            let dl = download_images_to_dir(&client, &owned, std::path::Path::new(dir)).await;
+            dl.log
         } else {
             Vec::new()
         };
@@ -2065,12 +2067,33 @@ impl VdslMcpServer {
 
         // Download images
         let all_images: Vec<&serde_json::Value> = collect_batch_images(&results);
-        let download_log = if let Some(ref dir) = req.save_dir {
+        let (download_log, saved_paths) = if let Some(ref dir) = req.save_dir {
             let owned: Vec<serde_json::Value> = all_images.iter().map(|v| (*v).clone()).collect();
-            download_images_to_dir(&client, &owned, std::path::Path::new(dir)).await
+            let dl = download_images_to_dir(&client, &owned, std::path::Path::new(dir)).await;
+            (dl.log, dl.saved_paths)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
+
+        // Inject VDSL metadata into downloaded PNGs
+        let png_paths: Vec<&std::path::Path> = saved_paths
+            .iter()
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("png"))
+            .map(|p| p.as_path())
+            .collect();
+        if !png_paths.is_empty() {
+            let dsl_source = match (req.script_file.as_deref(), req.code.as_deref()) {
+                (Some(path), _) => tokio::fs::read_to_string(path).await.ok(),
+                (_, Some(c)) => Some(c.to_string()),
+                _ => None,
+            };
+            if let Some(source) = dsl_source {
+                match inject_vdsl_metadata(&png_paths, &source, &work_dir).await {
+                    Ok(msg) => log.push(format!("\nvdsl metadata: {msg}")),
+                    Err(e) => log.push(format!("\nvdsl metadata: injection failed — {e}")),
+                }
+            }
+        }
 
         // Summary
         format_batch_summary(&results, &mut log);
@@ -2363,13 +2386,20 @@ fn check_execution_error(status: &serde_json::Value) -> Option<String> {
     Some(msg)
 }
 
-/// Download images to a local directory, returning log lines.
+/// Result of downloading images to a local directory.
+struct DownloadResult {
+    log: Vec<String>,
+    saved_paths: Vec<std::path::PathBuf>,
+}
+
+/// Download images to a local directory, returning log lines and saved file paths.
 async fn download_images_to_dir(
     client: &ComfyUiClient,
     images: &[serde_json::Value],
     save_dir: &std::path::Path,
-) -> Vec<String> {
+) -> DownloadResult {
     let mut log = Vec::new();
+    let mut saved_paths = Vec::new();
     for img in images {
         let filename = match img["filename"].as_str() {
             Some(f) => f,
@@ -2378,11 +2408,14 @@ async fn download_images_to_dir(
         let subfolder = img["subfolder"].as_str().unwrap_or("");
         let dest = unique_dest(save_dir, filename);
         match client.download_image(filename, subfolder, &dest).await {
-            Ok(size) => log.push(format!("  saved: {} ({size} bytes)", dest.display())),
+            Ok(size) => {
+                log.push(format!("  saved: {} ({size} bytes)", dest.display()));
+                saved_paths.push(dest);
+            }
             Err(e) => log.push(format!("  FAILED: {} — {e}", dest.display())),
         }
     }
-    log
+    DownloadResult { log, saved_paths }
 }
 
 /// Submit workflows to ComfyUI queue. Returns submitted jobs; errors are logged.
@@ -2558,6 +2591,96 @@ fn format_batch_summary(results: &[JobResult], log: &mut Vec<String>) {
 /// Collect all images from batch results.
 fn collect_batch_images(results: &[JobResult]) -> Vec<&serde_json::Value> {
     results.iter().flat_map(|r| r.images.iter()).collect()
+}
+
+// =============================================================================
+// VDSL metadata injection
+// =============================================================================
+
+/// Timeout for the metadata injection Lua process (seconds).
+const VDSL_INJECT_TIMEOUT_SECS: u64 = 30;
+
+/// Lua script that reads a manifest file and injects VDSL metadata into PNGs.
+const VDSL_INJECT_LUA: &str = r#"
+local png = require("vdsl.util.png")
+local json = require("vdsl.util.json")
+
+local f = io.open(os.getenv("VDSL_INJECT_MANIFEST"), "r")
+if not f then
+    io.stderr:write("cannot open manifest\n")
+    os.exit(1)
+end
+local content = f:read("*a")
+f:close()
+
+local manifest = json.decode(content)
+local injected = 0
+
+for _, path in ipairs(manifest.image_paths) do
+    local ok, err = png.inject_text(path, { vdsl = manifest.vdsl_metadata })
+    if ok then
+        injected = injected + 1
+    else
+        io.stderr:write("inject failed: " .. path .. ": " .. tostring(err) .. "\n")
+    end
+end
+
+print(injected .. " image(s) tagged")
+"#;
+
+/// Inject VDSL metadata (structured JSON) into downloaded PNG files.
+///
+/// Writes a manifest to a temp file and spawns a Lua process that calls
+/// `png.inject_text` for each image. Best-effort: errors are returned as
+/// `Err(message)` but do not affect the parent operation.
+async fn inject_vdsl_metadata(
+    png_paths: &[&std::path::Path],
+    dsl_source: &str,
+    work_dir: &std::path::Path,
+) -> Result<String, String> {
+    // Structured metadata to embed in the tEXt chunk
+    let metadata = serde_json::json!({
+        "script": dsl_source,
+        "timestamp": chrono::Local::now().to_rfc3339(),
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    let metadata_str = serde_json::to_string(&metadata).map_err(|e| e.to_string())?;
+
+    // Manifest: metadata string + list of image paths
+    let manifest = serde_json::json!({
+        "vdsl_metadata": metadata_str,
+        "image_paths": png_paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
+    });
+
+    let manifest_file = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+    std::fs::write(
+        manifest_file.path(),
+        serde_json::to_string(&manifest).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let manifest_path = manifest_file.path().to_string_lossy().to_string();
+
+    let lua_args = vec!["-e".to_string(), VDSL_INJECT_LUA.to_string()];
+    let result = exec_lua(
+        &lua_args,
+        work_dir,
+        VDSL_INJECT_TIMEOUT_SECS,
+        &[("VDSL_INJECT_MANIFEST", &manifest_path)],
+    )
+    .await
+    .map_err(|e| format!("{e}"))?;
+
+    if result.exit_code != 0 {
+        let stderr = result.stderr.trim();
+        return Err(format!("exit_code={}, stderr={stderr}", result.exit_code));
+    }
+
+    let msg = result.stdout.trim().to_string();
+    Ok(if msg.is_empty() {
+        format!("{} image(s) processed", png_paths.len())
+    } else {
+        msg
+    })
 }
 
 // =============================================================================
