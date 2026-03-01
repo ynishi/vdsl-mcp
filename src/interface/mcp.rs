@@ -3276,6 +3276,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "set_var poisons parallel tests — run with --ignored --test-threads=1"]
     fn save_inline_script_respects_env_override() {
         let custom_dir = tempfile::tempdir().unwrap();
         std::env::set_var("VDSL_INLINE_HISTORY_DIR", custom_dir.path());
