@@ -355,6 +355,8 @@ pub struct VdslPodCreateRequest {
 const GENERATE_TIMEOUT_SECS: u64 = 300;
 /// Default poll interval for generate (seconds).
 const GENERATE_POLL_INTERVAL_SECS: u64 = 2;
+/// Default poll interval for batch generate (seconds) — slightly longer to reduce /history load.
+const BATCH_POLL_INTERVAL_SECS: u64 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VdslGenerateRequest {
@@ -377,6 +379,33 @@ pub struct VdslGenerateRequest {
     /// Local directory to save output images. When specified, all generated images
     /// are downloaded from the ComfyUI server to this directory after completion.
     pub save_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslBatchGenerateRequest {
+    /// ComfyUI URL (e.g. "https://pod_id-8188.proxy.runpod.net") or RunPod pod ID.
+    pub url: Option<String>,
+
+    /// RunPod pod ID (e.g. "pod_abc123def"). Proxy URL is auto-constructed.
+    /// Takes precedence over url if both are provided.
+    pub pod_id: Option<String>,
+
+    /// Inline array of workflow JSONs. Mutually exclusive with workflow_files and load_dir.
+    pub workflows: Option<Vec<serde_json::Value>>,
+
+    /// Array of file paths to workflow JSON files.
+    /// Mutually exclusive with workflows and load_dir.
+    pub workflow_files: Option<Vec<String>>,
+
+    /// Directory containing .json workflow files (loaded alphabetically).
+    /// Mutually exclusive with workflows and workflow_files.
+    pub load_dir: Option<String>,
+
+    /// Local directory to save all output images after completion.
+    pub save_dir: Option<String>,
+
+    /// Timeout in seconds for the entire batch (default: 300).
+    pub timeout: Option<u64>,
 }
 
 // =============================================================================
@@ -1176,6 +1205,353 @@ impl VdslMcpServer {
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
+
+    #[tool(
+        name = "vdsl_batch_generate",
+        description = "Queue multiple ComfyUI workflows and wait for all to complete. \
+            Accepts workflows as: inline array (workflows), file list (workflow_files), \
+            or directory of .json files (load_dir). \
+            All workflows are submitted to the queue, then polled until every job finishes. \
+            Results and output images are collected per-workflow. \
+            Use save_dir to download all generated images locally.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn batch_generate(
+        &self,
+        Parameters(req): Parameters<VdslBatchGenerateRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let connect_req = VdslConnectRequest {
+            url: req.url,
+            pod_id: req.pod_id,
+        };
+        let url = Self::resolve_comfyui_url(&connect_req)?;
+        let client = Self::comfyui_client(url.clone());
+
+        // --- 1. Resolve all workflows ---
+        let sources = [
+            req.workflows.is_some(),
+            req.workflow_files.is_some(),
+            req.load_dir.is_some(),
+        ];
+        let source_count = sources.iter().filter(|&&b| b).count();
+        if source_count == 0 {
+            return Err(McpError::invalid_params(
+                "one of 'workflows', 'workflow_files', or 'load_dir' is required",
+                None,
+            ));
+        }
+        if source_count > 1 {
+            return Err(McpError::invalid_params(
+                "specify only one of 'workflows', 'workflow_files', or 'load_dir'",
+                None,
+            ));
+        }
+
+        struct TaggedWorkflow {
+            label: String,
+            workflow: serde_json::Value,
+        }
+
+        let tagged: Vec<TaggedWorkflow> = if let Some(wfs) = req.workflows {
+            wfs.into_iter()
+                .enumerate()
+                .map(|(i, w)| TaggedWorkflow {
+                    label: format!("inline_{}", i + 1),
+                    workflow: w,
+                })
+                .collect()
+        } else if let Some(files) = req.workflow_files {
+            let mut out = Vec::with_capacity(files.len());
+            for path in &files {
+                let content = tokio::fs::read_to_string(path).await.map_err(|e| {
+                    McpError::invalid_params(
+                        format!("failed to read '{path}': {e}"),
+                        None,
+                    )
+                })?;
+                let wf: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+                    McpError::invalid_params(
+                        format!("invalid JSON in '{path}': {e}"),
+                        None,
+                    )
+                })?;
+                let label = std::path::Path::new(path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                out.push(TaggedWorkflow { label, workflow: wf });
+            }
+            out
+        } else if let Some(dir) = req.load_dir {
+            let mut entries: Vec<String> = Vec::new();
+            let mut rd = tokio::fs::read_dir(&dir).await.map_err(|e| {
+                McpError::invalid_params(
+                    format!("failed to read directory '{dir}': {e}"),
+                    None,
+                )
+            })?;
+            while let Some(entry) = rd.next_entry().await.map_err(|e| {
+                McpError::internal_error(format!("read_dir error: {e}"), None)
+            })? {
+                let p = entry.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("json") {
+                    if let Some(s) = p.to_str() {
+                        entries.push(s.to_string());
+                    }
+                }
+            }
+            entries.sort();
+
+            if entries.is_empty() {
+                return Err(McpError::invalid_params(
+                    format!("no .json files found in '{dir}'"),
+                    None,
+                ));
+            }
+
+            let mut out = Vec::with_capacity(entries.len());
+            for path in &entries {
+                let content = tokio::fs::read_to_string(path).await.map_err(|e| {
+                    McpError::internal_error(format!("failed to read '{path}': {e}"), None)
+                })?;
+                let wf: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+                    McpError::internal_error(
+                        format!("invalid JSON in '{path}': {e}"),
+                        None,
+                    )
+                })?;
+                let label = std::path::Path::new(path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                out.push(TaggedWorkflow { label, workflow: wf });
+            }
+            out
+        } else {
+            // Unreachable due to source_count check above, but safe fallback
+            return Err(McpError::invalid_params("no workflow source", None));
+        };
+
+        let total = tagged.len();
+        let mut log = Vec::<String>::new();
+        log.push(format!("Batch: {total} workflow(s) on {url}"));
+
+        // --- 2. Submit all to queue ---
+        struct Submitted {
+            label: String,
+            prompt_id: String,
+        }
+
+        let mut jobs: Vec<Submitted> = Vec::with_capacity(total);
+        let mut submit_errors: Vec<String> = Vec::new();
+
+        for tw in &tagged {
+            match client.post_prompt(&tw.workflow).await {
+                Ok(resp) => {
+                    if let Some(pid) = resp["prompt_id"].as_str() {
+                        log.push(format!("  queued: {} → {pid}", tw.label));
+                        jobs.push(Submitted {
+                            label: tw.label.clone(),
+                            prompt_id: pid.to_string(),
+                        });
+                    } else {
+                        let msg = format!("  SKIP {}: no prompt_id in response", tw.label);
+                        log.push(msg.clone());
+                        submit_errors.push(msg);
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("  SKIP {}: {e}", tw.label);
+                    log.push(msg.clone());
+                    submit_errors.push(msg);
+                }
+            }
+        }
+
+        log.push(format!(
+            "Submitted: {}/{total} (errors: {})",
+            jobs.len(),
+            submit_errors.len()
+        ));
+
+        if jobs.is_empty() {
+            return Err(McpError::internal_error(
+                format!("all {total} workflows failed to submit.\n\n{}", log.join("\n")),
+                None,
+            ));
+        }
+
+        // --- 3. Poll until all complete ---
+        let timeout = req.timeout.unwrap_or(GENERATE_TIMEOUT_SECS);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+        let interval = std::time::Duration::from_secs(BATCH_POLL_INTERVAL_SECS);
+
+        struct JobResult {
+            label: String,
+            prompt_id: String,
+            images: Vec<serde_json::Value>,
+            error: Option<String>,
+        }
+
+        let mut results: Vec<JobResult> = Vec::new();
+        let mut pending: Vec<Submitted> = jobs;
+
+        while !pending.is_empty() {
+            if std::time::Instant::now() >= deadline {
+                for p in &pending {
+                    results.push(JobResult {
+                        label: p.label.clone(),
+                        prompt_id: p.prompt_id.clone(),
+                        images: Vec::new(),
+                        error: Some("timeout".to_string()),
+                    });
+                }
+                break;
+            }
+
+            tokio::time::sleep(interval).await;
+
+            let mut still_pending = Vec::new();
+            for job in pending {
+                let history = match client.history(&job.prompt_id).await {
+                    Ok(h) => h,
+                    Err(_) => {
+                        still_pending.push(job);
+                        continue;
+                    }
+                };
+
+                if let Some(entry) = history.get(&job.prompt_id) {
+                    if let Some(status) = entry.get("status") {
+                        let completed = status["completed"].as_bool().unwrap_or(false);
+                        if completed {
+                            let status_str =
+                                status["status_str"].as_str().unwrap_or("unknown");
+
+                            if status_str == "error" {
+                                let mut msg = "execution error".to_string();
+                                if let Some(messages) = status["messages"].as_array() {
+                                    for m in messages {
+                                        if m[0].as_str() == Some("execution_error") {
+                                            if let Some(detail) = m[1]["message"].as_str() {
+                                                msg = detail.to_string();
+                                            }
+                                        }
+                                    }
+                                }
+                                results.push(JobResult {
+                                    label: job.label,
+                                    prompt_id: job.prompt_id,
+                                    images: Vec::new(),
+                                    error: Some(msg),
+                                });
+                                continue;
+                            }
+
+                            // Collect images
+                            let mut imgs = Vec::new();
+                            if let Some(outputs) = entry.get("outputs") {
+                                if let Some(obj) = outputs.as_object() {
+                                    for (_node_id, output) in obj {
+                                        if let Some(arr) =
+                                            output.get("images").and_then(|v| v.as_array())
+                                        {
+                                            for img in arr {
+                                                imgs.push(img.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            results.push(JobResult {
+                                label: job.label,
+                                prompt_id: job.prompt_id,
+                                images: imgs,
+                                error: None,
+                            });
+                            continue;
+                        }
+                    }
+                }
+                still_pending.push(job);
+            }
+            pending = still_pending;
+
+            let done = results.len();
+            log.push(format!("  progress: {done}/{total} complete"));
+        }
+
+        // --- 4. Download images (if save_dir specified) ---
+        let mut download_log: Vec<String> = Vec::new();
+        if let Some(ref dir) = req.save_dir {
+            let save_path = std::path::Path::new(dir);
+            for jr in &results {
+                for img in &jr.images {
+                    let filename = match img["filename"].as_str() {
+                        Some(f) => f,
+                        None => continue,
+                    };
+                    let subfolder = img["subfolder"].as_str().unwrap_or("");
+                    let dest = save_path.join(filename);
+
+                    match client.download_image(filename, subfolder, &dest).await {
+                        Ok(size) => {
+                            download_log
+                                .push(format!("  saved: {} ({size} bytes)", dest.display()));
+                        }
+                        Err(e) => {
+                            download_log
+                                .push(format!("  FAILED: {} — {e}", dest.display()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- 5. Build summary ---
+        let ok_count = results.iter().filter(|r| r.error.is_none()).count();
+        let err_count = results.iter().filter(|r| r.error.is_some()).count();
+        let total_images: usize = results.iter().map(|r| r.images.len()).sum();
+
+        log.push(format!(
+            "\nBatch complete: {ok_count} ok, {err_count} failed, {total_images} images"
+        ));
+
+        let mut detail_lines: Vec<String> = Vec::new();
+        for (i, jr) in results.iter().enumerate() {
+            let status = if let Some(ref e) = jr.error {
+                format!("ERROR: {e}")
+            } else {
+                let img_names: Vec<&str> = jr
+                    .images
+                    .iter()
+                    .filter_map(|img| img["filename"].as_str())
+                    .collect();
+                format!("{} image(s): {}", jr.images.len(), img_names.join(", "))
+            };
+            detail_lines.push(format!(
+                "  {}. [{}] {} — {}",
+                i + 1,
+                jr.prompt_id,
+                jr.label,
+                status
+            ));
+        }
+
+        let mut output = format!("{}\n\n{}", log.join("\n"), detail_lines.join("\n"));
+
+        if !download_log.is_empty() {
+            output.push_str(&format!("\n\ndownloads:\n{}", download_log.join("\n")));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
 }
 
 // =============================================================================
@@ -1547,5 +1923,62 @@ mod tests {
         let req: VdslGenerateRequest =
             serde_json::from_str(r#"{"pod_id":"pod_abc","workflow":{}}"#).unwrap();
         assert!(req.save_dir.is_none());
+    }
+
+    // --- Batch generate request tests ---
+
+    #[test]
+    fn batch_request_with_inline_workflows() {
+        let req: VdslBatchGenerateRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_abc","workflows":[{"1":{}},{"2":{}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(req.pod_id.as_deref(), Some("pod_abc"));
+        assert_eq!(req.workflows.as_ref().map(|w| w.len()), Some(2));
+        assert!(req.workflow_files.is_none());
+        assert!(req.load_dir.is_none());
+    }
+
+    #[test]
+    fn batch_request_with_files() {
+        let req: VdslBatchGenerateRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_abc","workflow_files":["/tmp/a.json","/tmp/b.json","/tmp/c.json"]}"#,
+        )
+        .unwrap();
+        let files = req.workflow_files.as_ref().unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0], "/tmp/a.json");
+        assert!(req.workflows.is_none());
+    }
+
+    #[test]
+    fn batch_request_with_load_dir() {
+        let req: VdslBatchGenerateRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_abc","load_dir":"/tmp/workflows"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.load_dir.as_deref(), Some("/tmp/workflows"));
+        assert!(req.workflows.is_none());
+        assert!(req.workflow_files.is_none());
+    }
+
+    #[test]
+    fn batch_request_with_save_dir_and_timeout() {
+        let req: VdslBatchGenerateRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_abc","workflows":[{}],"save_dir":"/tmp/out","timeout":600}"#,
+        )
+        .unwrap();
+        assert_eq!(req.save_dir.as_deref(), Some("/tmp/out"));
+        assert_eq!(req.timeout, Some(600));
+    }
+
+    #[test]
+    fn batch_request_empty_is_valid_json() {
+        let req: VdslBatchGenerateRequest = serde_json::from_str("{}").unwrap();
+        assert!(req.workflows.is_none());
+        assert!(req.workflow_files.is_none());
+        assert!(req.load_dir.is_none());
+        assert!(req.save_dir.is_none());
+        assert!(req.pod_id.is_none());
     }
 }
