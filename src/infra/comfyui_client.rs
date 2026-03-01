@@ -220,6 +220,53 @@ impl ComfyUiClient {
         Ok(bytes.len() as u64)
     }
 
+    /// Generic API request — GET or POST with optional JSON body.
+    /// Returns raw JSON response.
+    pub async fn api_request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, DomainError> {
+        let url = format!("{}{path}", self.base_url);
+
+        let resp =
+            match method.to_uppercase().as_str() {
+                "GET" => self.get_request(&url).send().await.map_err(|e| {
+                    DomainError::ComfyUiConnection(format!("GET {url} failed: {e}"))
+                })?,
+                "POST" => {
+                    let mut req = self.http.post(&url);
+                    if let Some(token) = &self.token {
+                        req = req.bearer_auth(token);
+                    }
+                    if let Some(b) = body {
+                        req = req.json(b);
+                    }
+                    req.send().await.map_err(|e| {
+                        DomainError::ComfyUiConnection(format!("POST {url} failed: {e}"))
+                    })?
+                }
+                other => {
+                    return Err(DomainError::ComfyUiConnection(format!(
+                        "unsupported method: {other} (use GET or POST)"
+                    )));
+                }
+            };
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(DomainError::ComfyUiConnection(format!(
+                "{method} {path} returned HTTP {status}: {body_text}"
+            )));
+        }
+
+        resp.json()
+            .await
+            .map_err(|e| DomainError::ComfyUiConnection(format!("invalid JSON from {path}: {e}")))
+    }
+
     pub fn base_url(&self) -> &str {
         &self.base_url
     }

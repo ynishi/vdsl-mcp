@@ -196,14 +196,107 @@ pub struct VdslUploadRequest {
     /// Takes precedence over url if both are provided.
     pub pod_id: Option<String>,
 
-    /// Local file path to upload.
-    pub filepath: String,
+    /// Single file path to upload. Mutually exclusive with files/dir.
+    pub filepath: Option<String>,
+
+    /// Multiple file paths to upload. Mutually exclusive with filepath/dir.
+    pub files: Option<Vec<String>>,
+
+    /// Directory path — upload all files in this directory. Mutually exclusive with filepath/files.
+    pub dir: Option<String>,
 
     /// Target subfolder on the ComfyUI server (default: "").
     pub subfolder: Option<String>,
 
     /// Whether to overwrite existing files (default: true).
     pub overwrite: Option<bool>,
+}
+
+/// Resolve upload file list from mutually exclusive filepath/files/dir parameters.
+fn resolve_upload_files(req: &VdslUploadRequest) -> Result<Vec<std::path::PathBuf>, McpError> {
+    let sources = [
+        req.filepath.is_some(),
+        req.files.is_some(),
+        req.dir.is_some(),
+    ];
+    let count = sources.iter().filter(|&&b| b).count();
+    if count == 0 {
+        return Err(McpError::invalid_params(
+            "one of filepath, files, or dir is required",
+            None,
+        ));
+    }
+    if count > 1 {
+        return Err(McpError::invalid_params(
+            "filepath, files, and dir are mutually exclusive",
+            None,
+        ));
+    }
+
+    if let Some(ref path) = req.filepath {
+        let p = std::path::PathBuf::from(path);
+        if !p.exists() {
+            return Err(McpError::invalid_params(
+                format!("file not found: {path}"),
+                None,
+            ));
+        }
+        return Ok(vec![p]);
+    }
+
+    if let Some(ref paths) = req.files {
+        let mut result = Vec::with_capacity(paths.len());
+        for path in paths {
+            let p = std::path::PathBuf::from(path);
+            if !p.exists() {
+                return Err(McpError::invalid_params(
+                    format!("file not found: {path}"),
+                    None,
+                ));
+            }
+            result.push(p);
+        }
+        if result.is_empty() {
+            return Err(McpError::invalid_params("files array is empty", None));
+        }
+        return Ok(result);
+    }
+
+    if let Some(ref dir_path) = req.dir {
+        let dir = std::path::Path::new(dir_path);
+        if !dir.is_dir() {
+            return Err(McpError::invalid_params(
+                format!("directory not found: {dir_path}"),
+                None,
+            ));
+        }
+        let mut result = Vec::new();
+        let entries = std::fs::read_dir(dir).map_err(|e| {
+            McpError::internal_error(format!("failed to read directory {dir_path}: {e}"), None)
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                McpError::internal_error(format!("directory read error: {e}"), None)
+            })?;
+            let path = entry.path();
+            if path.is_file() {
+                result.push(path);
+            }
+        }
+        if result.is_empty() {
+            return Err(McpError::invalid_params(
+                format!("no files found in directory: {dir_path}"),
+                None,
+            ));
+        }
+        result.sort();
+        return Ok(result);
+    }
+
+    Err(McpError::invalid_params(
+        "one of filepath, files, or dir is required",
+        None,
+    ))
 }
 
 /// Default spec for ComfyUI pods on RunPod.
@@ -430,6 +523,42 @@ pub struct VdslRunScriptRequest {
 
     /// Timeout in seconds (default: 600).
     pub timeout: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslCatalogsRequest {
+    /// VDSL repository root (must contain lua/ for module resolution).
+    pub working_dir: String,
+
+    /// Path to the catalog listing script.
+    /// Absolute path is used as-is; relative path is resolved from working_dir.
+    /// Default: "scripts/catalog_available.lua"
+    pub catalog_script: Option<String>,
+
+    /// Optional path to a user catalog directory.
+    /// Entries here are merged with built-in catalogs.
+    pub catalogs_dir: Option<String>,
+}
+
+const DEFAULT_CATALOG_SCRIPT: &str = "scripts/catalog_available.lua";
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslComfyApiRequest {
+    /// ComfyUI URL (e.g. "https://pod_id-8188.proxy.runpod.net").
+    pub url: Option<String>,
+
+    /// RunPod pod ID (e.g. "pod_abc123def"). Proxy URL is auto-constructed.
+    /// Takes precedence over url if both are provided.
+    pub pod_id: Option<String>,
+
+    /// HTTP method: "GET" or "POST" (default: "GET").
+    pub method: Option<String>,
+
+    /// API endpoint path (e.g. "/queue", "/object_info", "/history/abc123").
+    pub path: String,
+
+    /// JSON request body (for POST requests).
+    pub body: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -924,7 +1053,10 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_upload",
-        description = "Upload a local file to a running ComfyUI instance. Used for ControlNet images, training data, etc. Files are uploaded to the input/ directory.",
+        description = "Upload local files to a running ComfyUI instance (input/ directory). \
+            Accepts a single file (filepath), multiple files (files), \
+            or an entire directory (dir). Mutually exclusive. \
+            Used for ControlNet images, training data, etc.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -936,33 +1068,44 @@ impl VdslMcpServer {
         Parameters(req): Parameters<VdslUploadRequest>,
     ) -> Result<CallToolResult, McpError> {
         let connect_req = VdslConnectRequest {
-            url: req.url,
-            pod_id: req.pod_id,
+            url: req.url.clone(),
+            pod_id: req.pod_id.clone(),
         };
         let url = Self::resolve_comfyui_url(&connect_req)?;
         let client = Self::comfyui_client(url.clone())?;
 
-        let filepath = std::path::Path::new(&req.filepath);
-        if !filepath.exists() {
-            return Err(McpError::invalid_params(
-                format!("file not found: {}", filepath.display()),
-                None,
-            ));
-        }
-
+        let file_list = resolve_upload_files(&req)?;
         let subfolder = req.subfolder.as_deref().unwrap_or("");
         let overwrite = req.overwrite.unwrap_or(true);
 
-        let result = client
-            .upload_image(filepath, subfolder, overwrite)
-            .await
-            .map_err(Self::to_mcp_error)?;
+        let total = file_list.len();
+        let mut uploaded = 0usize;
+        let mut log = Vec::new();
 
-        let name = result["name"].as_str().unwrap_or("?");
-        let output = format!(
-            "Uploaded to {url}: {name}\n\n{}",
-            serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"))
-        );
+        for filepath in &file_list {
+            let result = client
+                .upload_image(filepath, subfolder, overwrite)
+                .await
+                .map_err(Self::to_mcp_error)?;
+
+            let name = result["name"].as_str().unwrap_or("?");
+            log.push(format!("  {name}"));
+            uploaded += 1;
+        }
+
+        let header = if total == 1 {
+            format!(
+                "Uploaded to {url}: {}",
+                log.first().map_or("?", |s| s.trim())
+            )
+        } else {
+            format!("Uploaded {uploaded}/{total} files to {url}")
+        };
+
+        let mut output = header;
+        if total > 1 {
+            output.push_str(&format!("\n{}", log.join("\n")));
+        }
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -1390,6 +1533,116 @@ impl VdslMcpServer {
         }
 
         Ok(CallToolResult::success(vec![Content::text(response)]))
+    }
+
+    #[tool(
+        name = "vdsl_catalogs",
+        description = "List all available VDSL catalog entries (built-in + user-defined). \
+            Returns catalog names and their entries grouped by top-level catalogs and packs. \
+            Useful for discovering available style/quality/camera/lighting entries \
+            before writing VDSL scripts. \
+            Specify catalogs_dir to include user-defined catalogs.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn catalogs(
+        &self,
+        Parameters(req): Parameters<VdslCatalogsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let work_dir = std::path::PathBuf::from(&req.working_dir);
+        if !work_dir.join("lua").is_dir() {
+            return Err(McpError::invalid_params(
+                format!(
+                    "working_dir '{}' does not contain a lua/ directory",
+                    req.working_dir
+                ),
+                None,
+            ));
+        }
+
+        let raw = req
+            .catalog_script
+            .as_deref()
+            .unwrap_or(DEFAULT_CATALOG_SCRIPT);
+        let script = {
+            let p = std::path::Path::new(raw);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                work_dir.join(p)
+            }
+        };
+        if !script.exists() {
+            return Err(McpError::invalid_params(
+                format!("catalog script not found: {}", script.display()),
+                None,
+            ));
+        }
+
+        let mut envs: Vec<(&str, &str)> = Vec::new();
+        let catalogs_dir_val;
+        if let Some(ref dir) = req.catalogs_dir {
+            catalogs_dir_val = dir.clone();
+            envs.push(("VDSL_CATALOGS", &catalogs_dir_val));
+        }
+
+        let lua_args = vec![script.to_string_lossy().to_string()];
+        let result = exec_lua(&lua_args, &work_dir, 30, &envs).await?;
+
+        if result.exit_code != 0 {
+            let mut msg = format!("catalog script failed (exit {})", result.exit_code);
+            if !result.stderr.is_empty() {
+                msg.push_str(&format!("\n{}", result.stderr));
+            }
+            return Err(McpError::internal_error(msg, None));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(result.stdout)]))
+    }
+
+    #[tool(
+        name = "vdsl_comfy_api",
+        description = "Call any ComfyUI REST API endpoint with automatic authentication. \
+            Supports GET and POST. Authentication (Bearer token) and URL construction \
+            (from pod_id) are handled automatically. \
+            Examples: GET /queue, GET /object_info, POST /prompt, GET /history/{id}.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn comfy_api(
+        &self,
+        Parameters(req): Parameters<VdslComfyApiRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let connect_req = VdslConnectRequest {
+            url: req.url,
+            pod_id: req.pod_id,
+        };
+        let url = Self::resolve_comfyui_url(&connect_req)?;
+        let client = Self::comfyui_client(url.clone())?;
+
+        let method = req.method.as_deref().unwrap_or("GET");
+        let path = if req.path.starts_with('/') {
+            req.path.clone()
+        } else {
+            format!("/{}", req.path)
+        };
+
+        let result = client
+            .api_request(method, &path, req.body.as_ref())
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        let output = format!(
+            "{method} {url}{path}\n\n{}",
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"))
+        );
+        Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
     #[tool(
@@ -2112,29 +2365,74 @@ mod tests {
     }
 
     #[test]
-    fn upload_request_minimal() {
+    fn upload_request_single_file() {
         let req: VdslUploadRequest =
             serde_json::from_str(r#"{"pod_id":"pod_abc","filepath":"/tmp/test.png"}"#).unwrap();
         assert_eq!(req.pod_id.as_deref(), Some("pod_abc"));
-        assert_eq!(req.filepath, "/tmp/test.png");
+        assert_eq!(req.filepath.as_deref(), Some("/tmp/test.png"));
+        assert!(req.files.is_none());
+        assert!(req.dir.is_none());
         assert!(req.subfolder.is_none());
         assert!(req.overwrite.is_none());
     }
 
     #[test]
-    fn upload_request_full() {
+    fn upload_request_multiple_files() {
         let req: VdslUploadRequest = serde_json::from_str(
-            r#"{"pod_id":"pod_abc","filepath":"/tmp/test.png","subfolder":"training","overwrite":false}"#,
+            r#"{"pod_id":"pod_abc","files":["/tmp/a.png","/tmp/b.png"],"subfolder":"train"}"#,
         )
         .unwrap();
-        assert_eq!(req.subfolder.as_deref(), Some("training"));
+        assert_eq!(req.files.as_ref().map(|f| f.len()), Some(2));
+        assert!(req.filepath.is_none());
+        assert!(req.dir.is_none());
+        assert_eq!(req.subfolder.as_deref(), Some("train"));
+    }
+
+    #[test]
+    fn upload_request_dir() {
+        let req: VdslUploadRequest =
+            serde_json::from_str(r#"{"pod_id":"pod_abc","dir":"/tmp/dataset","overwrite":false}"#)
+                .unwrap();
+        assert_eq!(req.dir.as_deref(), Some("/tmp/dataset"));
+        assert!(req.filepath.is_none());
+        assert!(req.files.is_none());
         assert_eq!(req.overwrite, Some(false));
     }
 
     #[test]
-    fn upload_request_missing_filepath() {
-        let result = serde_json::from_str::<VdslUploadRequest>(r#"{"pod_id":"pod_abc"}"#);
-        assert!(result.is_err());
+    fn upload_request_empty_is_valid_json() {
+        let req: VdslUploadRequest = serde_json::from_str(r#"{"pod_id":"pod_abc"}"#).unwrap();
+        assert!(req.filepath.is_none());
+        assert!(req.files.is_none());
+        assert!(req.dir.is_none());
+    }
+
+    #[test]
+    fn upload_resolve_rejects_none() {
+        let req = VdslUploadRequest {
+            url: None,
+            pod_id: None,
+            filepath: None,
+            files: None,
+            dir: None,
+            subfolder: None,
+            overwrite: None,
+        };
+        assert!(resolve_upload_files(&req).is_err());
+    }
+
+    #[test]
+    fn upload_resolve_rejects_multiple_sources() {
+        let req = VdslUploadRequest {
+            url: None,
+            pod_id: None,
+            filepath: Some("/tmp/a.png".into()),
+            files: Some(vec!["/tmp/b.png".into()]),
+            dir: None,
+            subfolder: None,
+            overwrite: None,
+        };
+        assert!(resolve_upload_files(&req).is_err());
     }
 
     #[test]
@@ -2433,6 +2731,81 @@ mod tests {
             serde_json::from_str(r#"{"script_file":"/home/user/vdsl/examples/test.lua"}"#).unwrap();
         assert!(req.working_dir.is_none());
         assert!(req.script_file.is_some());
+    }
+
+    // --- catalogs request tests ---
+
+    #[test]
+    fn catalogs_request_full() {
+        let req: VdslCatalogsRequest = serde_json::from_str(
+            r#"{"working_dir":"/home/user/vdsl","catalog_script":"/opt/custom.lua","catalogs_dir":"/home/user/my_catalogs"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.working_dir, "/home/user/vdsl");
+        assert_eq!(req.catalog_script.as_deref(), Some("/opt/custom.lua"));
+        assert_eq!(req.catalogs_dir.as_deref(), Some("/home/user/my_catalogs"));
+    }
+
+    #[test]
+    fn catalogs_request_minimal() {
+        let req: VdslCatalogsRequest =
+            serde_json::from_str(r#"{"working_dir":"/home/user/vdsl"}"#).unwrap();
+        assert_eq!(req.working_dir, "/home/user/vdsl");
+        assert!(req.catalog_script.is_none());
+        assert!(req.catalogs_dir.is_none());
+    }
+
+    #[test]
+    fn catalogs_request_relative_script() {
+        let req: VdslCatalogsRequest = serde_json::from_str(
+            r#"{"working_dir":"/home/user/vdsl","catalog_script":"scripts/my_list.lua"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.catalog_script.as_deref(), Some("scripts/my_list.lua"));
+    }
+
+    #[test]
+    fn catalogs_request_missing_working_dir() {
+        let result = serde_json::from_str::<VdslCatalogsRequest>(r#"{}"#);
+        assert!(result.is_err());
+    }
+
+    // --- comfy_api request tests ---
+
+    #[test]
+    fn comfy_api_request_get() {
+        let req: VdslComfyApiRequest =
+            serde_json::from_str(r#"{"pod_id":"pod_abc","path":"/queue"}"#).unwrap();
+        assert_eq!(req.pod_id.as_deref(), Some("pod_abc"));
+        assert_eq!(req.path, "/queue");
+        assert!(req.method.is_none());
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn comfy_api_request_post_with_body() {
+        let req: VdslComfyApiRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_abc","method":"POST","path":"/prompt","body":{"prompt":{}}}"#,
+        )
+        .unwrap();
+        assert_eq!(req.method.as_deref(), Some("POST"));
+        assert_eq!(req.path, "/prompt");
+        assert!(req.body.is_some());
+    }
+
+    #[test]
+    fn comfy_api_request_url_direct() {
+        let req: VdslComfyApiRequest =
+            serde_json::from_str(r#"{"url":"https://example.com:8188","path":"/system_stats"}"#)
+                .unwrap();
+        assert_eq!(req.url.as_deref(), Some("https://example.com:8188"));
+        assert!(req.pod_id.is_none());
+    }
+
+    #[test]
+    fn comfy_api_request_missing_path() {
+        let result = serde_json::from_str::<VdslComfyApiRequest>(r#"{"pod_id":"pod_abc"}"#);
+        assert!(result.is_err());
     }
 
     // --- unique_dest tests ---
