@@ -69,8 +69,9 @@ impl VdslMcpServer {
     }
 
     /// Build a ComfyUiClient from URL, with env-based token auth.
-    fn comfyui_client(url: String) -> ComfyUiClient {
+    fn comfyui_client(url: String) -> Result<ComfyUiClient, McpError> {
         ComfyUiClient::new(url, Self::comfyui_token())
+            .map_err(|e| McpError::internal_error(format!("HTTP client init failed: {e}"), None))
     }
 
     /// Resolve ComfyUI URL from VdslConnectRequest fields.
@@ -218,6 +219,8 @@ const SETUP_POLL_INTERVAL_SECS: u64 = 10;
 
 /// Default SSH key path for RunPod pods.
 const DEFAULT_SSH_KEY: &str = "~/.ssh/id_ed25519_runpod";
+/// Base path for ComfyUI models on RunPod pods.
+const COMFYUI_MODELS_BASE: &str = "/workspace/runpod-slim/ComfyUI/models";
 /// Max wait time for downloads (seconds).
 const DOWNLOAD_TIMEOUT_SECS: u64 = 600;
 /// Interval between download status polls (seconds).
@@ -631,7 +634,7 @@ impl VdslMcpServer {
         Parameters(req): Parameters<VdslConnectRequest>,
     ) -> Result<CallToolResult, McpError> {
         let url = Self::resolve_comfyui_url(&req)?;
-        let client = Self::comfyui_client(url.clone());
+        let client = Self::comfyui_client(url.clone())?;
         let stats = client.system_stats().await.map_err(Self::to_mcp_error)?;
 
         let output = format!(
@@ -798,7 +801,7 @@ impl VdslMcpServer {
 
         // --- 4. Poll for ComfyUI readiness ---
         let url = proxy_url(&pod_id, 8188);
-        let client = Self::comfyui_client(url.clone());
+        let client = Self::comfyui_client(url.clone())?;
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(SETUP_TIMEOUT_SECS);
         let interval = std::time::Duration::from_secs(SETUP_POLL_INTERVAL_SECS);
@@ -848,7 +851,7 @@ impl VdslMcpServer {
         Parameters(req): Parameters<VdslConnectRequest>,
     ) -> Result<CallToolResult, McpError> {
         let url = Self::resolve_comfyui_url(&req)?;
-        let client = Self::comfyui_client(url.clone());
+        let client = Self::comfyui_client(url.clone())?;
         let object_info = client.object_info().await.map_err(Self::to_mcp_error)?;
         let catalog = parse_model_catalog(&object_info);
         let output = format!("Models on {url}\n\n{}", format_model_catalog(&catalog));
@@ -873,7 +876,7 @@ impl VdslMcpServer {
             pod_id: req.pod_id,
         };
         let url = Self::resolve_comfyui_url(&connect_req)?;
-        let client = Self::comfyui_client(url.clone());
+        let client = Self::comfyui_client(url.clone())?;
 
         match req.prompt_id {
             Some(pid) => {
@@ -937,7 +940,7 @@ impl VdslMcpServer {
             pod_id: req.pod_id,
         };
         let url = Self::resolve_comfyui_url(&connect_req)?;
-        let client = Self::comfyui_client(url.clone());
+        let client = Self::comfyui_client(url.clone())?;
 
         let filepath = std::path::Path::new(&req.filepath);
         if !filepath.exists() {
@@ -991,11 +994,7 @@ impl VdslMcpServer {
         let dir_name =
             resolve_model_dir(&req.target).map_err(|e| McpError::invalid_params(e, None))?;
 
-        // Use common ComfyUI models path
-        let dest = format!(
-            "/workspace/runpod-slim/ComfyUI/models/{}/{}",
-            dir_name, dl_info.filename
-        );
+        let dest = format!("{COMFYUI_MODELS_BASE}/{}/{}", dir_name, dl_info.filename);
 
         let mut log = Vec::<String>::new();
         log.push(format!(
@@ -1099,7 +1098,7 @@ impl VdslMcpServer {
             pod_id: req.pod_id,
         };
         let url = Self::resolve_comfyui_url(&connect_req)?;
-        let client = Self::comfyui_client(url.clone());
+        let client = Self::comfyui_client(url.clone())?;
 
         // --- 1. Resolve workflow ---
         let workflow = match (req.workflow, req.workflow_file) {
@@ -1160,19 +1159,8 @@ impl VdslMcpServer {
                 if let Some(status) = entry.get("status") {
                     let completed = status["completed"].as_bool().unwrap_or(false);
                     if completed {
-                        let status_str = status["status_str"].as_str().unwrap_or("unknown");
-                        if status_str == "error" {
-                            let mut msg = "ComfyUI execution error".to_string();
-                            if let Some(messages) = status["messages"].as_array() {
-                                for m in messages {
-                                    if m[0].as_str() == Some("execution_error") {
-                                        if let Some(detail) = m[1]["message"].as_str() {
-                                            msg = format!("{msg}: {detail}");
-                                        }
-                                    }
-                                }
-                            }
-                            return Err(McpError::internal_error(msg, None));
+                        if let Some(err_msg) = check_execution_error(status) {
+                            return Err(McpError::internal_error(err_msg, None));
                         }
                         break entry.clone();
                     }
@@ -1190,43 +1178,14 @@ impl VdslMcpServer {
         };
 
         // --- 4. Collect output images ---
-        let mut images = Vec::new();
-        if let Some(outputs) = entry.get("outputs") {
-            if let Some(obj) = outputs.as_object() {
-                for (_node_id, output) in obj {
-                    if let Some(imgs) = output.get("images") {
-                        if let Some(arr) = imgs.as_array() {
-                            for img in arr {
-                                images.push(img.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let images = collect_output_images(&entry);
 
         // --- 5. Download images locally (if save_dir specified) ---
-        let mut download_log: Vec<String> = Vec::new();
-        if let Some(ref dir) = req.save_dir {
-            let save_path = std::path::Path::new(dir);
-            for img in &images {
-                let filename = match img["filename"].as_str() {
-                    Some(f) => f,
-                    None => continue,
-                };
-                let subfolder = img["subfolder"].as_str().unwrap_or("");
-                let dest = unique_dest(save_path, filename);
-
-                match client.download_image(filename, subfolder, &dest).await {
-                    Ok(size) => {
-                        download_log.push(format!("  saved: {} ({size} bytes)", dest.display()));
-                    }
-                    Err(e) => {
-                        download_log.push(format!("  FAILED: {} — {e}", dest.display()));
-                    }
-                }
-            }
-        }
+        let download_log = if let Some(ref dir) = req.save_dir {
+            download_images_to_dir(&client, &images, std::path::Path::new(dir)).await
+        } else {
+            Vec::new()
+        };
 
         let image_summary: Vec<String> = images
             .iter()
@@ -1283,7 +1242,7 @@ impl VdslMcpServer {
             pod_id: req.pod_id,
         };
         let url = Self::resolve_comfyui_url(&connect_req)?;
-        let client = Self::comfyui_client(url.clone());
+        let client = Self::comfyui_client(url.clone())?;
 
         // --- 1. Resolve all workflows ---
         let sources = [
@@ -1305,11 +1264,6 @@ impl VdslMcpServer {
             ));
         }
 
-        struct TaggedWorkflow {
-            label: String,
-            workflow: serde_json::Value,
-        }
-
         let tagged: Vec<TaggedWorkflow> = if let Some(wfs) = req.workflows {
             wfs.into_iter()
                 .enumerate()
@@ -1321,74 +1275,23 @@ impl VdslMcpServer {
         } else if let Some(files) = req.workflow_files {
             let mut out = Vec::with_capacity(files.len());
             for path in &files {
-                let content = tokio::fs::read_to_string(path).await.map_err(|e| {
-                    McpError::invalid_params(
-                        format!("failed to read '{path}': {e}"),
-                        None,
-                    )
-                })?;
-                let wf: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
-                    McpError::invalid_params(
-                        format!("invalid JSON in '{path}': {e}"),
-                        None,
-                    )
-                })?;
-                let label = std::path::Path::new(path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                out.push(TaggedWorkflow { label, workflow: wf });
+                out.push(load_tagged_workflow(path).await?);
             }
             out
         } else if let Some(dir) = req.load_dir {
-            let mut entries: Vec<String> = Vec::new();
-            let mut rd = tokio::fs::read_dir(&dir).await.map_err(|e| {
-                McpError::invalid_params(
-                    format!("failed to read directory '{dir}': {e}"),
-                    None,
-                )
-            })?;
-            while let Some(entry) = rd.next_entry().await.map_err(|e| {
-                McpError::internal_error(format!("read_dir error: {e}"), None)
-            })? {
-                let p = entry.path();
-                if p.extension().and_then(|s| s.to_str()) == Some("json") {
-                    if let Some(s) = p.to_str() {
-                        entries.push(s.to_string());
-                    }
-                }
-            }
-            entries.sort();
-
+            let entries = scan_json_dir(&dir).await?;
             if entries.is_empty() {
                 return Err(McpError::invalid_params(
                     format!("no .json files found in '{dir}'"),
                     None,
                 ));
             }
-
             let mut out = Vec::with_capacity(entries.len());
             for path in &entries {
-                let content = tokio::fs::read_to_string(path).await.map_err(|e| {
-                    McpError::internal_error(format!("failed to read '{path}': {e}"), None)
-                })?;
-                let wf: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
-                    McpError::internal_error(
-                        format!("invalid JSON in '{path}': {e}"),
-                        None,
-                    )
-                })?;
-                let label = std::path::Path::new(path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                out.push(TaggedWorkflow { label, workflow: wf });
+                out.push(load_tagged_workflow(path).await?);
             }
             out
         } else {
-            // Unreachable due to source_count check above, but safe fallback
             return Err(McpError::invalid_params("no workflow source", None));
         };
 
@@ -1397,209 +1300,48 @@ impl VdslMcpServer {
         log.push(format!("Batch: {total} workflow(s) on {url}"));
 
         // --- 2. Submit all to queue ---
-        struct Submitted {
-            label: String,
-            prompt_id: String,
-        }
-
-        let mut jobs: Vec<Submitted> = Vec::with_capacity(total);
-        let mut submit_errors: Vec<String> = Vec::new();
-
-        for tw in &tagged {
-            match client.post_prompt(&tw.workflow).await {
-                Ok(resp) => {
-                    if let Some(pid) = resp["prompt_id"].as_str() {
-                        log.push(format!("  queued: {} → {pid}", tw.label));
-                        jobs.push(Submitted {
-                            label: tw.label.clone(),
-                            prompt_id: pid.to_string(),
-                        });
-                    } else {
-                        let msg = format!("  SKIP {}: no prompt_id in response", tw.label);
-                        log.push(msg.clone());
-                        submit_errors.push(msg);
-                    }
-                }
-                Err(e) => {
-                    let msg = format!("  SKIP {}: {e}", tw.label);
-                    log.push(msg.clone());
-                    submit_errors.push(msg);
-                }
-            }
-        }
-
+        let jobs = submit_workflows(&client, &tagged, &mut log).await;
+        let submitted_count = jobs.len();
         log.push(format!(
-            "Submitted: {}/{total} (errors: {})",
-            jobs.len(),
-            submit_errors.len()
+            "Submitted: {submitted_count}/{total} (errors: {})",
+            total - submitted_count
         ));
 
         if jobs.is_empty() {
             return Err(McpError::internal_error(
-                format!("all {total} workflows failed to submit.\n\n{}", log.join("\n")),
+                format!(
+                    "all {total} workflows failed to submit.\n\n{}",
+                    log.join("\n")
+                ),
                 None,
             ));
         }
 
         // --- 3. Poll until all complete ---
         let timeout = req.timeout.unwrap_or(GENERATE_TIMEOUT_SECS);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
-        let interval = std::time::Duration::from_secs(BATCH_POLL_INTERVAL_SECS);
-
-        struct JobResult {
-            label: String,
-            prompt_id: String,
-            images: Vec<serde_json::Value>,
-            error: Option<String>,
-        }
-
-        let mut results: Vec<JobResult> = Vec::new();
-        let mut pending: Vec<Submitted> = jobs;
-
-        while !pending.is_empty() {
-            if std::time::Instant::now() >= deadline {
-                for p in &pending {
-                    results.push(JobResult {
-                        label: p.label.clone(),
-                        prompt_id: p.prompt_id.clone(),
-                        images: Vec::new(),
-                        error: Some("timeout".to_string()),
-                    });
-                }
-                break;
-            }
-
-            tokio::time::sleep(interval).await;
-
-            let mut still_pending = Vec::new();
-            for job in pending {
-                let history = match client.history(&job.prompt_id).await {
-                    Ok(h) => h,
-                    Err(_) => {
-                        still_pending.push(job);
-                        continue;
-                    }
-                };
-
-                if let Some(entry) = history.get(&job.prompt_id) {
-                    if let Some(status) = entry.get("status") {
-                        let completed = status["completed"].as_bool().unwrap_or(false);
-                        if completed {
-                            let status_str =
-                                status["status_str"].as_str().unwrap_or("unknown");
-
-                            if status_str == "error" {
-                                let mut msg = "execution error".to_string();
-                                if let Some(messages) = status["messages"].as_array() {
-                                    for m in messages {
-                                        if m[0].as_str() == Some("execution_error") {
-                                            if let Some(detail) = m[1]["message"].as_str() {
-                                                msg = detail.to_string();
-                                            }
-                                        }
-                                    }
-                                }
-                                results.push(JobResult {
-                                    label: job.label,
-                                    prompt_id: job.prompt_id,
-                                    images: Vec::new(),
-                                    error: Some(msg),
-                                });
-                                continue;
-                            }
-
-                            // Collect images
-                            let mut imgs = Vec::new();
-                            if let Some(outputs) = entry.get("outputs") {
-                                if let Some(obj) = outputs.as_object() {
-                                    for (_node_id, output) in obj {
-                                        if let Some(arr) =
-                                            output.get("images").and_then(|v| v.as_array())
-                                        {
-                                            for img in arr {
-                                                imgs.push(img.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            results.push(JobResult {
-                                label: job.label,
-                                prompt_id: job.prompt_id,
-                                images: imgs,
-                                error: None,
-                            });
-                            continue;
-                        }
-                    }
-                }
-                still_pending.push(job);
-            }
-            pending = still_pending;
-
-            let done = results.len();
-            log.push(format!("  progress: {done}/{total} complete"));
-        }
+        let results = poll_jobs(
+            &client,
+            jobs,
+            total,
+            timeout,
+            BATCH_POLL_INTERVAL_SECS,
+            &mut log,
+        )
+        .await;
 
         // --- 4. Download images (if save_dir specified) ---
-        let mut download_log: Vec<String> = Vec::new();
-        if let Some(ref dir) = req.save_dir {
-            let save_path = std::path::Path::new(dir);
-            for jr in &results {
-                for img in &jr.images {
-                    let filename = match img["filename"].as_str() {
-                        Some(f) => f,
-                        None => continue,
-                    };
-                    let subfolder = img["subfolder"].as_str().unwrap_or("");
-                    let dest = unique_dest(save_path, filename);
-
-                    match client.download_image(filename, subfolder, &dest).await {
-                        Ok(size) => {
-                            download_log
-                                .push(format!("  saved: {} ({size} bytes)", dest.display()));
-                        }
-                        Err(e) => {
-                            download_log
-                                .push(format!("  FAILED: {} — {e}", dest.display()));
-                        }
-                    }
-                }
-            }
-        }
+        let all_images: Vec<&serde_json::Value> = collect_batch_images(&results);
+        let download_log = if let Some(ref dir) = req.save_dir {
+            let owned: Vec<serde_json::Value> = all_images.iter().map(|v| (*v).clone()).collect();
+            download_images_to_dir(&client, &owned, std::path::Path::new(dir)).await
+        } else {
+            Vec::new()
+        };
 
         // --- 5. Build summary ---
-        let ok_count = results.iter().filter(|r| r.error.is_none()).count();
-        let err_count = results.iter().filter(|r| r.error.is_some()).count();
-        let total_images: usize = results.iter().map(|r| r.images.len()).sum();
+        format_batch_summary(&results, &mut log);
 
-        log.push(format!(
-            "\nBatch complete: {ok_count} ok, {err_count} failed, {total_images} images"
-        ));
-
-        let mut detail_lines: Vec<String> = Vec::new();
-        for (i, jr) in results.iter().enumerate() {
-            let status = if let Some(ref e) = jr.error {
-                format!("ERROR: {e}")
-            } else {
-                let img_names: Vec<&str> = jr
-                    .images
-                    .iter()
-                    .filter_map(|img| img["filename"].as_str())
-                    .collect();
-                format!("{} image(s): {}", jr.images.len(), img_names.join(", "))
-            };
-            detail_lines.push(format!(
-                "  {}. [{}] {} — {}",
-                i + 1,
-                jr.prompt_id,
-                jr.label,
-                status
-            ));
-        }
-
-        let mut output = format!("{}\n\n{}", log.join("\n"), detail_lines.join("\n"));
-
+        let mut output = log.join("\n");
         if !download_log.is_empty() {
             output.push_str(&format!("\n\ndownloads:\n{}", download_log.join("\n")));
         }
@@ -1625,14 +1367,9 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslRunScriptRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let (lua_args, script_label) = resolve_script_source(
-            req.script_file.as_deref(),
-            req.code.as_deref(),
-        )?;
-        let work_dir = resolve_working_dir(
-            req.working_dir.as_deref(),
-            req.script_file.as_deref(),
-        )?;
+        let (lua_args, script_label) =
+            resolve_script_source(req.script_file.as_deref(), req.code.as_deref())?;
+        let work_dir = resolve_working_dir(req.working_dir.as_deref(), req.script_file.as_deref())?;
         let timeout = req.timeout.unwrap_or(SCRIPT_TIMEOUT_SECS);
 
         let result = exec_lua(&lua_args, &work_dir, timeout, &[]).await?;
@@ -1673,14 +1410,9 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslRunRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let (lua_args, script_label) = resolve_script_source(
-            req.script_file.as_deref(),
-            req.code.as_deref(),
-        )?;
-        let work_dir = resolve_working_dir(
-            req.working_dir.as_deref(),
-            req.script_file.as_deref(),
-        )?;
+        let (lua_args, script_label) =
+            resolve_script_source(req.script_file.as_deref(), req.code.as_deref())?;
+        let work_dir = resolve_working_dir(req.working_dir.as_deref(), req.script_file.as_deref())?;
         let timeout = req.timeout.unwrap_or(SCRIPT_TIMEOUT_SECS);
 
         // --- Phase 1: Compile --- temp dir for workflow JSONs
@@ -1715,21 +1447,8 @@ impl VdslMcpServer {
         }
 
         // Enumerate compiled .json files
-        let mut workflow_files: Vec<String> = Vec::new();
-        let mut rd = tokio::fs::read_dir(out_dir.path()).await.map_err(|e| {
-            McpError::internal_error(format!("failed to read temp dir: {e}"), None)
-        })?;
-        while let Some(entry) = rd.next_entry().await.map_err(|e| {
-            McpError::internal_error(format!("read_dir error: {e}"), None)
-        })? {
-            let p = entry.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("json") {
-                if let Some(s) = p.to_str() {
-                    workflow_files.push(s.to_string());
-                }
-            }
-        }
-        workflow_files.sort();
+        let out_dir_str_ref = out_dir.path().to_string_lossy().to_string();
+        let workflow_files = scan_json_dir(&out_dir_str_ref).await?;
 
         log.push(format!("compiled: {} workflow(s)", workflow_files.len()));
 
@@ -1743,8 +1462,11 @@ impl VdslMcpServer {
         // --- compile_only: return here ---
         if req.compile_only || workflow_files.is_empty() {
             if workflow_files.is_empty() {
-                log.push("No .json workflows found in VDSL_OUT_DIR. \
-                          Ensure the script writes workflow files there.".to_string());
+                log.push(
+                    "No .json workflows found in VDSL_OUT_DIR. \
+                          Ensure the script writes workflow files there."
+                        .to_string(),
+                );
             }
             return Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]));
         }
@@ -1755,209 +1477,43 @@ impl VdslMcpServer {
             pod_id: req.pod_id,
         };
         let url = Self::resolve_comfyui_url(&connect_req)?;
-        let client = Self::comfyui_client(url.clone());
-
-        // Load and submit workflows
-        struct TaggedWorkflow {
-            label: String,
-            workflow: serde_json::Value,
-        }
+        let client = Self::comfyui_client(url.clone())?;
 
         let mut tagged: Vec<TaggedWorkflow> = Vec::with_capacity(workflow_files.len());
         for path in &workflow_files {
-            let content = tokio::fs::read_to_string(path).await.map_err(|e| {
-                McpError::internal_error(format!("failed to read '{path}': {e}"), None)
-            })?;
-            let wf: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
-                McpError::internal_error(format!("invalid JSON in '{path}': {e}"), None)
-            })?;
-            let label = std::path::Path::new(path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-            tagged.push(TaggedWorkflow { label, workflow: wf });
+            tagged.push(load_tagged_workflow(path).await?);
         }
 
         let total = tagged.len();
         log.push(format!("\nBatch: {total} workflow(s) → {url}"));
 
-        // Submit all
-        struct Submitted {
-            label: String,
-            prompt_id: String,
-        }
-
-        let mut jobs: Vec<Submitted> = Vec::with_capacity(total);
-        for tw in &tagged {
-            match client.post_prompt(&tw.workflow).await {
-                Ok(resp) => {
-                    if let Some(pid) = resp["prompt_id"].as_str() {
-                        log.push(format!("  queued: {} → {pid}", tw.label));
-                        jobs.push(Submitted {
-                            label: tw.label.clone(),
-                            prompt_id: pid.to_string(),
-                        });
-                    } else {
-                        log.push(format!("  SKIP {}: no prompt_id in response", tw.label));
-                    }
-                }
-                Err(e) => {
-                    log.push(format!("  SKIP {}: {e}", tw.label));
-                }
-            }
-        }
-
+        let jobs = submit_workflows(&client, &tagged, &mut log).await;
         if jobs.is_empty() {
             log.push("All workflows failed to submit.".to_string());
             return Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]));
         }
 
-        // Poll until all complete
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(timeout);
-        let interval = std::time::Duration::from_secs(BATCH_POLL_INTERVAL_SECS);
-
-        struct JobResult {
-            label: String,
-            #[allow(dead_code)]
-            prompt_id: String,
-            images: Vec<serde_json::Value>,
-            error: Option<String>,
-        }
-
-        let mut results: Vec<JobResult> = Vec::new();
-        let mut pending: Vec<Submitted> = jobs;
-
-        while !pending.is_empty() {
-            if std::time::Instant::now() >= deadline {
-                for p in &pending {
-                    results.push(JobResult {
-                        label: p.label.clone(),
-                        prompt_id: p.prompt_id.clone(),
-                        images: Vec::new(),
-                        error: Some("timeout".to_string()),
-                    });
-                }
-                break;
-            }
-
-            tokio::time::sleep(interval).await;
-
-            let mut still_pending = Vec::new();
-            for job in pending {
-                let history = match client.history(&job.prompt_id).await {
-                    Ok(h) => h,
-                    Err(_) => {
-                        still_pending.push(job);
-                        continue;
-                    }
-                };
-
-                if let Some(entry) = history.get(&job.prompt_id) {
-                    if let Some(status) = entry.get("status") {
-                        let completed = status["completed"].as_bool().unwrap_or(false);
-                        if completed {
-                            let status_str =
-                                status["status_str"].as_str().unwrap_or("unknown");
-                            if status_str == "error" {
-                                let mut msg = "execution error".to_string();
-                                if let Some(messages) = status["messages"].as_array() {
-                                    for m in messages {
-                                        if m[0].as_str() == Some("execution_error") {
-                                            if let Some(detail) = m[1]["message"].as_str() {
-                                                msg = detail.to_string();
-                                            }
-                                        }
-                                    }
-                                }
-                                results.push(JobResult {
-                                    label: job.label,
-                                    prompt_id: job.prompt_id,
-                                    images: Vec::new(),
-                                    error: Some(msg),
-                                });
-                                continue;
-                            }
-
-                            let mut imgs = Vec::new();
-                            if let Some(outputs) = entry.get("outputs") {
-                                if let Some(obj) = outputs.as_object() {
-                                    for (_node_id, output) in obj {
-                                        if let Some(arr) =
-                                            output.get("images").and_then(|v| v.as_array())
-                                        {
-                                            for img in arr {
-                                                imgs.push(img.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            results.push(JobResult {
-                                label: job.label,
-                                prompt_id: job.prompt_id,
-                                images: imgs,
-                                error: None,
-                            });
-                            continue;
-                        }
-                    }
-                }
-                still_pending.push(job);
-            }
-            pending = still_pending;
-        }
+        let results = poll_jobs(
+            &client,
+            jobs,
+            total,
+            timeout,
+            BATCH_POLL_INTERVAL_SECS,
+            &mut log,
+        )
+        .await;
 
         // Download images
-        let mut download_log: Vec<String> = Vec::new();
-        if let Some(ref dir) = req.save_dir {
-            let save_path = std::path::Path::new(dir);
-            for jr in &results {
-                for img in &jr.images {
-                    let filename = match img["filename"].as_str() {
-                        Some(f) => f,
-                        None => continue,
-                    };
-                    let subfolder = img["subfolder"].as_str().unwrap_or("");
-                    let dest = unique_dest(save_path, filename);
-
-                    match client.download_image(filename, subfolder, &dest).await {
-                        Ok(size) => {
-                            download_log
-                                .push(format!("  saved: {} ({size} bytes)", dest.display()));
-                        }
-                        Err(e) => {
-                            download_log
-                                .push(format!("  FAILED: {} — {e}", dest.display()));
-                        }
-                    }
-                }
-            }
-        }
+        let all_images: Vec<&serde_json::Value> = collect_batch_images(&results);
+        let download_log = if let Some(ref dir) = req.save_dir {
+            let owned: Vec<serde_json::Value> = all_images.iter().map(|v| (*v).clone()).collect();
+            download_images_to_dir(&client, &owned, std::path::Path::new(dir)).await
+        } else {
+            Vec::new()
+        };
 
         // Summary
-        let ok_count = results.iter().filter(|r| r.error.is_none()).count();
-        let err_count = results.iter().filter(|r| r.error.is_some()).count();
-        let total_images: usize = results.iter().map(|r| r.images.len()).sum();
-
-        log.push(format!(
-            "\nComplete: {ok_count} ok, {err_count} failed, {total_images} images"
-        ));
-
-        for (i, jr) in results.iter().enumerate() {
-            let status = if let Some(ref e) = jr.error {
-                format!("ERROR: {e}")
-            } else {
-                let names: Vec<&str> = jr
-                    .images
-                    .iter()
-                    .filter_map(|img| img["filename"].as_str())
-                    .collect();
-                format!("{} image(s): {}", jr.images.len(), names.join(", "))
-            };
-            log.push(format!("  {}. {} — {}", i + 1, jr.label, status));
-        }
+        format_batch_summary(&results, &mut log);
 
         if !download_log.is_empty() {
             log.push(format!("\ndownloads:\n{}", download_log.join("\n")));
@@ -1986,7 +1542,7 @@ fn unique_dest(dir: &std::path::Path, filename: &str) -> std::path::PathBuf {
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    for n in 2u32.. {
+    for n in 2u32..10_000 {
         let name = if ext.is_empty() {
             format!("{stem}_{n}")
         } else {
@@ -1997,6 +1553,7 @@ fn unique_dest(dir: &std::path::Path, filename: &str) -> std::path::PathBuf {
             return p;
         }
     }
+    // 10,000件を超える衝突は異常状態。元のパスを返し呼び出し側に委ねる。
     candidate
 }
 
@@ -2040,15 +1597,12 @@ fn resolve_working_dir(
         Some(d) => std::path::PathBuf::from(d),
         None => {
             if let Some(path) = script_file {
-                let script_path =
-                    std::path::Path::new(path)
-                        .canonicalize()
-                        .map_err(|e| {
-                            McpError::invalid_params(
-                                format!("cannot resolve script path '{path}': {e}"),
-                                None,
-                            )
-                        })?;
+                let script_path = std::path::Path::new(path).canonicalize().map_err(|e| {
+                    McpError::invalid_params(
+                        format!("cannot resolve script path '{path}': {e}"),
+                        None,
+                    )
+                })?;
                 let mut dir = script_path.parent();
                 loop {
                     match dir {
@@ -2115,6 +1669,9 @@ async fn exec_lua(
         cmd.env(k, v);
     }
 
+    // タイムアウトやドロップ時に子プロセスを確実に終了し、ゾンビ化を防ぐ
+    cmd.kill_on_drop(true);
+
     let child = cmd.spawn().map_err(|e| {
         McpError::internal_error(
             format!("failed to spawn lua: {e}. Is lua installed and on PATH?"),
@@ -2137,7 +1694,7 @@ async fn exec_lua(
             return Err(McpError::internal_error(
                 format!("script timed out after {timeout_secs}s"),
                 None,
-            ))
+            ));
         }
     };
 
@@ -2146,6 +1703,264 @@ async fn exec_lua(
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+// =============================================================================
+// Batch workflow helpers (shared by generate, batch_generate, run)
+// =============================================================================
+
+/// Tagged workflow with a display label.
+struct TaggedWorkflow {
+    label: String,
+    workflow: serde_json::Value,
+}
+
+/// A submitted job awaiting completion.
+struct SubmittedJob {
+    label: String,
+    prompt_id: String,
+}
+
+/// Result of a completed job.
+struct JobResult {
+    label: String,
+    prompt_id: String,
+    images: Vec<serde_json::Value>,
+    error: Option<String>,
+}
+
+/// Collect output images from a ComfyUI history entry.
+fn collect_output_images(entry: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut images = Vec::new();
+    if let Some(outputs) = entry.get("outputs") {
+        if let Some(obj) = outputs.as_object() {
+            for (_node_id, output) in obj {
+                if let Some(arr) = output.get("images").and_then(|v| v.as_array()) {
+                    for img in arr {
+                        images.push(img.clone());
+                    }
+                }
+            }
+        }
+    }
+    images
+}
+
+/// Check if a ComfyUI history entry indicates an execution error.
+/// Returns `Some(message)` on error, `None` on success.
+fn check_execution_error(status: &serde_json::Value) -> Option<String> {
+    let status_str = status["status_str"].as_str().unwrap_or("unknown");
+    if status_str != "error" {
+        return None;
+    }
+    let mut msg = "execution error".to_string();
+    if let Some(messages) = status["messages"].as_array() {
+        for m in messages {
+            if m[0].as_str() == Some("execution_error") {
+                if let Some(detail) = m[1]["message"].as_str() {
+                    msg = detail.to_string();
+                }
+            }
+        }
+    }
+    Some(msg)
+}
+
+/// Download images to a local directory, returning log lines.
+async fn download_images_to_dir(
+    client: &ComfyUiClient,
+    images: &[serde_json::Value],
+    save_dir: &std::path::Path,
+) -> Vec<String> {
+    let mut log = Vec::new();
+    for img in images {
+        let filename = match img["filename"].as_str() {
+            Some(f) => f,
+            None => continue,
+        };
+        let subfolder = img["subfolder"].as_str().unwrap_or("");
+        let dest = unique_dest(save_dir, filename);
+        match client.download_image(filename, subfolder, &dest).await {
+            Ok(size) => log.push(format!("  saved: {} ({size} bytes)", dest.display())),
+            Err(e) => log.push(format!("  FAILED: {} — {e}", dest.display())),
+        }
+    }
+    log
+}
+
+/// Submit workflows to ComfyUI queue. Returns submitted jobs; errors are logged.
+async fn submit_workflows(
+    client: &ComfyUiClient,
+    tagged: &[TaggedWorkflow],
+    log: &mut Vec<String>,
+) -> Vec<SubmittedJob> {
+    let mut jobs = Vec::with_capacity(tagged.len());
+    for tw in tagged {
+        match client.post_prompt(&tw.workflow).await {
+            Ok(resp) => {
+                if let Some(pid) = resp["prompt_id"].as_str() {
+                    log.push(format!("  queued: {} → {pid}", tw.label));
+                    jobs.push(SubmittedJob {
+                        label: tw.label.clone(),
+                        prompt_id: pid.to_string(),
+                    });
+                } else {
+                    log.push(format!("  SKIP {}: no prompt_id in response", tw.label));
+                }
+            }
+            Err(e) => {
+                log.push(format!("  SKIP {}: {e}", tw.label));
+            }
+        }
+    }
+    jobs
+}
+
+/// Poll ComfyUI until all submitted jobs complete or timeout.
+async fn poll_jobs(
+    client: &ComfyUiClient,
+    jobs: Vec<SubmittedJob>,
+    total_submitted: usize,
+    timeout_secs: u64,
+    poll_interval_secs: u64,
+    log: &mut Vec<String>,
+) -> Vec<JobResult> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let interval = std::time::Duration::from_secs(poll_interval_secs);
+
+    let mut results: Vec<JobResult> = Vec::new();
+    let mut pending = jobs;
+
+    while !pending.is_empty() {
+        if std::time::Instant::now() >= deadline {
+            for p in &pending {
+                results.push(JobResult {
+                    label: p.label.clone(),
+                    prompt_id: p.prompt_id.clone(),
+                    images: Vec::new(),
+                    error: Some("timeout".to_string()),
+                });
+            }
+            break;
+        }
+
+        tokio::time::sleep(interval).await;
+
+        let mut still_pending = Vec::new();
+        for job in pending {
+            let history = match client.history(&job.prompt_id).await {
+                Ok(h) => h,
+                Err(_) => {
+                    still_pending.push(job);
+                    continue;
+                }
+            };
+
+            if let Some(entry) = history.get(&job.prompt_id) {
+                if let Some(status) = entry.get("status") {
+                    let completed = status["completed"].as_bool().unwrap_or(false);
+                    if completed {
+                        if let Some(err_msg) = check_execution_error(status) {
+                            results.push(JobResult {
+                                label: job.label,
+                                prompt_id: job.prompt_id,
+                                images: Vec::new(),
+                                error: Some(err_msg),
+                            });
+                            continue;
+                        }
+                        results.push(JobResult {
+                            label: job.label,
+                            prompt_id: job.prompt_id,
+                            images: collect_output_images(entry),
+                            error: None,
+                        });
+                        continue;
+                    }
+                }
+            }
+            still_pending.push(job);
+        }
+        pending = still_pending;
+
+        let done = results.len();
+        log.push(format!("  progress: {done}/{total_submitted} complete"));
+    }
+
+    results
+}
+
+/// Load a workflow JSON file into a TaggedWorkflow.
+async fn load_tagged_workflow(path: &str) -> Result<TaggedWorkflow, McpError> {
+    let content = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| McpError::internal_error(format!("failed to read '{path}': {e}"), None))?;
+    let workflow: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| McpError::internal_error(format!("invalid JSON in '{path}': {e}"), None))?;
+    let label = std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    Ok(TaggedWorkflow { label, workflow })
+}
+
+/// Scan a directory for .json files, returning sorted paths.
+async fn scan_json_dir(dir: &str) -> Result<Vec<String>, McpError> {
+    let mut entries: Vec<String> = Vec::new();
+    let mut rd = tokio::fs::read_dir(dir).await.map_err(|e| {
+        McpError::invalid_params(format!("failed to read directory '{dir}': {e}"), None)
+    })?;
+    while let Some(entry) = rd
+        .next_entry()
+        .await
+        .map_err(|e| McpError::internal_error(format!("read_dir error: {e}"), None))?
+    {
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) == Some("json") {
+            if let Some(s) = p.to_str() {
+                entries.push(s.to_string());
+            }
+        }
+    }
+    entries.sort();
+    Ok(entries)
+}
+
+/// Format batch results into summary lines.
+fn format_batch_summary(results: &[JobResult], log: &mut Vec<String>) {
+    let ok_count = results.iter().filter(|r| r.error.is_none()).count();
+    let err_count = results.iter().filter(|r| r.error.is_some()).count();
+    let total_images: usize = results.iter().map(|r| r.images.len()).sum();
+
+    log.push(format!(
+        "\nComplete: {ok_count} ok, {err_count} failed, {total_images} images"
+    ));
+
+    for (i, jr) in results.iter().enumerate() {
+        let status = if let Some(ref e) = jr.error {
+            format!("ERROR: {e}")
+        } else {
+            let names: Vec<&str> = jr
+                .images
+                .iter()
+                .filter_map(|img| img["filename"].as_str())
+                .collect();
+            format!("{} image(s): {}", jr.images.len(), names.join(", "))
+        };
+        log.push(format!(
+            "  {}. [{}] {} — {}",
+            i + 1,
+            jr.prompt_id,
+            jr.label,
+            status
+        ));
+    }
+}
+
+/// Collect all images from batch results.
+fn collect_batch_images(results: &[JobResult]) -> Vec<&serde_json::Value> {
+    results.iter().flat_map(|r| r.images.iter()).collect()
 }
 
 // =============================================================================
@@ -2523,10 +2338,9 @@ mod tests {
 
     #[test]
     fn batch_request_with_inline_workflows() {
-        let req: VdslBatchGenerateRequest = serde_json::from_str(
-            r#"{"pod_id":"pod_abc","workflows":[{"1":{}},{"2":{}}]}"#,
-        )
-        .unwrap();
+        let req: VdslBatchGenerateRequest =
+            serde_json::from_str(r#"{"pod_id":"pod_abc","workflows":[{"1":{}},{"2":{}}]}"#)
+                .unwrap();
         assert_eq!(req.pod_id.as_deref(), Some("pod_abc"));
         assert_eq!(req.workflows.as_ref().map(|w| w.len()), Some(2));
         assert!(req.workflow_files.is_none());
@@ -2547,10 +2361,8 @@ mod tests {
 
     #[test]
     fn batch_request_with_load_dir() {
-        let req: VdslBatchGenerateRequest = serde_json::from_str(
-            r#"{"pod_id":"pod_abc","load_dir":"/tmp/workflows"}"#,
-        )
-        .unwrap();
+        let req: VdslBatchGenerateRequest =
+            serde_json::from_str(r#"{"pod_id":"pod_abc","load_dir":"/tmp/workflows"}"#).unwrap();
         assert_eq!(req.load_dir.as_deref(), Some("/tmp/workflows"));
         assert!(req.workflows.is_none());
         assert!(req.workflow_files.is_none());
@@ -2591,20 +2403,17 @@ mod tests {
 
     #[test]
     fn run_script_request_with_code() {
-        let req: VdslRunScriptRequest = serde_json::from_str(
-            r#"{"code":"print('hello')","working_dir":"/home/user/vdsl"}"#,
-        )
-        .unwrap();
+        let req: VdslRunScriptRequest =
+            serde_json::from_str(r#"{"code":"print('hello')","working_dir":"/home/user/vdsl"}"#)
+                .unwrap();
         assert_eq!(req.code.as_deref(), Some("print('hello')"));
         assert!(req.script_file.is_none());
     }
 
     #[test]
     fn run_script_request_with_timeout() {
-        let req: VdslRunScriptRequest = serde_json::from_str(
-            r#"{"script_file":"/tmp/test.lua","timeout":120}"#,
-        )
-        .unwrap();
+        let req: VdslRunScriptRequest =
+            serde_json::from_str(r#"{"script_file":"/tmp/test.lua","timeout":120}"#).unwrap();
         assert_eq!(req.timeout, Some(120));
     }
 
@@ -2620,10 +2429,8 @@ mod tests {
     #[test]
     fn run_script_request_auto_detect_working_dir() {
         // working_dir is optional when script_file is provided
-        let req: VdslRunScriptRequest = serde_json::from_str(
-            r#"{"script_file":"/home/user/vdsl/examples/test.lua"}"#,
-        )
-        .unwrap();
+        let req: VdslRunScriptRequest =
+            serde_json::from_str(r#"{"script_file":"/home/user/vdsl/examples/test.lua"}"#).unwrap();
         assert!(req.working_dir.is_none());
         assert!(req.script_file.is_some());
     }

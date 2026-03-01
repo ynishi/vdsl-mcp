@@ -18,5 +18,3 @@ urlencoding = "2"
 tempfile = "3"
 
 [dev-dependencies]
-insta = { version = "1", features = ["json"] }
-tempfile = "3"

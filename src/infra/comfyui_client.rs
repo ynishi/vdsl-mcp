@@ -16,16 +16,15 @@ pub struct ComfyUiClient {
 }
 
 impl ComfyUiClient {
-    pub fn new(base_url: String, token: Option<String>) -> Self {
+    pub fn new(base_url: String, token: Option<String>) -> Result<Self, reqwest::Error> {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        Self {
+            .build()?;
+        Ok(Self {
             base_url,
             token,
             http,
-        }
+        })
     }
 
     /// Build a GET request with optional Bearer auth header.
@@ -251,13 +250,14 @@ mod tests {
 
     #[test]
     fn client_without_token() {
-        let client = ComfyUiClient::new("http://localhost:8188".into(), None);
+        let client = ComfyUiClient::new("http://localhost:8188".into(), None).unwrap();
         assert_eq!(client.base_url(), "http://localhost:8188");
     }
 
     #[test]
     fn client_with_token() {
-        let client = ComfyUiClient::new("http://localhost:8188".into(), Some("mytoken".into()));
+        let client =
+            ComfyUiClient::new("http://localhost:8188".into(), Some("mytoken".into())).unwrap();
         assert_eq!(client.base_url(), "http://localhost:8188");
     }
 }

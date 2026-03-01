@@ -13,6 +13,14 @@ pub struct RunPodCli {
     api_key: String,
 }
 
+impl std::fmt::Debug for RunPodCli {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunPodCli")
+            .field("api_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
 impl RunPodCli {
     pub fn new(api_key: String) -> Self {
         Self { api_key }
