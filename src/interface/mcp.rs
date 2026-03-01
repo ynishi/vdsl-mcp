@@ -351,6 +351,30 @@ pub struct VdslPodCreateRequest {
     pub disk_gb: Option<u32>,
 }
 
+/// Default timeout for generate poll (seconds).
+const GENERATE_TIMEOUT_SECS: u64 = 300;
+/// Default poll interval for generate (seconds).
+const GENERATE_POLL_INTERVAL_SECS: u64 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslGenerateRequest {
+    /// ComfyUI URL (e.g. "https://pod_id-8188.proxy.runpod.net") or RunPod pod ID.
+    pub url: Option<String>,
+
+    /// RunPod pod ID (e.g. "pod_abc123def"). Proxy URL is auto-constructed.
+    /// Takes precedence over url if both are provided.
+    pub pod_id: Option<String>,
+
+    /// ComfyUI workflow JSON (inline). Mutually exclusive with workflow_file.
+    pub workflow: Option<serde_json::Value>,
+
+    /// Path to a JSON file containing the ComfyUI workflow. Mutually exclusive with workflow.
+    pub workflow_file: Option<String>,
+
+    /// Timeout in seconds for waiting for completion (default: 300).
+    pub timeout: Option<u64>,
+}
+
 // =============================================================================
 // Tool implementations
 // =============================================================================
@@ -968,6 +992,162 @@ impl VdslMcpServer {
         );
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
+
+    #[tool(
+        name = "vdsl_generate",
+        description = "Queue a ComfyUI workflow and wait for completion. \
+            Accepts workflow JSON inline (workflow) or as a file path (workflow_file). \
+            Polls /history until done, returns prompt_id and output images. \
+            Timeout: 5 minutes (configurable).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn generate(
+        &self,
+        Parameters(req): Parameters<VdslGenerateRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let connect_req = VdslConnectRequest {
+            url: req.url,
+            pod_id: req.pod_id,
+        };
+        let url = Self::resolve_comfyui_url(&connect_req)?;
+        let client = Self::comfyui_client(url.clone());
+
+        // --- 1. Resolve workflow ---
+        let workflow = match (req.workflow, req.workflow_file) {
+            (Some(w), None) => w,
+            (None, Some(path)) => {
+                let content = tokio::fs::read_to_string(&path).await.map_err(|e| {
+                    McpError::invalid_params(
+                        format!("failed to read workflow file '{path}': {e}"),
+                        None,
+                    )
+                })?;
+                serde_json::from_str(&content).map_err(|e| {
+                    McpError::invalid_params(
+                        format!("invalid JSON in workflow file '{path}': {e}"),
+                        None,
+                    )
+                })?
+            }
+            (Some(_), Some(_)) => {
+                return Err(McpError::invalid_params(
+                    "specify either 'workflow' or 'workflow_file', not both",
+                    None,
+                ))
+            }
+            (None, None) => {
+                return Err(McpError::invalid_params(
+                    "either 'workflow' (inline JSON) or 'workflow_file' (path) is required",
+                    None,
+                ))
+            }
+        };
+
+        // --- 2. Queue ---
+        let resp = client
+            .post_prompt(&workflow)
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        let prompt_id = resp["prompt_id"]
+            .as_str()
+            .ok_or_else(|| {
+                McpError::internal_error(
+                    format!("no prompt_id in response: {resp}"),
+                    None,
+                )
+            })?
+            .to_string();
+
+        // --- 3. Poll for completion ---
+        let timeout = req.timeout.unwrap_or(GENERATE_TIMEOUT_SECS);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+        let interval = std::time::Duration::from_secs(GENERATE_POLL_INTERVAL_SECS);
+
+        let entry = loop {
+            let history = client
+                .history(&prompt_id)
+                .await
+                .map_err(Self::to_mcp_error)?;
+
+            if let Some(entry) = history.get(&prompt_id) {
+                if let Some(status) = entry.get("status") {
+                    let completed = status["completed"].as_bool().unwrap_or(false);
+                    if completed {
+                        let status_str =
+                            status["status_str"].as_str().unwrap_or("unknown");
+                        if status_str == "error" {
+                            let mut msg = "ComfyUI execution error".to_string();
+                            if let Some(messages) = status["messages"].as_array() {
+                                for m in messages {
+                                    if m[0].as_str() == Some("execution_error") {
+                                        if let Some(detail) = m[1]["message"].as_str() {
+                                            msg = format!("{msg}: {detail}");
+                                        }
+                                    }
+                                }
+                            }
+                            return Err(McpError::internal_error(msg, None));
+                        }
+                        break entry.clone();
+                    }
+                }
+            }
+
+            if std::time::Instant::now() >= deadline {
+                return Err(McpError::internal_error(
+                    format!("timeout after {timeout}s waiting for prompt {prompt_id}"),
+                    None,
+                ));
+            }
+
+            tokio::time::sleep(interval).await;
+        };
+
+        // --- 4. Collect output images ---
+        let mut images = Vec::new();
+        if let Some(outputs) = entry.get("outputs") {
+            if let Some(obj) = outputs.as_object() {
+                for (_node_id, output) in obj {
+                    if let Some(imgs) = output.get("images") {
+                        if let Some(arr) = imgs.as_array() {
+                            for img in arr {
+                                images.push(img.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let image_summary: Vec<String> = images
+            .iter()
+            .enumerate()
+            .map(|(i, img)| {
+                let name = img["filename"].as_str().unwrap_or("?");
+                let subfolder = img["subfolder"].as_str().unwrap_or("");
+                if subfolder.is_empty() {
+                    format!("  {}. {name}", i + 1)
+                } else {
+                    format!("  {}. {subfolder}/{name}", i + 1)
+                }
+            })
+            .collect();
+
+        let output = format!(
+            "prompt_id: {prompt_id}\nserver: {url}\nimages: {}\n{}\n\n{}",
+            images.len(),
+            image_summary.join("\n"),
+            serde_json::to_string_pretty(&images)
+                .unwrap_or_else(|_| format!("{images:?}"))
+        );
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
 }
 
 // =============================================================================
@@ -1285,5 +1465,46 @@ mod tests {
         let err = resolve_model_dir("foobar").unwrap_err();
         assert!(err.contains("unknown target"));
         assert!(err.contains("loras"));
+    }
+
+    // --- Generate request tests ---
+
+    #[test]
+    fn generate_request_with_inline_workflow() {
+        let req: VdslGenerateRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_abc","workflow":{"1":{"class_type":"KSampler"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(req.pod_id.as_deref(), Some("pod_abc"));
+        assert!(req.workflow.is_some());
+        assert!(req.workflow_file.is_none());
+    }
+
+    #[test]
+    fn generate_request_with_file() {
+        let req: VdslGenerateRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_abc","workflow_file":"/tmp/workflow.json"}"#,
+        )
+        .unwrap();
+        assert!(req.workflow.is_none());
+        assert_eq!(req.workflow_file.as_deref(), Some("/tmp/workflow.json"));
+    }
+
+    #[test]
+    fn generate_request_with_timeout() {
+        let req: VdslGenerateRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_abc","workflow":{},"timeout":600}"#,
+        )
+        .unwrap();
+        assert_eq!(req.timeout, Some(600));
+    }
+
+    #[test]
+    fn generate_request_empty_is_valid_json() {
+        // Both workflow sources optional at deser level; tool validates at runtime
+        let req: VdslGenerateRequest = serde_json::from_str("{}").unwrap();
+        assert!(req.workflow.is_none());
+        assert!(req.workflow_file.is_none());
+        assert!(req.pod_id.is_none());
     }
 }

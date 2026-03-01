@@ -82,6 +82,38 @@ impl ComfyUiClient {
         self.get_json("/queue").await
     }
 
+    /// POST a workflow to `/prompt` and return the response (contains `prompt_id`).
+    ///
+    /// Mirrors Lua `Registry:queue()` in `registry.lua` L128-138.
+    pub async fn post_prompt(
+        &self,
+        prompt: &serde_json::Value,
+    ) -> Result<serde_json::Value, DomainError> {
+        let url = format!("{}/prompt", self.base_url);
+        let body = serde_json::json!({ "prompt": prompt });
+
+        let mut req = self.http.post(&url).json(&body);
+        if let Some(token) = &self.token {
+            req = req.bearer_auth(token);
+        }
+
+        let resp = req.send().await.map_err(|e| {
+            DomainError::ComfyUiConnection(format!("failed to POST /prompt: {e}"))
+        })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(DomainError::ComfyUiConnection(format!(
+                "POST /prompt returned HTTP {status}: {body_text}"
+            )));
+        }
+
+        resp.json().await.map_err(|e| {
+            DomainError::ComfyUiConnection(format!("invalid JSON from POST /prompt: {e}"))
+        })
+    }
+
     /// Upload a file to ComfyUI via `POST /upload/image` (multipart/form-data).
     ///
     /// Mirrors Lua `Registry:upload()` in `registry.lua` L276-295.
