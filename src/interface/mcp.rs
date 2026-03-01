@@ -588,6 +588,30 @@ pub struct VdslCatalogsRequest {
 const DEFAULT_CATALOG_SCRIPT: &str = "scripts/catalog_available.lua";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslPreflightRequest {
+    /// VDSL script file to check (extracts required models from vdsl.render() calls).
+    pub script_file: String,
+
+    /// VDSL repository root (must contain lua/ for module resolution).
+    pub working_dir: String,
+
+    /// ComfyUI URL for checking model availability.
+    /// If omitted (along with pod_id), only required models are listed without availability check.
+    pub url: Option<String>,
+
+    /// RunPod pod ID for checking model availability.
+    /// Proxy URL is auto-constructed. Takes precedence over url.
+    pub pod_id: Option<String>,
+
+    /// Path to the preflight script.
+    /// Absolute path is used as-is; relative path is resolved from working_dir.
+    /// Default: "scripts/preflight.lua"
+    pub preflight_script: Option<String>,
+}
+
+const DEFAULT_PREFLIGHT_SCRIPT: &str = "scripts/preflight.lua";
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VdslComfyApiRequest {
     /// ComfyUI URL (e.g. "https://pod_id-8188.proxy.runpod.net").
     pub url: Option<String>,
@@ -1679,6 +1703,112 @@ impl VdslMcpServer {
         }
 
         Ok(CallToolResult::success(vec![Content::text(result.stdout)]))
+    }
+
+    #[tool(
+        name = "vdsl_preflight",
+        description = "Check model availability before generation. \
+            Executes the target VDSL script in dry-run mode, captures all vdsl.render() calls, \
+            extracts required models (checkpoints, LoRAs, VAEs, ControlNets, upscalers), \
+            and optionally checks them against a running ComfyUI instance. \
+            Returns JSON report: { ok, missing, required, summary }. \
+            If url/pod_id is provided, models are checked against the server. \
+            If omitted, only required models are listed.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn preflight(
+        &self,
+        Parameters(req): Parameters<VdslPreflightRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let work_dir = std::path::PathBuf::from(&req.working_dir);
+        if !work_dir.join("lua").is_dir() {
+            return Err(McpError::invalid_params(
+                format!(
+                    "working_dir '{}' does not contain a lua/ directory",
+                    req.working_dir
+                ),
+                None,
+            ));
+        }
+
+        // Resolve preflight script path
+        let raw = req
+            .preflight_script
+            .as_deref()
+            .unwrap_or(DEFAULT_PREFLIGHT_SCRIPT);
+        let script = {
+            let p = std::path::Path::new(raw);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                work_dir.join(p)
+            }
+        };
+        if !script.exists() {
+            return Err(McpError::invalid_params(
+                format!("preflight script not found: {}", script.display()),
+                None,
+            ));
+        }
+
+        // Resolve target script file
+        let target = {
+            let p = std::path::Path::new(&req.script_file);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                work_dir.join(p)
+            }
+        };
+        if !target.exists() {
+            return Err(McpError::invalid_params(
+                format!("script file not found: {}", target.display()),
+                None,
+            ));
+        }
+
+        // Optionally fetch available models from ComfyUI
+        let mut envs: Vec<(&str, &str)> = Vec::new();
+        let available_json;
+        if req.url.is_some() || req.pod_id.is_some() {
+            let connect_req = VdslConnectRequest {
+                url: req.url,
+                pod_id: req.pod_id,
+            };
+            let url = Self::resolve_comfyui_url(&connect_req)?;
+            let client = Self::comfyui_client(url)?;
+            let object_info = client.object_info().await.map_err(Self::to_mcp_error)?;
+            let catalog = crate::domain::models::parse_model_catalog(&object_info);
+            available_json = serde_json::to_string(&catalog)
+                .map_err(|e| McpError::internal_error(format!("JSON serialize: {e}"), None))?;
+            envs.push(("VDSL_AVAILABLE", &available_json));
+        }
+
+        let lua_args = vec![
+            script.to_string_lossy().to_string(),
+            target.to_string_lossy().to_string(),
+        ];
+        let result = exec_lua(&lua_args, &work_dir, 60, &envs).await?;
+
+        // exit_code 2 = missing models (not an error, report normally)
+        if result.exit_code != 0 && result.exit_code != 2 {
+            let mut msg = format!("preflight script failed (exit {})", result.exit_code);
+            if !result.stderr.is_empty() {
+                msg.push_str(&format!("\n{}", result.stderr));
+            }
+            return Err(McpError::internal_error(msg, None));
+        }
+
+        let mut response = result.stdout;
+        if !result.stderr.is_empty() {
+            response.push_str(&format!("\n[stderr]\n{}", result.stderr));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(response)]))
     }
 
     #[tool(
