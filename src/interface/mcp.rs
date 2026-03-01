@@ -607,6 +607,28 @@ pub struct VdslComfyApiRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslRunpodCliRequest {
+    /// Arguments to pass to runpod-cli (e.g. ["pods", "list-pods"]).
+    /// RUNPOD_API_KEY and -o json are injected automatically.
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslInterruptRequest {
+    /// ComfyUI URL (e.g. "https://pod_id-8188.proxy.runpod.net").
+    pub url: Option<String>,
+
+    /// RunPod pod ID (e.g. "pod_abc123def"). Proxy URL is auto-constructed.
+    /// Takes precedence over url if both are provided.
+    pub pod_id: Option<String>,
+
+    /// Prompt ID(s) to remove from the pending queue.
+    /// If omitted, sends POST /interrupt to cancel the currently running job.
+    /// If provided, sends POST /queue with {"delete": [...]} to remove pending jobs.
+    pub prompt_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct VdslRunRequest {
     /// Path to a .lua script file to execute. Mutually exclusive with code.
@@ -1689,6 +1711,95 @@ impl VdslMcpServer {
             serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"))
         );
         Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    #[tool(
+        name = "vdsl_runpod_cli",
+        description = "Execute any runpod-cli command directly. \
+            RUNPOD_API_KEY and -o json are injected automatically. \
+            Pass subcommand + arguments as an array. \
+            Examples: [\"pods\", \"list-pods\"], [\"exec\", \"pod_id\", \"nvidia-smi\"], \
+            [\"download\", \"list\", \"-i\", \"~/.ssh/id_ed25519_runpod\", \"pod_id\"].",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn runpod_cli(
+        &self,
+        Parameters(req): Parameters<VdslRunpodCliRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if req.args.is_empty() {
+            return Err(McpError::invalid_params(
+                "args is required (e.g. [\"pods\", \"list-pods\"])",
+                None,
+            ));
+        }
+        let api_key = resolve_api_key().map_err(Self::to_mcp_error)?;
+        let cli = RunPodCli::new(api_key);
+        let result = cli.raw_exec(&req.args).await.map_err(Self::to_mcp_error)?;
+
+        let cmd_display = req.args.join(" ");
+        let output = format!(
+            "runpod-cli {cmd_display}\n\n{}",
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"))
+        );
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    #[tool(
+        name = "vdsl_interrupt",
+        description = "Cancel ComfyUI jobs. \
+            Without prompt_ids: sends POST /interrupt to cancel the currently running job. \
+            With prompt_ids: sends POST /queue to delete specific pending jobs from the queue.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn interrupt(
+        &self,
+        Parameters(req): Parameters<VdslInterruptRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let connect_req = VdslConnectRequest {
+            url: req.url,
+            pod_id: req.pod_id,
+        };
+        let url = Self::resolve_comfyui_url(&connect_req)?;
+        let client = Self::comfyui_client(url.clone())?;
+
+        match req.prompt_ids {
+            Some(ids) if !ids.is_empty() => {
+                // Delete specific pending jobs from the queue
+                let body = serde_json::json!({ "delete": ids });
+                let result = client
+                    .api_request("POST", "/queue", Some(&body))
+                    .await
+                    .map_err(Self::to_mcp_error)?;
+
+                let output = format!(
+                    "Deleted {} job(s) from queue at {url}\n\n{}",
+                    ids.len(),
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"))
+                );
+                Ok(CallToolResult::success(vec![Content::text(output)]))
+            }
+            _ => {
+                // Interrupt the currently running job
+                let result = client
+                    .api_request("POST", "/interrupt", None)
+                    .await
+                    .map_err(Self::to_mcp_error)?;
+
+                let output = format!(
+                    "Interrupted running job at {url}\n\n{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"))
+                );
+                Ok(CallToolResult::success(vec![Content::text(output)]))
+            }
+        }
     }
 
     #[tool(
@@ -2886,6 +2997,70 @@ mod tests {
     fn comfy_api_request_missing_path() {
         let result = serde_json::from_str::<VdslComfyApiRequest>(r#"{"pod_id":"pod_abc"}"#);
         assert!(result.is_err());
+    }
+
+    // --- vdsl_runpod_cli tests ---
+
+    #[test]
+    fn runpod_cli_request_pods_list() {
+        let req: VdslRunpodCliRequest =
+            serde_json::from_str(r#"{"args":["pods","list-pods"]}"#).unwrap();
+        assert_eq!(req.args, vec!["pods", "list-pods"]);
+    }
+
+    #[test]
+    fn runpod_cli_request_exec() {
+        let req: VdslRunpodCliRequest =
+            serde_json::from_str(r#"{"args":["exec","pod_abc","nvidia-smi"]}"#).unwrap();
+        assert_eq!(req.args.len(), 3);
+        assert_eq!(req.args[0], "exec");
+        assert_eq!(req.args[1], "pod_abc");
+    }
+
+    #[test]
+    fn runpod_cli_request_empty_args() {
+        let req: VdslRunpodCliRequest = serde_json::from_str(r#"{"args":[]}"#).unwrap();
+        assert!(req.args.is_empty());
+    }
+
+    #[test]
+    fn runpod_cli_request_missing_args() {
+        let result = serde_json::from_str::<VdslRunpodCliRequest>(r#"{}"#);
+        assert!(result.is_err());
+    }
+
+    // --- vdsl_interrupt tests ---
+
+    #[test]
+    fn interrupt_request_no_prompt_ids() {
+        let req: VdslInterruptRequest = serde_json::from_str(r#"{"pod_id":"pod_abc"}"#).unwrap();
+        assert_eq!(req.pod_id.as_deref(), Some("pod_abc"));
+        assert!(req.prompt_ids.is_none());
+    }
+
+    #[test]
+    fn interrupt_request_with_prompt_ids() {
+        let req: VdslInterruptRequest =
+            serde_json::from_str(r#"{"pod_id":"pod_abc","prompt_ids":["id1","id2"]}"#).unwrap();
+        let ids = req.prompt_ids.as_ref().unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], "id1");
+        assert_eq!(ids[1], "id2");
+    }
+
+    #[test]
+    fn interrupt_request_with_url() {
+        let req: VdslInterruptRequest =
+            serde_json::from_str(r#"{"url":"https://example.com:8188"}"#).unwrap();
+        assert_eq!(req.url.as_deref(), Some("https://example.com:8188"));
+        assert!(req.pod_id.is_none());
+    }
+
+    #[test]
+    fn interrupt_request_missing_both_url_and_pod_id() {
+        let req: VdslInterruptRequest = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(req.url.is_none());
+        assert!(req.pod_id.is_none());
     }
 
     // --- unique_dest tests ---

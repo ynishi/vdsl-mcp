@@ -26,6 +26,15 @@ impl RunPodCli {
         Self { api_key }
     }
 
+    /// Execute runpod-cli with arbitrary args and return parsed JSON.
+    ///
+    /// Public entry point for passthrough usage. Automatically injects
+    /// `RUNPOD_API_KEY` and `-o json` flags.
+    pub async fn raw_exec(&self, args: &[String]) -> Result<serde_json::Value, DomainError> {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.exec(&refs).await
+    }
+
     /// Execute runpod-cli and return parsed JSON.
     ///
     /// Equivalent to the Lua `cli(args, api_key)` helper in runpod.lua L56-82.
