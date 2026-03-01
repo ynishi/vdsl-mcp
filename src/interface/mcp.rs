@@ -429,6 +429,39 @@ pub struct VdslRunScriptRequest {
     pub timeout: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct VdslRunRequest {
+    /// Path to a .lua script file to execute. Mutually exclusive with code.
+    pub script_file: Option<String>,
+
+    /// Inline Lua code to execute. Mutually exclusive with script_file.
+    pub code: Option<String>,
+
+    /// Working directory for script execution.
+    /// Must contain lua/ and scripts/ directories for VDSL module resolution.
+    /// If omitted, auto-detected by walking up from script_file's parent.
+    pub working_dir: Option<String>,
+
+    /// ComfyUI URL (e.g. "https://pod_id-8188.proxy.runpod.net") or RunPod pod ID.
+    pub url: Option<String>,
+
+    /// RunPod pod ID (e.g. "pod_abc123def"). Proxy URL is auto-constructed.
+    /// Takes precedence over url if both are provided.
+    pub pod_id: Option<String>,
+
+    /// Local directory to save all output images after completion.
+    pub save_dir: Option<String>,
+
+    /// Timeout in seconds for the entire operation (default: 600).
+    pub timeout: Option<u64>,
+
+    /// Compile only — run the Lua script but do not send workflows to ComfyUI.
+    /// The compiled workflow JSONs and script output are returned without generation.
+    #[serde(default)]
+    pub compile_only: bool,
+}
+
 // =============================================================================
 // Tool implementations
 // =============================================================================
@@ -1182,7 +1215,7 @@ impl VdslMcpServer {
                     None => continue,
                 };
                 let subfolder = img["subfolder"].as_str().unwrap_or("");
-                let dest = save_path.join(filename);
+                let dest = unique_dest(save_path, filename);
 
                 match client.download_image(filename, subfolder, &dest).await {
                     Ok(size) => {
@@ -1519,7 +1552,7 @@ impl VdslMcpServer {
                         None => continue,
                     };
                     let subfolder = img["subfolder"].as_str().unwrap_or("");
-                    let dest = save_path.join(filename);
+                    let dest = unique_dest(save_path, filename);
 
                     match client.download_image(filename, subfolder, &dest).await {
                         Ok(size) => {
@@ -1592,42 +1625,423 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslRunScriptRequest>,
     ) -> Result<CallToolResult, McpError> {
-        // --- 1. Resolve script source ---
-        let (lua_args, script_label) = match (req.script_file.as_deref(), req.code.as_deref()) {
-            (Some(path), None) => {
-                let p = std::path::Path::new(path);
-                if !p.exists() {
-                    return Err(McpError::invalid_params(
-                        format!("script not found: {path}"),
-                        None,
-                    ));
-                }
-                (vec![path.to_string()], path.to_string())
-            }
-            (None, Some(code)) => {
-                (vec!["-e".to_string(), code.to_string()], "<inline>".to_string())
-            }
-            (Some(_), Some(_)) => {
-                return Err(McpError::invalid_params(
-                    "specify either 'script_file' or 'code', not both",
-                    None,
-                ))
-            }
-            (None, None) => {
-                return Err(McpError::invalid_params(
-                    "either 'script_file' or 'code' is required",
-                    None,
-                ))
-            }
-        };
+        let (lua_args, script_label) = resolve_script_source(
+            req.script_file.as_deref(),
+            req.code.as_deref(),
+        )?;
+        let work_dir = resolve_working_dir(
+            req.working_dir.as_deref(),
+            req.script_file.as_deref(),
+        )?;
+        let timeout = req.timeout.unwrap_or(SCRIPT_TIMEOUT_SECS);
 
-        // --- 2. Resolve working directory ---
-        let work_dir = match req.working_dir {
-            Some(ref d) => std::path::PathBuf::from(d),
-            None => {
-                // Auto-detect: walk up from script_file to find lua/ directory
-                if let Some(ref path) = req.script_file {
-                    let script_path = std::path::Path::new(path)
+        let result = exec_lua(&lua_args, &work_dir, timeout, &[]).await?;
+
+        let mut response = format!(
+            "script: {script_label}\nworking_dir: {}\nexit_code: {}",
+            work_dir.display(),
+            result.exit_code,
+        );
+        if !result.stdout.is_empty() {
+            response.push_str(&format!("\n\n--- stdout ---\n{}", result.stdout));
+        }
+        if !result.stderr.is_empty() {
+            response.push_str(&format!("\n\n--- stderr ---\n{}", result.stderr));
+        }
+        if result.exit_code != 0 {
+            response.insert_str(0, "FAILED: ");
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(response)]))
+    }
+
+    #[tool(
+        name = "vdsl_run",
+        description = "Compile and generate images from a VDSL Lua script. \
+            Phase 1: Runs the script to compile workflows (vdsl.render) into a temp directory. \
+            The script receives VDSL_OUT_DIR env var and writes .json workflow files there. \
+            Phase 2: Sends all compiled workflows to ComfyUI via batch generate, \
+            polls for completion, and downloads output images to save_dir. \
+            Set compile_only=true to skip generation (no server required).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn run(
+        &self,
+        Parameters(req): Parameters<VdslRunRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let (lua_args, script_label) = resolve_script_source(
+            req.script_file.as_deref(),
+            req.code.as_deref(),
+        )?;
+        let work_dir = resolve_working_dir(
+            req.working_dir.as_deref(),
+            req.script_file.as_deref(),
+        )?;
+        let timeout = req.timeout.unwrap_or(SCRIPT_TIMEOUT_SECS);
+
+        // --- Phase 1: Compile --- temp dir for workflow JSONs
+        let out_dir = tempfile::TempDir::new().map_err(|e| {
+            McpError::internal_error(format!("failed to create temp dir: {e}"), None)
+        })?;
+        let out_dir_str = out_dir.path().to_string_lossy().to_string();
+
+        let lua_result = exec_lua(
+            &lua_args,
+            &work_dir,
+            timeout,
+            &[("VDSL_OUT_DIR", &out_dir_str)],
+        )
+        .await?;
+
+        // Collect script output for reporting
+        let mut log = Vec::<String>::new();
+        log.push(format!("script: {script_label}"));
+        log.push(format!("working_dir: {}", work_dir.display()));
+        log.push(format!("compile exit_code: {}", lua_result.exit_code));
+
+        if lua_result.exit_code != 0 {
+            let mut msg = format!("FAILED: script exited with code {}", lua_result.exit_code);
+            if !lua_result.stdout.is_empty() {
+                msg.push_str(&format!("\n\n--- stdout ---\n{}", lua_result.stdout));
+            }
+            if !lua_result.stderr.is_empty() {
+                msg.push_str(&format!("\n\n--- stderr ---\n{}", lua_result.stderr));
+            }
+            return Err(McpError::internal_error(msg, None));
+        }
+
+        // Enumerate compiled .json files
+        let mut workflow_files: Vec<String> = Vec::new();
+        let mut rd = tokio::fs::read_dir(out_dir.path()).await.map_err(|e| {
+            McpError::internal_error(format!("failed to read temp dir: {e}"), None)
+        })?;
+        while let Some(entry) = rd.next_entry().await.map_err(|e| {
+            McpError::internal_error(format!("read_dir error: {e}"), None)
+        })? {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("json") {
+                if let Some(s) = p.to_str() {
+                    workflow_files.push(s.to_string());
+                }
+            }
+        }
+        workflow_files.sort();
+
+        log.push(format!("compiled: {} workflow(s)", workflow_files.len()));
+
+        if !lua_result.stdout.is_empty() {
+            log.push(format!("\n--- script stdout ---\n{}", lua_result.stdout));
+        }
+        if !lua_result.stderr.is_empty() {
+            log.push(format!("\n--- script stderr ---\n{}", lua_result.stderr));
+        }
+
+        // --- compile_only: return here ---
+        if req.compile_only || workflow_files.is_empty() {
+            if workflow_files.is_empty() {
+                log.push("No .json workflows found in VDSL_OUT_DIR. \
+                          Ensure the script writes workflow files there.".to_string());
+            }
+            return Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]));
+        }
+
+        // --- Phase 2: Generate via batch ---
+        let connect_req = VdslConnectRequest {
+            url: req.url,
+            pod_id: req.pod_id,
+        };
+        let url = Self::resolve_comfyui_url(&connect_req)?;
+        let client = Self::comfyui_client(url.clone());
+
+        // Load and submit workflows
+        struct TaggedWorkflow {
+            label: String,
+            workflow: serde_json::Value,
+        }
+
+        let mut tagged: Vec<TaggedWorkflow> = Vec::with_capacity(workflow_files.len());
+        for path in &workflow_files {
+            let content = tokio::fs::read_to_string(path).await.map_err(|e| {
+                McpError::internal_error(format!("failed to read '{path}': {e}"), None)
+            })?;
+            let wf: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+                McpError::internal_error(format!("invalid JSON in '{path}': {e}"), None)
+            })?;
+            let label = std::path::Path::new(path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            tagged.push(TaggedWorkflow { label, workflow: wf });
+        }
+
+        let total = tagged.len();
+        log.push(format!("\nBatch: {total} workflow(s) → {url}"));
+
+        // Submit all
+        struct Submitted {
+            label: String,
+            prompt_id: String,
+        }
+
+        let mut jobs: Vec<Submitted> = Vec::with_capacity(total);
+        for tw in &tagged {
+            match client.post_prompt(&tw.workflow).await {
+                Ok(resp) => {
+                    if let Some(pid) = resp["prompt_id"].as_str() {
+                        log.push(format!("  queued: {} → {pid}", tw.label));
+                        jobs.push(Submitted {
+                            label: tw.label.clone(),
+                            prompt_id: pid.to_string(),
+                        });
+                    } else {
+                        log.push(format!("  SKIP {}: no prompt_id in response", tw.label));
+                    }
+                }
+                Err(e) => {
+                    log.push(format!("  SKIP {}: {e}", tw.label));
+                }
+            }
+        }
+
+        if jobs.is_empty() {
+            log.push("All workflows failed to submit.".to_string());
+            return Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]));
+        }
+
+        // Poll until all complete
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+        let interval = std::time::Duration::from_secs(BATCH_POLL_INTERVAL_SECS);
+
+        struct JobResult {
+            label: String,
+            #[allow(dead_code)]
+            prompt_id: String,
+            images: Vec<serde_json::Value>,
+            error: Option<String>,
+        }
+
+        let mut results: Vec<JobResult> = Vec::new();
+        let mut pending: Vec<Submitted> = jobs;
+
+        while !pending.is_empty() {
+            if std::time::Instant::now() >= deadline {
+                for p in &pending {
+                    results.push(JobResult {
+                        label: p.label.clone(),
+                        prompt_id: p.prompt_id.clone(),
+                        images: Vec::new(),
+                        error: Some("timeout".to_string()),
+                    });
+                }
+                break;
+            }
+
+            tokio::time::sleep(interval).await;
+
+            let mut still_pending = Vec::new();
+            for job in pending {
+                let history = match client.history(&job.prompt_id).await {
+                    Ok(h) => h,
+                    Err(_) => {
+                        still_pending.push(job);
+                        continue;
+                    }
+                };
+
+                if let Some(entry) = history.get(&job.prompt_id) {
+                    if let Some(status) = entry.get("status") {
+                        let completed = status["completed"].as_bool().unwrap_or(false);
+                        if completed {
+                            let status_str =
+                                status["status_str"].as_str().unwrap_or("unknown");
+                            if status_str == "error" {
+                                let mut msg = "execution error".to_string();
+                                if let Some(messages) = status["messages"].as_array() {
+                                    for m in messages {
+                                        if m[0].as_str() == Some("execution_error") {
+                                            if let Some(detail) = m[1]["message"].as_str() {
+                                                msg = detail.to_string();
+                                            }
+                                        }
+                                    }
+                                }
+                                results.push(JobResult {
+                                    label: job.label,
+                                    prompt_id: job.prompt_id,
+                                    images: Vec::new(),
+                                    error: Some(msg),
+                                });
+                                continue;
+                            }
+
+                            let mut imgs = Vec::new();
+                            if let Some(outputs) = entry.get("outputs") {
+                                if let Some(obj) = outputs.as_object() {
+                                    for (_node_id, output) in obj {
+                                        if let Some(arr) =
+                                            output.get("images").and_then(|v| v.as_array())
+                                        {
+                                            for img in arr {
+                                                imgs.push(img.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            results.push(JobResult {
+                                label: job.label,
+                                prompt_id: job.prompt_id,
+                                images: imgs,
+                                error: None,
+                            });
+                            continue;
+                        }
+                    }
+                }
+                still_pending.push(job);
+            }
+            pending = still_pending;
+        }
+
+        // Download images
+        let mut download_log: Vec<String> = Vec::new();
+        if let Some(ref dir) = req.save_dir {
+            let save_path = std::path::Path::new(dir);
+            for jr in &results {
+                for img in &jr.images {
+                    let filename = match img["filename"].as_str() {
+                        Some(f) => f,
+                        None => continue,
+                    };
+                    let subfolder = img["subfolder"].as_str().unwrap_or("");
+                    let dest = unique_dest(save_path, filename);
+
+                    match client.download_image(filename, subfolder, &dest).await {
+                        Ok(size) => {
+                            download_log
+                                .push(format!("  saved: {} ({size} bytes)", dest.display()));
+                        }
+                        Err(e) => {
+                            download_log
+                                .push(format!("  FAILED: {} — {e}", dest.display()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Summary
+        let ok_count = results.iter().filter(|r| r.error.is_none()).count();
+        let err_count = results.iter().filter(|r| r.error.is_some()).count();
+        let total_images: usize = results.iter().map(|r| r.images.len()).sum();
+
+        log.push(format!(
+            "\nComplete: {ok_count} ok, {err_count} failed, {total_images} images"
+        ));
+
+        for (i, jr) in results.iter().enumerate() {
+            let status = if let Some(ref e) = jr.error {
+                format!("ERROR: {e}")
+            } else {
+                let names: Vec<&str> = jr
+                    .images
+                    .iter()
+                    .filter_map(|img| img["filename"].as_str())
+                    .collect();
+                format!("{} image(s): {}", jr.images.len(), names.join(", "))
+            };
+            log.push(format!("  {}. {} — {}", i + 1, jr.label, status));
+        }
+
+        if !download_log.is_empty() {
+            log.push(format!("\ndownloads:\n{}", download_log.join("\n")));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]))
+    }
+}
+
+// =============================================================================
+// Lua execution helpers
+// =============================================================================
+
+/// Return a non-colliding path under `dir` for `filename`.
+/// If `dir/filename` already exists, inserts `_2`, `_3`, … before the extension.
+fn unique_dest(dir: &std::path::Path, filename: &str) -> std::path::PathBuf {
+    let candidate = dir.join(filename);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let stem = std::path::Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(filename);
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    for n in 2u32.. {
+        let name = if ext.is_empty() {
+            format!("{stem}_{n}")
+        } else {
+            format!("{stem}_{n}.{ext}")
+        };
+        let p = dir.join(&name);
+        if !p.exists() {
+            return p;
+        }
+    }
+    candidate
+}
+
+/// Resolved Lua script arguments and display label.
+fn resolve_script_source(
+    script_file: Option<&str>,
+    code: Option<&str>,
+) -> Result<(Vec<String>, String), McpError> {
+    match (script_file, code) {
+        (Some(path), None) => {
+            let p = std::path::Path::new(path);
+            if !p.exists() {
+                return Err(McpError::invalid_params(
+                    format!("script not found: {path}"),
+                    None,
+                ));
+            }
+            Ok((vec![path.to_string()], path.to_string()))
+        }
+        (None, Some(c)) => Ok((
+            vec!["-e".to_string(), c.to_string()],
+            "<inline>".to_string(),
+        )),
+        (Some(_), Some(_)) => Err(McpError::invalid_params(
+            "specify either 'script_file' or 'code', not both",
+            None,
+        )),
+        (None, None) => Err(McpError::invalid_params(
+            "either 'script_file' or 'code' is required",
+            None,
+        )),
+    }
+}
+
+/// Resolve VDSL working directory (must contain lua/).
+fn resolve_working_dir(
+    explicit: Option<&str>,
+    script_file: Option<&str>,
+) -> Result<std::path::PathBuf, McpError> {
+    let work_dir = match explicit {
+        Some(d) => std::path::PathBuf::from(d),
+        None => {
+            if let Some(path) = script_file {
+                let script_path =
+                    std::path::Path::new(path)
                         .canonicalize()
                         .map_err(|e| {
                             McpError::invalid_params(
@@ -1635,109 +2049,103 @@ impl VdslMcpServer {
                                 None,
                             )
                         })?;
-                    let mut dir = script_path.parent();
-                    loop {
-                        match dir {
-                            Some(d) if d.join("lua").is_dir() => break d.to_path_buf(),
-                            Some(d) => dir = d.parent(),
-                            None => {
-                                return Err(McpError::invalid_params(
-                                    format!(
-                                        "cannot auto-detect working_dir: no lua/ directory found \
-                                         above '{path}'. Specify working_dir explicitly."
-                                    ),
-                                    None,
-                                ))
-                            }
+                let mut dir = script_path.parent();
+                loop {
+                    match dir {
+                        Some(d) if d.join("lua").is_dir() => break d.to_path_buf(),
+                        Some(d) => dir = d.parent(),
+                        None => {
+                            return Err(McpError::invalid_params(
+                                format!(
+                                    "cannot auto-detect working_dir: no lua/ directory found \
+                                     above '{path}'. Specify working_dir explicitly."
+                                ),
+                                None,
+                            ))
                         }
                     }
-                } else {
-                    return Err(McpError::invalid_params(
-                        "working_dir is required when using inline code",
-                        None,
-                    ));
                 }
-            }
-        };
-
-        if !work_dir.join("lua").is_dir() {
-            return Err(McpError::invalid_params(
-                format!(
-                    "working_dir '{}' does not contain a lua/ directory",
-                    work_dir.display()
-                ),
-                None,
-            ));
-        }
-
-        // --- 3. Build lua command ---
-        let package_path_setup = format!(
-            "package.path='{VDSL_PACKAGE_PATH}'..package.path"
-        );
-
-        let mut cmd = tokio::process::Command::new("lua");
-        cmd.arg("-e").arg(&package_path_setup);
-        for arg in &lua_args {
-            cmd.arg(arg);
-        }
-        cmd.current_dir(&work_dir);
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        // --- 4. Execute with timeout ---
-        let timeout = req.timeout.unwrap_or(SCRIPT_TIMEOUT_SECS);
-        let timeout_dur = std::time::Duration::from_secs(timeout);
-
-        let child = cmd.spawn().map_err(|e| {
-            McpError::internal_error(
-                format!(
-                    "failed to spawn lua: {e}. Is lua installed and on PATH?"
-                ),
-                None,
-            )
-        })?;
-
-        let result = tokio::time::timeout(timeout_dur, child.wait_with_output()).await;
-
-        let output = match result {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                return Err(McpError::internal_error(
-                    format!("lua process error: {e}"),
+            } else {
+                return Err(McpError::invalid_params(
+                    "working_dir is required when using inline code",
                     None,
-                ))
+                ));
             }
-            Err(_) => {
-                return Err(McpError::internal_error(
-                    format!("script timed out after {timeout}s: {script_label}"),
-                    None,
-                ))
-            }
-        };
-
-        // --- 5. Build response ---
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        let mut response = format!(
-            "script: {script_label}\nworking_dir: {}\nexit_code: {exit_code}",
-            work_dir.display(),
-        );
-
-        if !stdout.is_empty() {
-            response.push_str(&format!("\n\n--- stdout ---\n{stdout}"));
         }
-        if !stderr.is_empty() {
-            response.push_str(&format!("\n\n--- stderr ---\n{stderr}"));
-        }
+    };
 
-        if exit_code != 0 {
-            response.insert_str(0, "FAILED: ");
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(response)]))
+    if !work_dir.join("lua").is_dir() {
+        return Err(McpError::invalid_params(
+            format!(
+                "working_dir '{}' does not contain a lua/ directory",
+                work_dir.display()
+            ),
+            None,
+        ));
     }
+    Ok(work_dir)
+}
+
+/// Result of a Lua process execution.
+struct LuaExecResult {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+/// Execute a Lua script with VDSL package.path setup.
+/// Extra environment variables can be injected via `envs`.
+async fn exec_lua(
+    lua_args: &[String],
+    work_dir: &std::path::Path,
+    timeout_secs: u64,
+    envs: &[(&str, &str)],
+) -> Result<LuaExecResult, McpError> {
+    let package_path_setup = format!("package.path='{VDSL_PACKAGE_PATH}'..package.path");
+
+    let mut cmd = tokio::process::Command::new("lua");
+    cmd.arg("-e").arg(&package_path_setup);
+    for arg in lua_args {
+        cmd.arg(arg);
+    }
+    cmd.current_dir(work_dir);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+
+    let child = cmd.spawn().map_err(|e| {
+        McpError::internal_error(
+            format!("failed to spawn lua: {e}. Is lua installed and on PATH?"),
+            None,
+        )
+    })?;
+
+    let timeout_dur = std::time::Duration::from_secs(timeout_secs);
+    let result = tokio::time::timeout(timeout_dur, child.wait_with_output()).await;
+
+    let output = match result {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return Err(McpError::internal_error(
+                format!("lua process error: {e}"),
+                None,
+            ))
+        }
+        Err(_) => {
+            return Err(McpError::internal_error(
+                format!("script timed out after {timeout_secs}s"),
+                None,
+            ))
+        }
+    };
+
+    Ok(LuaExecResult {
+        exit_code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
 }
 
 // =============================================================================
@@ -2218,5 +2626,40 @@ mod tests {
         .unwrap();
         assert!(req.working_dir.is_none());
         assert!(req.script_file.is_some());
+    }
+
+    // --- unique_dest tests ---
+
+    #[test]
+    fn unique_dest_no_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = unique_dest(dir.path(), "photo.png");
+        assert_eq!(dest, dir.path().join("photo.png"));
+    }
+
+    #[test]
+    fn unique_dest_one_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("photo.png"), b"x").unwrap();
+        let dest = unique_dest(dir.path(), "photo.png");
+        assert_eq!(dest, dir.path().join("photo_2.png"));
+    }
+
+    #[test]
+    fn unique_dest_multiple_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("photo.png"), b"x").unwrap();
+        std::fs::write(dir.path().join("photo_2.png"), b"x").unwrap();
+        std::fs::write(dir.path().join("photo_3.png"), b"x").unwrap();
+        let dest = unique_dest(dir.path(), "photo.png");
+        assert_eq!(dest, dir.path().join("photo_4.png"));
+    }
+
+    #[test]
+    fn unique_dest_no_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data"), b"x").unwrap();
+        let dest = unique_dest(dir.path(), "data");
+        assert_eq!(dest, dir.path().join("data_2"));
     }
 }
