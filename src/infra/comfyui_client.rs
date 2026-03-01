@@ -3,6 +3,8 @@
 //! Connects to ComfyUI via RunPod proxy URL and queries API endpoints.
 //! Supports optional Bearer token authentication (RunPod proxy auth).
 
+use std::path::Path;
+
 use crate::domain::error::DomainError;
 
 /// ComfyUI HTTP client.
@@ -38,9 +40,10 @@ impl ComfyUiClient {
     /// GET a JSON endpoint, returning parsed value.
     async fn get_json(&self, path: &str) -> Result<serde_json::Value, DomainError> {
         let url = format!("{}{path}", self.base_url);
-        let resp = self.get_request(&url).send().await.map_err(|e| {
-            DomainError::ComfyUiConnection(format!("failed to reach {url}: {e}"))
-        })?;
+        let resp =
+            self.get_request(&url).send().await.map_err(|e| {
+                DomainError::ComfyUiConnection(format!("failed to reach {url}: {e}"))
+            })?;
 
         if !resp.status().is_success() {
             return Err(DomainError::ComfyUiConnection(format!(
@@ -49,9 +52,9 @@ impl ComfyUiClient {
             )));
         }
 
-        resp.json().await.map_err(|e| {
-            DomainError::ComfyUiConnection(format!("invalid JSON from {path}: {e}"))
-        })
+        resp.json()
+            .await
+            .map_err(|e| DomainError::ComfyUiConnection(format!("invalid JSON from {path}: {e}")))
     }
 
     /// Probe /system_stats to verify ComfyUI is responding.
@@ -68,10 +71,7 @@ impl ComfyUiClient {
     ///
     /// Mirrors Lua `Registry:poll()` in `registry.lua` L181-223.
     /// Returns the full `/history/{prompt_id}` response.
-    pub async fn history(
-        &self,
-        prompt_id: &str,
-    ) -> Result<serde_json::Value, DomainError> {
+    pub async fn history(&self, prompt_id: &str) -> Result<serde_json::Value, DomainError> {
         self.get_json(&format!("/history/{prompt_id}")).await
     }
 
@@ -80,6 +80,62 @@ impl ComfyUiClient {
     /// Returns `{ "queue_running": [...], "queue_pending": [...] }`.
     pub async fn queue(&self) -> Result<serde_json::Value, DomainError> {
         self.get_json("/queue").await
+    }
+
+    /// Upload a file to ComfyUI via `POST /upload/image` (multipart/form-data).
+    ///
+    /// Mirrors Lua `Registry:upload()` in `registry.lua` L276-295.
+    pub async fn upload_image(
+        &self,
+        filepath: &Path,
+        subfolder: &str,
+        overwrite: bool,
+    ) -> Result<serde_json::Value, DomainError> {
+        let url = format!("{}/upload/image", self.base_url);
+
+        let filename = filepath
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                DomainError::ComfyUiConnection(format!("invalid filename: {}", filepath.display()))
+            })?
+            .to_string();
+
+        let file_bytes = tokio::fs::read(filepath).await.map_err(|e| {
+            DomainError::ComfyUiConnection(format!("failed to read {}: {e}", filepath.display()))
+        })?;
+
+        let file_part = reqwest::multipart::Part::bytes(file_bytes)
+            .file_name(filename)
+            .mime_str("application/octet-stream")
+            .map_err(|e| DomainError::ComfyUiConnection(format!("mime error: {e}")))?;
+
+        let form = reqwest::multipart::Form::new()
+            .part("image", file_part)
+            .text("subfolder", subfolder.to_string())
+            .text("type", "input")
+            .text("overwrite", if overwrite { "true" } else { "false" });
+
+        let mut req = self.http.post(&url).multipart(form);
+        if let Some(token) = &self.token {
+            req = req.bearer_auth(token);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| DomainError::ComfyUiConnection(format!("upload failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            return Err(DomainError::ComfyUiConnection(format!(
+                "upload returned HTTP {}",
+                resp.status()
+            )));
+        }
+
+        resp.json()
+            .await
+            .map_err(|e| DomainError::ComfyUiConnection(format!("invalid JSON from upload: {e}")))
     }
 
     pub fn base_url(&self) -> &str {
@@ -118,8 +174,7 @@ mod tests {
 
     #[test]
     fn client_with_token() {
-        let client =
-            ComfyUiClient::new("http://localhost:8188".into(), Some("mytoken".into()));
+        let client = ComfyUiClient::new("http://localhost:8188".into(), Some("mytoken".into()));
         assert_eq!(client.base_url(), "http://localhost:8188");
     }
 }

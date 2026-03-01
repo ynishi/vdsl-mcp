@@ -63,7 +63,9 @@ impl VdslMcpServer {
 
     /// Resolve ComfyUI Bearer token from COMFYUI_TOKEN env var.
     fn comfyui_token() -> Option<String> {
-        std::env::var("COMFYUI_TOKEN").ok().filter(|s| !s.is_empty())
+        std::env::var("COMFYUI_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty())
     }
 
     /// Build a ComfyUiClient from URL, with env-based token auth.
@@ -184,6 +186,25 @@ pub struct VdslQueueStatusRequest {
     pub prompt_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslUploadRequest {
+    /// ComfyUI URL (e.g. "https://pod_id-8188.proxy.runpod.net") or RunPod pod ID.
+    pub url: Option<String>,
+
+    /// RunPod pod ID (e.g. "pod_abc123def"). Proxy URL is auto-constructed.
+    /// Takes precedence over url if both are provided.
+    pub pod_id: Option<String>,
+
+    /// Local file path to upload.
+    pub filepath: String,
+
+    /// Target subfolder on the ComfyUI server (default: "").
+    pub subfolder: Option<String>,
+
+    /// Whether to overwrite existing files (default: true).
+    pub overwrite: Option<bool>,
+}
+
 /// Default spec for ComfyUI pods on RunPod.
 /// Matches Lua `M.COMFY_DEFAULTS` in runpod.lua L36-41.
 const COMFY_DEFAULTS_NAME: &str = "comfyui-vdsl";
@@ -248,9 +269,12 @@ impl VdslMcpServer {
         Parameters(req): Parameters<VdslPodActionRequest>,
     ) -> Result<CallToolResult, McpError> {
         let svc = Self::pod_service()?;
-        let result = svc.start_pod(&req.pod_id).await.map_err(Self::to_mcp_error)?;
-        let output = serde_json::to_string_pretty(&result)
-            .unwrap_or_else(|_| format!("{result:?}"));
+        let result = svc
+            .start_pod(&req.pod_id)
+            .await
+            .map_err(Self::to_mcp_error)?;
+        let output =
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"));
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -268,9 +292,12 @@ impl VdslMcpServer {
         Parameters(req): Parameters<VdslPodActionRequest>,
     ) -> Result<CallToolResult, McpError> {
         let svc = Self::pod_service()?;
-        let result = svc.stop_pod(&req.pod_id).await.map_err(Self::to_mcp_error)?;
-        let output = serde_json::to_string_pretty(&result)
-            .unwrap_or_else(|_| format!("{result:?}"));
+        let result = svc
+            .stop_pod(&req.pod_id)
+            .await
+            .map_err(Self::to_mcp_error)?;
+        let output =
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"));
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -290,9 +317,7 @@ impl VdslMcpServer {
         let mut spec = serde_json::Map::new();
         spec.insert(
             "name".into(),
-            serde_json::Value::String(
-                req.name.unwrap_or_else(|| COMFY_DEFAULTS_NAME.to_string()),
-            ),
+            serde_json::Value::String(req.name.unwrap_or_else(|| COMFY_DEFAULTS_NAME.to_string())),
         );
         spec.insert(
             "templateId".into(),
@@ -302,10 +327,7 @@ impl VdslMcpServer {
             "containerDiskInGb".into(),
             serde_json::Value::Number(req.disk_gb.unwrap_or(COMFY_DEFAULTS_DISK).into()),
         );
-        spec.insert(
-            "ports".into(),
-            serde_json::json!(["8188/http", "22/tcp"]),
-        );
+        spec.insert("ports".into(), serde_json::json!(["8188/http", "22/tcp"]));
         spec.insert(
             "networkVolumeId".into(),
             serde_json::Value::String(req.volume_id),
@@ -329,7 +351,10 @@ impl VdslMcpServer {
 
         let spec_json = serde_json::to_string(&spec).map_err(Self::to_mcp_error)?;
         let svc = Self::pod_service()?;
-        let result = svc.create_pod(&spec_json).await.map_err(Self::to_mcp_error)?;
+        let result = svc
+            .create_pod(&spec_json)
+            .await
+            .map_err(Self::to_mcp_error)?;
 
         let pod_id = result["id"].as_str().unwrap_or("?");
         let pod_name = result["name"].as_str().unwrap_or("?");
@@ -397,9 +422,12 @@ impl VdslMcpServer {
         Parameters(req): Parameters<VdslPodActionRequest>,
     ) -> Result<CallToolResult, McpError> {
         let svc = Self::pod_service()?;
-        let result = svc.delete_pod(&req.pod_id).await.map_err(Self::to_mcp_error)?;
-        let output = serde_json::to_string_pretty(&result)
-            .unwrap_or_else(|_| format!("{result:?}"));
+        let result = svc
+            .delete_pod(&req.pod_id)
+            .await
+            .map_err(Self::to_mcp_error)?;
+        let output =
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"));
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -451,8 +479,7 @@ impl VdslMcpServer {
                 let status = if let Some(entry) = history.get(&pid) {
                     if let Some(status) = entry.get("status") {
                         let completed = status["completed"].as_bool().unwrap_or(false);
-                        let status_str =
-                            status["status_str"].as_str().unwrap_or("unknown");
+                        let status_str = status["status_str"].as_str().unwrap_or("unknown");
                         if completed && status_str == "error" {
                             "error"
                         } else if completed {
@@ -477,21 +504,60 @@ impl VdslMcpServer {
             None => {
                 let queue = client.queue().await.map_err(Self::to_mcp_error)?;
 
-                let running = queue["queue_running"]
-                    .as_array()
-                    .map_or(0, |a| a.len());
-                let pending = queue["queue_pending"]
-                    .as_array()
-                    .map_or(0, |a| a.len());
+                let running = queue["queue_running"].as_array().map_or(0, |a| a.len());
+                let pending = queue["queue_pending"].as_array().map_or(0, |a| a.len());
 
                 let output = format!(
                     "Queue: {running} running, {pending} pending\n\n{}",
-                    serde_json::to_string_pretty(&queue)
-                        .unwrap_or_else(|_| format!("{queue:?}"))
+                    serde_json::to_string_pretty(&queue).unwrap_or_else(|_| format!("{queue:?}"))
                 );
                 Ok(CallToolResult::success(vec![Content::text(output)]))
             }
         }
+    }
+
+    #[tool(
+        name = "vdsl_upload",
+        description = "Upload a local file to a running ComfyUI instance. Used for ControlNet images, training data, etc. Files are uploaded to the input/ directory.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn upload(
+        &self,
+        Parameters(req): Parameters<VdslUploadRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let connect_req = VdslConnectRequest {
+            url: req.url,
+            pod_id: req.pod_id,
+        };
+        let url = Self::resolve_comfyui_url(&connect_req)?;
+        let client = Self::comfyui_client(url.clone());
+
+        let filepath = std::path::Path::new(&req.filepath);
+        if !filepath.exists() {
+            return Err(McpError::invalid_params(
+                format!("file not found: {}", filepath.display()),
+                None,
+            ));
+        }
+
+        let subfolder = req.subfolder.as_deref().unwrap_or("");
+        let overwrite = req.overwrite.unwrap_or(true);
+
+        let result = client
+            .upload_image(filepath, subfolder, overwrite)
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        let name = result["name"].as_str().unwrap_or("?");
+        let output = format!(
+            "Uploaded to {url}: {name}\n\n{}",
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"))
+        );
+        Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 }
 
@@ -519,8 +585,7 @@ mod tests {
 
     #[test]
     fn pod_action_request_parse() {
-        let req: VdslPodActionRequest =
-            serde_json::from_str(r#"{"pod_id":"abc123"}"#).unwrap();
+        let req: VdslPodActionRequest = serde_json::from_str(r#"{"pod_id":"abc123"}"#).unwrap();
         assert_eq!(req.pod_id, "abc123");
     }
 
@@ -556,8 +621,7 @@ mod tests {
 
     #[test]
     fn pod_create_request_minimal() {
-        let req: VdslPodCreateRequest =
-            serde_json::from_str(r#"{"volume_id":"vol_001"}"#).unwrap();
+        let req: VdslPodCreateRequest = serde_json::from_str(r#"{"volume_id":"vol_001"}"#).unwrap();
         assert_eq!(req.volume_id, "vol_001");
         assert!(req.gpu.is_none());
         assert!(req.name.is_none());
@@ -586,18 +650,15 @@ mod tests {
 
     #[test]
     fn queue_status_request_with_prompt_id() {
-        let req: VdslQueueStatusRequest = serde_json::from_str(
-            r#"{"pod_id":"pod_abc","prompt_id":"abc-123-def"}"#,
-        )
-        .unwrap();
+        let req: VdslQueueStatusRequest =
+            serde_json::from_str(r#"{"pod_id":"pod_abc","prompt_id":"abc-123-def"}"#).unwrap();
         assert_eq!(req.pod_id.as_deref(), Some("pod_abc"));
         assert_eq!(req.prompt_id.as_deref(), Some("abc-123-def"));
     }
 
     #[test]
     fn queue_status_request_without_prompt_id() {
-        let req: VdslQueueStatusRequest =
-            serde_json::from_str(r#"{"pod_id":"pod_abc"}"#).unwrap();
+        let req: VdslQueueStatusRequest = serde_json::from_str(r#"{"pod_id":"pod_abc"}"#).unwrap();
         assert!(req.prompt_id.is_none());
     }
 
@@ -646,5 +707,31 @@ mod tests {
             pod_id: None,
         };
         assert!(VdslMcpServer::resolve_comfyui_url(&req).is_err());
+    }
+
+    #[test]
+    fn upload_request_minimal() {
+        let req: VdslUploadRequest =
+            serde_json::from_str(r#"{"pod_id":"pod_abc","filepath":"/tmp/test.png"}"#).unwrap();
+        assert_eq!(req.pod_id.as_deref(), Some("pod_abc"));
+        assert_eq!(req.filepath, "/tmp/test.png");
+        assert!(req.subfolder.is_none());
+        assert!(req.overwrite.is_none());
+    }
+
+    #[test]
+    fn upload_request_full() {
+        let req: VdslUploadRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_abc","filepath":"/tmp/test.png","subfolder":"training","overwrite":false}"#,
+        )
+        .unwrap();
+        assert_eq!(req.subfolder.as_deref(), Some("training"));
+        assert_eq!(req.overwrite, Some(false));
+    }
+
+    #[test]
+    fn upload_request_missing_filepath() {
+        let result = serde_json::from_str::<VdslUploadRequest>(r#"{"pod_id":"pod_abc"}"#);
+        assert!(result.is_err());
     }
 }
