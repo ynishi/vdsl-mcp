@@ -35,42 +35,51 @@ impl ComfyUiClient {
         req
     }
 
-    /// Probe /system_stats to verify ComfyUI is responding.
-    pub async fn system_stats(&self) -> Result<serde_json::Value, DomainError> {
-        let url = format!("{}/system_stats", self.base_url);
+    /// GET a JSON endpoint, returning parsed value.
+    async fn get_json(&self, path: &str) -> Result<serde_json::Value, DomainError> {
+        let url = format!("{}{path}", self.base_url);
         let resp = self.get_request(&url).send().await.map_err(|e| {
             DomainError::ComfyUiConnection(format!("failed to reach {url}: {e}"))
         })?;
 
         if !resp.status().is_success() {
             return Err(DomainError::ComfyUiConnection(format!(
-                "ComfyUI returned HTTP {}",
+                "ComfyUI returned HTTP {} for {path}",
                 resp.status()
             )));
         }
 
         resp.json().await.map_err(|e| {
-            DomainError::ComfyUiConnection(format!("invalid JSON from /system_stats: {e}"))
+            DomainError::ComfyUiConnection(format!("invalid JSON from {path}: {e}"))
         })
+    }
+
+    /// Probe /system_stats to verify ComfyUI is responding.
+    pub async fn system_stats(&self) -> Result<serde_json::Value, DomainError> {
+        self.get_json("/system_stats").await
     }
 
     /// List available models from /object_info endpoint.
     pub async fn object_info(&self) -> Result<serde_json::Value, DomainError> {
-        let url = format!("{}/object_info", self.base_url);
-        let resp = self.get_request(&url).send().await.map_err(|e| {
-            DomainError::ComfyUiConnection(format!("failed to reach {url}: {e}"))
-        })?;
+        self.get_json("/object_info").await
+    }
 
-        if !resp.status().is_success() {
-            return Err(DomainError::ComfyUiConnection(format!(
-                "ComfyUI returned HTTP {}",
-                resp.status()
-            )));
-        }
+    /// Query job history for a specific prompt.
+    ///
+    /// Mirrors Lua `Registry:poll()` in `registry.lua` L181-223.
+    /// Returns the full `/history/{prompt_id}` response.
+    pub async fn history(
+        &self,
+        prompt_id: &str,
+    ) -> Result<serde_json::Value, DomainError> {
+        self.get_json(&format!("/history/{prompt_id}")).await
+    }
 
-        resp.json().await.map_err(|e| {
-            DomainError::ComfyUiConnection(format!("invalid JSON from /object_info: {e}"))
-        })
+    /// Query the current ComfyUI queue state.
+    ///
+    /// Returns `{ "queue_running": [...], "queue_pending": [...] }`.
+    pub async fn queue(&self) -> Result<serde_json::Value, DomainError> {
+        self.get_json("/queue").await
     }
 
     pub fn base_url(&self) -> &str {

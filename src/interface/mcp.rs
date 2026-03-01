@@ -71,6 +71,18 @@ impl VdslMcpServer {
         ComfyUiClient::new(url, Self::comfyui_token())
     }
 
+    /// Resolve ComfyUI URL from VdslConnectRequest fields.
+    fn resolve_comfyui_url(req: &VdslConnectRequest) -> Result<String, McpError> {
+        match (req.pod_id.as_deref(), req.url.as_deref()) {
+            (Some(id), _) => Ok(proxy_url(id, 8188)),
+            (None, Some(u)) => Ok(u.to_string()),
+            (None, None) => Err(McpError::invalid_params(
+                "either pod_id or url is required",
+                None,
+            )),
+        }
+    }
+
     fn to_mcp_error(e: impl std::fmt::Display) -> McpError {
         McpError::internal_error(format!("{e}"), None)
     }
@@ -157,6 +169,19 @@ pub struct VdslConnectRequest {
     /// RunPod pod ID (e.g. "pod_abc123def"). Proxy URL is auto-constructed.
     /// Takes precedence over url if both are provided.
     pub pod_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslQueueStatusRequest {
+    /// ComfyUI URL (e.g. "https://pod_id-8188.proxy.runpod.net") or RunPod pod ID.
+    pub url: Option<String>,
+
+    /// RunPod pod ID (e.g. "pod_abc123def"). Proxy URL is auto-constructed.
+    /// Takes precedence over url if both are provided.
+    pub pod_id: Option<String>,
+
+    /// Prompt ID to check status for. If omitted, returns the full queue state.
+    pub prompt_id: Option<String>,
 }
 
 /// Default spec for ComfyUI pods on RunPod.
@@ -347,17 +372,7 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslConnectRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let url = match (req.pod_id.as_deref(), req.url.as_deref()) {
-            (Some(id), _) => proxy_url(id, 8188),
-            (None, Some(u)) => u.to_string(),
-            (None, None) => {
-                return Err(McpError::invalid_params(
-                    "either pod_id or url is required",
-                    None,
-                ));
-            }
-        };
-
+        let url = Self::resolve_comfyui_url(&req)?;
         let client = Self::comfyui_client(url.clone());
         let stats = client.system_stats().await.map_err(Self::to_mcp_error)?;
 
@@ -401,22 +416,82 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslConnectRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let url = match (req.pod_id.as_deref(), req.url.as_deref()) {
-            (Some(id), _) => proxy_url(id, 8188),
-            (None, Some(u)) => u.to_string(),
-            (None, None) => {
-                return Err(McpError::invalid_params(
-                    "either pod_id or url is required",
-                    None,
-                ));
-            }
-        };
-
+        let url = Self::resolve_comfyui_url(&req)?;
         let client = Self::comfyui_client(url.clone());
         let object_info = client.object_info().await.map_err(Self::to_mcp_error)?;
         let catalog = parse_model_catalog(&object_info);
         let output = format!("Models on {url}\n\n{}", format_model_catalog(&catalog));
         Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    #[tool(
+        name = "vdsl_queue_status",
+        description = "Check ComfyUI queue status. With prompt_id: check specific job (pending/running/completed/error). Without: show full queue state.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn queue_status(
+        &self,
+        Parameters(req): Parameters<VdslQueueStatusRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let connect_req = VdslConnectRequest {
+            url: req.url,
+            pod_id: req.pod_id,
+        };
+        let url = Self::resolve_comfyui_url(&connect_req)?;
+        let client = Self::comfyui_client(url.clone());
+
+        match req.prompt_id {
+            Some(pid) => {
+                let history = client.history(&pid).await.map_err(Self::to_mcp_error)?;
+
+                let status = if let Some(entry) = history.get(&pid) {
+                    if let Some(status) = entry.get("status") {
+                        let completed = status["completed"].as_bool().unwrap_or(false);
+                        let status_str =
+                            status["status_str"].as_str().unwrap_or("unknown");
+                        if completed && status_str == "error" {
+                            "error"
+                        } else if completed {
+                            "completed"
+                        } else {
+                            "running"
+                        }
+                    } else {
+                        "running"
+                    }
+                } else {
+                    "pending"
+                };
+
+                let output = format!(
+                    "Prompt {pid}: {status}\n\n{}",
+                    serde_json::to_string_pretty(&history)
+                        .unwrap_or_else(|_| format!("{history:?}"))
+                );
+                Ok(CallToolResult::success(vec![Content::text(output)]))
+            }
+            None => {
+                let queue = client.queue().await.map_err(Self::to_mcp_error)?;
+
+                let running = queue["queue_running"]
+                    .as_array()
+                    .map_or(0, |a| a.len());
+                let pending = queue["queue_pending"]
+                    .as_array()
+                    .map_or(0, |a| a.len());
+
+                let output = format!(
+                    "Queue: {running} running, {pending} pending\n\n{}",
+                    serde_json::to_string_pretty(&queue)
+                        .unwrap_or_else(|_| format!("{queue:?}"))
+                );
+                Ok(CallToolResult::success(vec![Content::text(output)]))
+            }
+        }
     }
 }
 
@@ -507,5 +582,69 @@ mod tests {
     fn pod_create_request_missing_volume() {
         let result = serde_json::from_str::<VdslPodCreateRequest>("{}");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn queue_status_request_with_prompt_id() {
+        let req: VdslQueueStatusRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_abc","prompt_id":"abc-123-def"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.pod_id.as_deref(), Some("pod_abc"));
+        assert_eq!(req.prompt_id.as_deref(), Some("abc-123-def"));
+    }
+
+    #[test]
+    fn queue_status_request_without_prompt_id() {
+        let req: VdslQueueStatusRequest =
+            serde_json::from_str(r#"{"pod_id":"pod_abc"}"#).unwrap();
+        assert!(req.prompt_id.is_none());
+    }
+
+    #[test]
+    fn queue_status_request_empty() {
+        let req: VdslQueueStatusRequest = serde_json::from_str("{}").unwrap();
+        assert!(req.pod_id.is_none());
+        assert!(req.url.is_none());
+        assert!(req.prompt_id.is_none());
+    }
+
+    #[test]
+    fn resolve_url_from_pod_id() {
+        let req = VdslConnectRequest {
+            url: None,
+            pod_id: Some("abc123".into()),
+        };
+        let url = VdslMcpServer::resolve_comfyui_url(&req).unwrap();
+        assert_eq!(url, "https://abc123-8188.proxy.runpod.net");
+    }
+
+    #[test]
+    fn resolve_url_from_url() {
+        let req = VdslConnectRequest {
+            url: Some("http://localhost:8188".into()),
+            pod_id: None,
+        };
+        let url = VdslMcpServer::resolve_comfyui_url(&req).unwrap();
+        assert_eq!(url, "http://localhost:8188");
+    }
+
+    #[test]
+    fn resolve_url_pod_id_takes_precedence() {
+        let req = VdslConnectRequest {
+            url: Some("http://localhost:8188".into()),
+            pod_id: Some("abc123".into()),
+        };
+        let url = VdslMcpServer::resolve_comfyui_url(&req).unwrap();
+        assert_eq!(url, "https://abc123-8188.proxy.runpod.net");
+    }
+
+    #[test]
+    fn resolve_url_neither_returns_error() {
+        let req = VdslConnectRequest {
+            url: None,
+            pod_id: None,
+        };
+        assert!(VdslMcpServer::resolve_comfyui_url(&req).is_err());
     }
 }
