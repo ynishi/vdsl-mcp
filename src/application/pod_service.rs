@@ -38,6 +38,33 @@ impl PodService {
         self.cli.create_pod(spec_json).await.map_err(AppError::from)
     }
 
+    /// Queue a background download on a pod.
+    pub async fn download_add(
+        &self,
+        pod_id: &str,
+        url: &str,
+        dest: Option<&str>,
+        ssh_key: &str,
+    ) -> Result<serde_json::Value, AppError> {
+        self.cli
+            .download_add(pod_id, url, dest, ssh_key)
+            .await
+            .map_err(AppError::from)
+    }
+
+    /// Check download progress.
+    pub async fn download_status(
+        &self,
+        pod_id: &str,
+        job_id: &str,
+        ssh_key: &str,
+    ) -> Result<serde_json::Value, AppError> {
+        self.cli
+            .download_status(pod_id, job_id, ssh_key)
+            .await
+            .map_err(AppError::from)
+    }
+
     /// List network volumes.
     pub async fn list_volumes(&self) -> Result<Vec<serde_json::Value>, AppError> {
         self.cli.list_volumes().await.map_err(AppError::from)

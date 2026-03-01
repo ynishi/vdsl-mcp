@@ -84,6 +84,49 @@ impl RunPodCli {
         self.exec(&["pods", "create-pod", "-j", spec_json]).await
     }
 
+    /// Queue a background download on a pod.
+    ///
+    /// Equivalent to Lua `Pod:download_add()` in runpod.lua L181-192.
+    pub async fn download_add(
+        &self,
+        pod_id: &str,
+        url: &str,
+        dest: Option<&str>,
+        ssh_key: &str,
+    ) -> Result<serde_json::Value, DomainError> {
+        let mut args = vec!["download", "add", "-i", ssh_key, pod_id, url];
+        if let Some(d) = dest {
+            args.push("-d");
+            args.push(d);
+        }
+        self.exec(&args).await
+    }
+
+    /// Check download progress on a pod.
+    ///
+    /// Equivalent to Lua `Pod:download_status()` in runpod.lua L198-206.
+    pub async fn download_status(
+        &self,
+        pod_id: &str,
+        job_id: &str,
+        ssh_key: &str,
+    ) -> Result<serde_json::Value, DomainError> {
+        self.exec(&["download", "status", "-i", ssh_key, pod_id, job_id])
+            .await
+    }
+
+    /// List all downloads on a pod.
+    ///
+    /// Equivalent to Lua `Pod:download_list()` in runpod.lua L211-218.
+    pub async fn download_list(
+        &self,
+        pod_id: &str,
+        ssh_key: &str,
+    ) -> Result<serde_json::Value, DomainError> {
+        self.exec(&["download", "list", "-i", ssh_key, pod_id])
+            .await
+    }
+
     /// List network volumes.
     ///
     /// Equivalent to Lua `M.volumes(opts)` in runpod.lua L626-633.

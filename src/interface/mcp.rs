@@ -216,6 +216,111 @@ const SETUP_TIMEOUT_SECS: u64 = 300;
 /// Interval between readiness polls (seconds).
 const SETUP_POLL_INTERVAL_SECS: u64 = 10;
 
+/// Default SSH key path for RunPod pods.
+const DEFAULT_SSH_KEY: &str = "~/.ssh/id_ed25519_runpod";
+/// Max wait time for downloads (seconds).
+const DOWNLOAD_TIMEOUT_SECS: u64 = 600;
+/// Interval between download status polls (seconds).
+const DOWNLOAD_POLL_INTERVAL_SECS: u64 = 5;
+
+/// ComfyUI model directory mapping (relative to models base dir).
+/// Matches Lua `MODEL_DIRS` in runpod.lua L256-266.
+const MODEL_DIRS: &[(&str, &str)] = &[
+    ("checkpoints", "checkpoints"),
+    ("loras", "loras"),
+    ("controlnet", "controlnet"),
+    ("vae", "vae"),
+    ("upscale", "upscale_models"),
+    ("embeddings", "embeddings"),
+    ("clip", "clip"),
+    ("unet", "unet"),
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslDownloadRequest {
+    /// RunPod pod ID (e.g. "pod_abc123def").
+    pub pod_id: String,
+
+    /// Model source. Formats:
+    /// - "hf:user/repo/file.safetensors" (HuggingFace)
+    /// - "https://..." (direct URL)
+    /// - "user/repo/file.safetensors" (defaults to HuggingFace)
+    pub source: String,
+
+    /// Target model category: checkpoints, loras, controlnet, vae, upscale, embeddings, clip, unet.
+    pub target: String,
+
+    /// Override filename (default: extracted from URL).
+    pub filename: Option<String>,
+
+    /// SSH key path (default: ~/.ssh/id_ed25519_runpod).
+    pub ssh_key: Option<String>,
+}
+
+/// Resolved download info: URL + filename.
+struct DownloadInfo {
+    url: String,
+    filename: String,
+}
+
+/// Parse a model source string into market + download URL.
+/// Matches Lua `parse_source()` + `MARKETS` in runpod.lua L290-347.
+fn resolve_source(source: &str, filename_override: Option<&str>) -> Result<DownloadInfo, String> {
+    let (market, identifier) = if let Some(rest) = source.strip_prefix("hf:") {
+        ("hf", rest)
+    } else if source.starts_with("http://") || source.starts_with("https://") {
+        ("url", source)
+    } else {
+        // Default: HuggingFace
+        ("hf", source)
+    };
+
+    let mut info = match market {
+        "hf" => {
+            // Parse: "user/repo/path/to/file.ext"
+            let parts: Vec<&str> = identifier.splitn(3, '/').collect();
+            if parts.len() < 3 {
+                return Err(format!(
+                    "HuggingFace source requires 'user/repo/file.ext', got: {identifier}"
+                ));
+            }
+            let repo = format!("{}/{}", parts[0], parts[1]);
+            let filepath = parts[2];
+            let fname = filepath.rsplit('/').next().unwrap_or(filepath);
+            DownloadInfo {
+                url: format!("https://huggingface.co/{repo}/resolve/main/{filepath}"),
+                filename: fname.to_string(),
+            }
+        }
+        "url" => {
+            let path = identifier.split(['?', '#']).next().unwrap_or(identifier);
+            let fname = path.rsplit('/').next().unwrap_or("download");
+            DownloadInfo {
+                url: identifier.to_string(),
+                filename: fname.to_string(),
+            }
+        }
+        _ => return Err(format!("unknown market: {market}")),
+    };
+
+    if let Some(f) = filename_override {
+        info.filename = f.to_string();
+    }
+    Ok(info)
+}
+
+/// Resolve model directory name from target category.
+fn resolve_model_dir(target: &str) -> Result<&'static str, String> {
+    MODEL_DIRS
+        .iter()
+        .find(|(k, _)| *k == target)
+        .map(|(_, v)| *v)
+        .ok_or_else(|| {
+            let valid: Vec<&str> = MODEL_DIRS.iter().map(|(k, _)| *k).collect();
+            format!("unknown target '{target}'. Valid: {}", valid.join(", "))
+        })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VdslPodSetupRequest {
     /// Network volume ID. If omitted, auto-detected when exactly one volume exists.
@@ -745,6 +850,124 @@ impl VdslMcpServer {
         );
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
+
+    #[tool(
+        name = "vdsl_download",
+        description = "Download a model to a RunPod pod's ComfyUI models directory. \
+            Supports HuggingFace (hf:user/repo/file), direct URLs (https://...), \
+            and bare paths (user/repo/file defaults to HuggingFace). \
+            Downloads run in background on the pod via SSH; this tool polls until complete. \
+            Timeout: 10 minutes.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn download(
+        &self,
+        Parameters(req): Parameters<VdslDownloadRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = Self::pod_service()?;
+        let ssh_key = req.ssh_key.as_deref().unwrap_or(DEFAULT_SSH_KEY);
+
+        // --- 1. Resolve source → URL + filename ---
+        let dl_info = resolve_source(&req.source, req.filename.as_deref())
+            .map_err(|e| McpError::invalid_params(e, None))?;
+
+        // --- 2. Resolve target directory ---
+        let dir_name =
+            resolve_model_dir(&req.target).map_err(|e| McpError::invalid_params(e, None))?;
+
+        // Use common ComfyUI models path
+        let dest = format!(
+            "/workspace/runpod-slim/ComfyUI/models/{}/{}",
+            dir_name, dl_info.filename
+        );
+
+        let mut log = Vec::<String>::new();
+        log.push(format!(
+            "Downloading {} → {}/{}",
+            req.source, req.target, dl_info.filename
+        ));
+        log.push(format!("URL: {}", dl_info.url));
+        log.push(format!("Dest: {dest}"));
+
+        // --- 3. Start download ---
+        let resp = svc
+            .download_add(&req.pod_id, &dl_info.url, Some(&dest), ssh_key)
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        let job_id = resp["id"]
+            .as_str()
+            .ok_or_else(|| {
+                McpError::internal_error(
+                    format!("download_add returned no job id: {resp:?}"),
+                    None,
+                )
+            })?
+            .to_string();
+
+        if resp["state"].as_str() == Some("already_running") {
+            log.push(format!(
+                "Already in progress (pid {}), waiting...",
+                resp["pid"].as_str().unwrap_or("?")
+            ));
+        } else {
+            log.push(format!("Job started: {job_id}"));
+        }
+
+        // --- 4. Poll for completion ---
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS);
+        let interval = std::time::Duration::from_secs(DOWNLOAD_POLL_INTERVAL_SECS);
+
+        let final_status = loop {
+            let status = svc
+                .download_status(&req.pod_id, &job_id, ssh_key)
+                .await
+                .map_err(Self::to_mcp_error)?;
+
+            let state = status["state"].as_str().unwrap_or("unknown");
+
+            if state == "done" {
+                let exit_code = status["exit_code"]
+                    .as_str()
+                    .or_else(|| status["exit_code"].as_i64().map(|_| ""))
+                    .unwrap_or("?");
+                if exit_code != "0" && !exit_code.is_empty() {
+                    let log_msg = status["log"].as_str().unwrap_or("");
+                    log.push(format!("Download failed (exit {exit_code}): {log_msg}"));
+                    return Err(McpError::internal_error(log.join("\n"), None));
+                }
+                break status;
+            }
+
+            if std::time::Instant::now() >= deadline {
+                log.push(format!(
+                    "Timeout after {DOWNLOAD_TIMEOUT_SECS}s (last state: {state})"
+                ));
+                return Err(McpError::internal_error(log.join("\n"), None));
+            }
+
+            tokio::time::sleep(interval).await;
+        };
+
+        let file_size = final_status["file_size"]
+            .as_str()
+            .or_else(|| final_status["file_size"].as_i64().map(|_| "?"))
+            .unwrap_or("?");
+        log.push(format!("Done ({file_size} bytes)"));
+
+        let output = format!(
+            "{}\n\n{}",
+            log.join("\n"),
+            serde_json::to_string_pretty(&final_status)
+                .unwrap_or_else(|_| format!("{final_status:?}"))
+        );
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
 }
 
 // =============================================================================
@@ -946,5 +1169,121 @@ mod tests {
             serde_json::from_str(r#"{"volume_id":"vol_abc"}"#).unwrap();
         assert_eq!(req.volume_id.as_deref(), Some("vol_abc"));
         assert!(req.gpu.is_none());
+    }
+
+    // --- Download request tests ---
+
+    #[test]
+    fn download_request_minimal() {
+        let req: VdslDownloadRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_abc","source":"hf:user/repo/model.safetensors","target":"loras"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.pod_id, "pod_abc");
+        assert_eq!(req.source, "hf:user/repo/model.safetensors");
+        assert_eq!(req.target, "loras");
+        assert!(req.filename.is_none());
+        assert!(req.ssh_key.is_none());
+    }
+
+    #[test]
+    fn download_request_full() {
+        let req: VdslDownloadRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_abc","source":"https://example.com/model.safetensors","target":"checkpoints","filename":"my_model.safetensors","ssh_key":"~/.ssh/custom_key"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.filename.as_deref(), Some("my_model.safetensors"));
+        assert_eq!(req.ssh_key.as_deref(), Some("~/.ssh/custom_key"));
+    }
+
+    #[test]
+    fn download_request_missing_fields() {
+        assert!(serde_json::from_str::<VdslDownloadRequest>("{}").is_err());
+        assert!(
+            serde_json::from_str::<VdslDownloadRequest>(r#"{"pod_id":"pod_abc"}"#).is_err()
+        );
+    }
+
+    // --- Source resolution tests ---
+
+    #[test]
+    fn resolve_source_hf_prefix() {
+        let info = resolve_source("hf:myuser/myrepo/model.safetensors", None).unwrap();
+        assert_eq!(
+            info.url,
+            "https://huggingface.co/myuser/myrepo/resolve/main/model.safetensors"
+        );
+        assert_eq!(info.filename, "model.safetensors");
+    }
+
+    #[test]
+    fn resolve_source_hf_default() {
+        let info = resolve_source("myuser/myrepo/lora_v1.safetensors", None).unwrap();
+        assert_eq!(
+            info.url,
+            "https://huggingface.co/myuser/myrepo/resolve/main/lora_v1.safetensors"
+        );
+        assert_eq!(info.filename, "lora_v1.safetensors");
+    }
+
+    #[test]
+    fn resolve_source_hf_nested_path() {
+        let info = resolve_source("hf:user/repo/subdir/deep/model.bin", None).unwrap();
+        assert_eq!(
+            info.url,
+            "https://huggingface.co/user/repo/resolve/main/subdir/deep/model.bin"
+        );
+        assert_eq!(info.filename, "model.bin");
+    }
+
+    #[test]
+    fn resolve_source_direct_url() {
+        let info =
+            resolve_source("https://example.com/models/v2/checkpoint.safetensors", None).unwrap();
+        assert_eq!(
+            info.url,
+            "https://example.com/models/v2/checkpoint.safetensors"
+        );
+        assert_eq!(info.filename, "checkpoint.safetensors");
+    }
+
+    #[test]
+    fn resolve_source_url_with_query() {
+        let info = resolve_source("https://civitai.com/api/download/models/12345?type=Model", None)
+            .unwrap();
+        assert_eq!(info.filename, "12345");
+    }
+
+    #[test]
+    fn resolve_source_filename_override() {
+        let info = resolve_source(
+            "https://civitai.com/api/download/models/12345",
+            Some("my_lora.safetensors"),
+        )
+        .unwrap();
+        assert_eq!(info.filename, "my_lora.safetensors");
+    }
+
+    #[test]
+    fn resolve_source_hf_too_short() {
+        let result = resolve_source("hf:user/repo", None);
+        assert!(result.is_err());
+    }
+
+    // --- Model dir resolution tests ---
+
+    #[test]
+    fn resolve_model_dir_valid() {
+        assert_eq!(resolve_model_dir("loras").unwrap(), "loras");
+        assert_eq!(resolve_model_dir("checkpoints").unwrap(), "checkpoints");
+        assert_eq!(resolve_model_dir("controlnet").unwrap(), "controlnet");
+        assert_eq!(resolve_model_dir("upscale").unwrap(), "upscale_models");
+    }
+
+    #[test]
+    fn resolve_model_dir_invalid() {
+        let err = resolve_model_dir("foobar").unwrap_err();
+        assert!(err.contains("unknown target"));
+        assert!(err.contains("loras"));
     }
 }
