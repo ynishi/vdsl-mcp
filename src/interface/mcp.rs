@@ -339,8 +339,9 @@ pub struct VdslDownloadRequest {
 
     /// Model source. Formats:
     /// - "hf:user/repo/file.safetensors" (HuggingFace)
-    /// - "https://..." (direct URL)
-    /// - "user/repo/file.safetensors" (defaults to HuggingFace)
+    /// - "cv:VERSION_ID" (CivitAI — token auto-injected from CIVITAI_TOKEN env)
+    /// - "https://..." (direct URL — CivitAI URLs get token auto-injected)
+    /// - "user/repo/file.safetensors" (bare path defaults to HuggingFace)
     pub source: String,
 
     /// Target model category: checkpoints, loras, controlnet, vae, upscale, embeddings, clip, unet.
@@ -360,14 +361,21 @@ struct DownloadInfo {
 }
 
 /// Parse a model source string into market + download URL.
-/// Matches Lua `parse_source()` + `MARKETS` in runpod.lua L290-347.
+///
+/// Supported prefixes:
+///   - `hf:user/repo/file.safetensors` — HuggingFace
+///   - `cv:VERSION_ID` — CivitAI (token auto-injected from CIVITAI_TOKEN env)
+///   - `https://...` — direct URL (CivitAI URLs get token auto-injected)
+///   - `user/repo/file.safetensors` — bare path defaults to HuggingFace
 fn resolve_source(source: &str, filename_override: Option<&str>) -> Result<DownloadInfo, String> {
     let (market, identifier) = if let Some(rest) = source.strip_prefix("hf:") {
         ("hf", rest)
+    } else if let Some(rest) = source.strip_prefix("cv:") {
+        ("cv", rest)
     } else if source.starts_with("http://") || source.starts_with("https://") {
         ("url", source)
     } else {
-        // Default: HuggingFace
+        // Bare path: default to HuggingFace (user/repo/file pattern)
         ("hf", source)
     };
 
@@ -388,21 +396,58 @@ fn resolve_source(source: &str, filename_override: Option<&str>) -> Result<Downl
                 filename: fname.to_string(),
             }
         }
+        "cv" => {
+            // CivitAI version ID → download URL with auto token
+            let version_id = identifier.trim();
+            if version_id.is_empty() {
+                return Err("cv: requires a version ID (e.g. cv:1595775)".into());
+            }
+            let mut url = format!("https://civitai.com/api/download/models/{version_id}");
+            if let Ok(token) = std::env::var("CIVITAI_TOKEN") {
+                if !token.is_empty() {
+                    url.push_str(&format!("?token={token}"));
+                }
+            }
+            DownloadInfo {
+                url,
+                filename: format!("{version_id}.safetensors"),
+            }
+        }
         "url" => {
             let path = identifier.split(['?', '#']).next().unwrap_or(identifier);
             let fname = path.rsplit('/').next().unwrap_or("download");
+            // Auto-inject CivitAI token for civitai.com URLs without token
+            let url = inject_civitai_token(identifier);
             DownloadInfo {
-                url: identifier.to_string(),
+                url,
                 filename: fname.to_string(),
             }
         }
-        _ => return Err(format!("unknown market: {market}")),
+        _ => return Err(format!("unknown source prefix: {market}")),
     };
 
     if let Some(f) = filename_override {
         info.filename = f.to_string();
     }
     Ok(info)
+}
+
+/// Auto-inject CIVITAI_TOKEN into civitai.com download URLs if not already present.
+fn inject_civitai_token(url: &str) -> String {
+    if !url.contains("civitai.com") {
+        return url.to_string();
+    }
+    if url.contains("token=") {
+        return url.to_string();
+    }
+    let Ok(token) = std::env::var("CIVITAI_TOKEN") else {
+        return url.to_string();
+    };
+    if token.is_empty() {
+        return url.to_string();
+    }
+    let sep = if url.contains('?') { "&" } else { "?" };
+    format!("{url}{sep}token={token}")
 }
 
 /// Resolve model directory name from target category.
@@ -1112,9 +1157,10 @@ impl VdslMcpServer {
     #[tool(
         name = "vdsl_download",
         description = "Download a model to a RunPod pod's ComfyUI models directory. \
-            Supports HuggingFace (hf:user/repo/file), direct URLs (https://...), \
-            and bare paths (user/repo/file defaults to HuggingFace). \
-            Downloads run in background on the pod via SSH; this tool polls until complete. \
+            Sources: hf:user/repo/file (HuggingFace), cv:VERSION_ID (CivitAI), \
+            https://... (direct URL), or bare user/repo/file (defaults to HuggingFace). \
+            CivitAI token is auto-injected from CIVITAI_TOKEN env. \
+            Downloads run in background on the pod via SSH; polls until complete. \
             Timeout: 10 minutes.",
         annotations(
             read_only_hint = false,
@@ -2559,6 +2605,40 @@ mod tests {
     fn resolve_source_hf_too_short() {
         let result = resolve_source("hf:user/repo", None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_source_cv_prefix() {
+        let info = resolve_source("cv:1595775", None).unwrap();
+        assert!(info
+            .url
+            .starts_with("https://civitai.com/api/download/models/1595775"));
+        assert_eq!(info.filename, "1595775.safetensors");
+    }
+
+    #[test]
+    fn resolve_source_cv_with_filename_override() {
+        let info = resolve_source("cv:1595775", Some("retro_scifi.safetensors")).unwrap();
+        assert!(info.url.contains("civitai.com"));
+        assert_eq!(info.filename, "retro_scifi.safetensors");
+    }
+
+    #[test]
+    fn resolve_source_cv_empty_id() {
+        let result = resolve_source("cv:", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn inject_civitai_token_non_civitai_url() {
+        let url = inject_civitai_token("https://example.com/file.bin");
+        assert_eq!(url, "https://example.com/file.bin");
+    }
+
+    #[test]
+    fn inject_civitai_token_already_has_token() {
+        let url = inject_civitai_token("https://civitai.com/api/download/models/123?token=abc");
+        assert_eq!(url, "https://civitai.com/api/download/models/123?token=abc");
     }
 
     // --- Model dir resolution tests ---
