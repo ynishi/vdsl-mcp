@@ -50,6 +50,10 @@ struct VdslMcpServer {
     /// Set by `vdsl_connect` and `vdsl_pod_setup` on success.
     /// Used as fallback when pod_id/url are omitted in subsequent calls.
     last_url: Arc<Mutex<Option<String>>>,
+    /// Last successfully connected pod ID (session state).
+    /// Set alongside `last_url` when the pod ID is known.
+    /// Used by `vdsl_exec` to avoid requiring pod_id on every call.
+    last_pod_id: Arc<Mutex<Option<String>>>,
 }
 
 impl VdslMcpServer {
@@ -57,6 +61,7 @@ impl VdslMcpServer {
         Self {
             tool_router: Self::tool_router(),
             last_url: Arc::new(Mutex::new(None)),
+            last_pod_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -80,10 +85,35 @@ impl VdslMcpServer {
             .map_err(|e| McpError::internal_error(format!("HTTP client init failed: {e}"), None))
     }
 
-    /// Store the last successfully connected URL for session reuse.
-    fn save_last_url(&self, url: &str) {
+    /// Store the last successfully connected URL and pod ID for session reuse.
+    fn save_session(&self, url: &str, pod_id: Option<&str>) {
         if let Ok(mut guard) = self.last_url.lock() {
             *guard = Some(url.to_string());
+        }
+        if let Some(id) = pod_id {
+            if let Ok(mut guard) = self.last_pod_id.lock() {
+                *guard = Some(id.to_string());
+            }
+        }
+    }
+
+    /// Resolve pod ID from explicit parameter or session state.
+    fn resolve_pod_id(&self, pod_id: Option<&str>) -> Result<String, McpError> {
+        if let Some(id) = pod_id {
+            if !id.is_empty() {
+                return Ok(id.to_string());
+            }
+        }
+        let guard = self
+            .last_pod_id
+            .lock()
+            .map_err(|_| McpError::internal_error("session state lock poisoned", None))?;
+        match guard.as_deref() {
+            Some(id) => Ok(id.to_string()),
+            None => Err(McpError::invalid_params(
+                "pod_id is required (no previous connection to fall back to). Use vdsl_connect first.",
+                None,
+            )),
         }
     }
 
@@ -486,6 +516,102 @@ fn inject_civitai_token(url: &str) -> String {
     format!("{url}{sep}token={token}")
 }
 
+/// Format CivitAI /api/v1/models response into human-readable text.
+///
+/// Each model shows: name, type, base model, download count, rating,
+/// and the latest version's ID (usable with `vdsl_download source: "cv:ID"`).
+fn format_civitai_results(json: &serde_json::Value) -> String {
+    let items = match json["items"].as_array() {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => return "No models found.".to_string(),
+    };
+
+    let mut out = format!("Found {} model(s):\n\n", items.len());
+
+    for (i, model) in items.iter().enumerate() {
+        let name = model["name"].as_str().unwrap_or("(unknown)");
+        let model_type = model["type"].as_str().unwrap_or("?");
+        let stats = &model["stats"];
+        let downloads = stats["downloadCount"].as_u64().unwrap_or(0);
+        let rating = stats["rating"].as_f64().unwrap_or(0.0);
+        let rating_count = stats["ratingCount"].as_u64().unwrap_or(0);
+        let nsfw = model["nsfw"].as_bool().unwrap_or(false);
+
+        out.push_str(&format!("{}. **{}**\n", i + 1, name));
+        out.push_str(&format!(
+            "   Type: {model_type} | Downloads: {downloads} | Rating: {rating:.1} ({rating_count})"
+        ));
+        if nsfw {
+            out.push_str(" | NSFW");
+        }
+        out.push('\n');
+
+        // Show versions (latest first, max 10)
+        if let Some(versions) = model["modelVersions"].as_array() {
+            let show = versions.len().min(10);
+            for ver in &versions[..show] {
+                let ver_id = ver["id"].as_u64().unwrap_or(0);
+                let ver_name = ver["name"].as_str().unwrap_or("?");
+                let base = ver["baseModel"].as_str().unwrap_or("?");
+
+                // File size from first file entry
+                let file_size = ver["files"]
+                    .as_array()
+                    .and_then(|f| f.first())
+                    .and_then(|f| f["sizeKB"].as_f64())
+                    .map(format_file_size);
+
+                let mut line = format!("   - v{ver_name} (base: {base})");
+                if let Some(ref size) = file_size {
+                    line.push_str(&format!(" [{size}]"));
+                }
+                line.push_str(&format!(" → cv:{ver_id}"));
+
+                // Trained words (trigger words for LoRAs)
+                if let Some(words) = ver["trainedWords"].as_array() {
+                    let triggers: Vec<&str> = words.iter().filter_map(|w| w.as_str()).collect();
+                    if !triggers.is_empty() {
+                        line.push_str(&format!("\n     triggers: {}", triggers.join(", ")));
+                    }
+                }
+
+                out.push_str(&line);
+                out.push('\n');
+            }
+            if versions.len() > 10 {
+                out.push_str(&format!(
+                    "   ... and {} more version(s)\n",
+                    versions.len() - 10
+                ));
+            }
+        }
+        out.push('\n');
+    }
+
+    // Pagination info
+    if let Some(meta) = json["metadata"].as_object() {
+        let total = meta.get("totalItems").and_then(|v| v.as_u64());
+        let page = meta.get("currentPage").and_then(|v| v.as_u64());
+        let pages = meta.get("totalPages").and_then(|v| v.as_u64());
+        if let (Some(t), Some(p), Some(tp)) = (total, page, pages) {
+            out.push_str(&format!("Page {p}/{tp} ({t} total models)\n"));
+        }
+    }
+
+    out
+}
+
+/// Format file size from KB to human-readable string.
+fn format_file_size(size_kb: f64) -> String {
+    if size_kb >= 1_048_576.0 {
+        format!("{:.1} GB", size_kb / 1_048_576.0)
+    } else if size_kb >= 1024.0 {
+        format!("{:.0} MB", size_kb / 1024.0)
+    } else {
+        format!("{:.0} KB", size_kb)
+    }
+}
+
 /// Resolve model directory name from target category.
 fn resolve_model_dir(target: &str) -> Result<&'static str, String> {
     MODEL_DIRS
@@ -550,6 +676,27 @@ pub struct VdslStoragePushRequest {
     /// Specific filename within the model category dir (e.g. "sd_xl_base.safetensors").
     /// If omitted, pushes the entire category directory.
     pub filename: Option<String>,
+
+    /// Destination path prefix in B2 (default: "models/<category>").
+    pub dest_path: Option<String>,
+
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    pub ssh_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslStorageArchiveRequest {
+    /// RunPod pod ID (e.g. "pod_abc123def").
+    pub pod_id: String,
+
+    /// Model category: checkpoints, loras, controlnet, vae, upscale, embeddings, clip, unet.
+    pub source_target: String,
+
+    /// Filename to archive (e.g. "GAME_cammy_white_aiwaifu-10.safetensors").
+    pub filename: String,
+
+    /// B2 bucket name. If omitted, uses VDSL_B2_BUCKET env var.
+    pub bucket: Option<String>,
 
     /// Destination path prefix in B2 (default: "models/<category>").
     pub dest_path: Option<String>,
@@ -704,30 +851,6 @@ pub struct VdslCatalogsRequest {
 const DEFAULT_CATALOG_SCRIPT: &str = "scripts/catalog_available.lua";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct VdslPreflightRequest {
-    /// VDSL script file to check (extracts required models from vdsl.render() calls).
-    pub script_file: String,
-
-    /// VDSL repository root (must contain lua/ for module resolution).
-    pub working_dir: String,
-
-    /// ComfyUI URL for checking model availability.
-    /// If omitted (along with pod_id), only required models are listed without availability check.
-    pub url: Option<String>,
-
-    /// RunPod pod ID for checking model availability.
-    /// Proxy URL is auto-constructed. Takes precedence over url.
-    pub pod_id: Option<String>,
-
-    /// Path to the preflight script.
-    /// Absolute path is used as-is; relative path is resolved from working_dir.
-    /// Default: "scripts/preflight.lua"
-    pub preflight_script: Option<String>,
-}
-
-const DEFAULT_PREFLIGHT_SCRIPT: &str = "scripts/preflight.lua";
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VdslComfyApiRequest {
     /// ComfyUI URL (e.g. "https://pod_id-8188.proxy.runpod.net").
     pub url: Option<String>,
@@ -785,6 +908,101 @@ pub struct VdslRunpodCliRequest {
     /// Arguments to pass to runpod-cli (e.g. ["pods", "list-pods"]).
     /// VDSL_RUNPOD_API_KEY and -o json are injected automatically.
     pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslExecRequest {
+    /// Shell command to execute on the pod (e.g. "ls /workspace" or "nvidia-smi").
+    pub command: String,
+
+    /// RunPod pod ID. If omitted, reuses the last vdsl_connect or vdsl_pod_setup session.
+    pub pod_id: Option<String>,
+
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    pub ssh_key: Option<String>,
+
+    /// Timeout in seconds (default: 30).
+    pub timeout: Option<u64>,
+}
+
+/// Model marketplace source for search.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelSource {
+    /// CivitAI (civitai.com)
+    Cv,
+    /// HuggingFace (huggingface.co)
+    Hf,
+}
+
+/// Model type filter for search (aligned with ComfyUI model categories).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelType {
+    Checkpoint,
+    Lora,
+    Controlnet,
+    Vae,
+    Upscale,
+    Embedding,
+}
+
+impl ModelType {
+    /// Convert to CivitAI API `types` parameter value.
+    fn to_civitai_type(self) -> &'static str {
+        match self {
+            Self::Checkpoint => "Checkpoint",
+            Self::Lora => "LORA",
+            Self::Controlnet => "Controlnet",
+            Self::Vae => "VAE",
+            Self::Upscale => "Upscaler",
+            Self::Embedding => "TextualInversion",
+        }
+    }
+}
+
+/// Sort order for model search results.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSearchSort {
+    MostDownloaded,
+    HighestRated,
+    Newest,
+}
+
+impl ModelSearchSort {
+    fn to_civitai_sort(self) -> &'static str {
+        match self {
+            Self::MostDownloaded => "Most Downloaded",
+            Self::HighestRated => "Highest Rated",
+            Self::Newest => "Newest",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslModelSearchRequest {
+    /// Search keyword (e.g. "photorealistic", "anime style", "SDXL").
+    pub query: String,
+
+    /// Model marketplace to search. If omitted, defaults to CivitAI.
+    /// Currently supported: cv (CivitAI). HuggingFace (hf) support is planned.
+    pub source: Option<ModelSource>,
+
+    /// Filter by model type. Maps to ComfyUI model categories.
+    pub model_type: Option<ModelType>,
+
+    /// Sort order (default: most_downloaded).
+    pub sort: Option<ModelSearchSort>,
+
+    /// Maximum results to return (default: 10, max: 50).
+    pub limit: Option<u32>,
+
+    /// Filter by base model (e.g. "SDXL 1.0", "SD 1.5", "Flux.1 D").
+    pub base_model: Option<String>,
+
+    /// Include NSFW results (default: false).
+    pub nsfw: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1037,10 +1255,12 @@ impl VdslMcpServer {
         };
 
         // Save successful connection for session reuse
-        self.save_last_url(&url);
+        self.save_session(&url, req.pod_id.as_deref());
 
         let output = format!(
             "Connected to {url}\n\
+             \nAll subsequent tools (generate, models, exec, etc.) will reuse this connection — \
+             pod_id/url can be omitted.\n\
              \nComfyUI models path: {COMFYUI_MODELS_BASE}\n\
              Custom nodes path: {COMFYUI_CUSTOM_NODES}\n\
              \n{}",
@@ -1251,10 +1471,13 @@ impl VdslMcpServer {
         log.push("ComfyUI is ready.".to_string());
 
         // Save successful connection for session reuse
-        self.save_last_url(&url);
+        self.save_session(&url, Some(&pod_id));
 
         let output = format!(
-            "{}\n\npod_id: {pod_id}\nurl: {url}\n\n{}",
+            "{}\n\npod_id: {pod_id}\nurl: {url}\n\
+             \nAll subsequent tools (generate, models, exec, etc.) will reuse this connection — \
+             pod_id/url can be omitted.\n\
+             \n{}",
             log.join("\n"),
             serde_json::to_string_pretty(&stats).unwrap_or_else(|_| format!("{stats:?}"))
         );
@@ -1263,7 +1486,8 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_models",
-        description = "List available models (checkpoints, LoRAs, VAEs, ControlNets, upscalers) on a running ComfyUI instance. Requires a connection URL or pod ID.",
+        description = "List available models (checkpoints, LoRAs, VAEs, ControlNets, upscalers) on a running ComfyUI instance. \
+            If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1292,7 +1516,8 @@ impl VdslMcpServer {
             Returns matching node class names (case-insensitive substring match). \
             Use this instead of /object_info which can exceed token limits. \
             Examples: pattern='Face' finds FaceDetailer, FaceRestore, etc. \
-            Omit pattern to list all node names.",
+            Omit pattern to list all node names. \
+            If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1350,7 +1575,8 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_queue_status",
-        description = "Check ComfyUI queue status. With prompt_id: check specific job (pending/running/completed/error). Without: show full queue state.",
+        description = "Check ComfyUI queue status. With prompt_id: check specific job (pending/running/completed/error). Without: show full queue state. \
+            If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1413,7 +1639,8 @@ impl VdslMcpServer {
         description = "Upload local files to a running ComfyUI instance (input/ directory). \
             Accepts a single file (filepath), multiple files (files), \
             or an entire directory (dir). Mutually exclusive. \
-            Used for ControlNet images, training data, etc.",
+            Used for ControlNet images, training data, etc. \
+            If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1579,7 +1806,8 @@ impl VdslMcpServer {
         description = "Queue a ComfyUI workflow and wait for completion. \
             Accepts workflow JSON inline (workflow) or as a file path (workflow_file). \
             Polls /history until done, returns prompt_id and output images. \
-            Timeout: 5 minutes (configurable).",
+            Timeout: 5 minutes (configurable). \
+            If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1720,7 +1948,8 @@ impl VdslMcpServer {
             or directory of .json files (load_dir). \
             All workflows are submitted to the queue, then polled until every job finishes. \
             Results and output images are collected per-workflow. \
-            Use save_dir to download all generated images locally.",
+            Use save_dir to download all generated images locally. \
+            If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1975,113 +2204,12 @@ impl VdslMcpServer {
     }
 
     #[tool(
-        name = "vdsl_preflight",
-        description = "Check model availability before generation. \
-            Executes the target VDSL script in dry-run mode, captures all vdsl.render() calls, \
-            extracts required models (checkpoints, LoRAs, VAEs, ControlNets, upscalers), \
-            and optionally checks them against a running ComfyUI instance. \
-            Returns JSON report: { ok, missing, required, summary }. \
-            If url/pod_id is provided, models are checked against the server. \
-            If omitted, only required models are listed.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            open_world_hint = true
-        )
-    )]
-    async fn preflight(
-        &self,
-        Parameters(req): Parameters<VdslPreflightRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let work_dir = std::path::PathBuf::from(&req.working_dir);
-        if !work_dir.join("lua").is_dir() {
-            return Err(McpError::invalid_params(
-                format!(
-                    "working_dir '{}' does not contain a lua/ directory",
-                    req.working_dir
-                ),
-                None,
-            ));
-        }
-
-        // Resolve preflight script path
-        let raw = req
-            .preflight_script
-            .as_deref()
-            .unwrap_or(DEFAULT_PREFLIGHT_SCRIPT);
-        let script = {
-            let p = std::path::Path::new(raw);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                work_dir.join(p)
-            }
-        };
-        if !script.exists() {
-            return Err(McpError::invalid_params(
-                format!("preflight script not found: {}", script.display()),
-                None,
-            ));
-        }
-
-        // Resolve target script file
-        let target = {
-            let p = std::path::Path::new(&req.script_file);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                work_dir.join(p)
-            }
-        };
-        if !target.exists() {
-            return Err(McpError::invalid_params(
-                format!("script file not found: {}", target.display()),
-                None,
-            ));
-        }
-
-        // Optionally fetch available models from ComfyUI
-        let mut envs: Vec<(&str, &str)> = Vec::new();
-        let available_json;
-        if req.url.is_some() || req.pod_id.is_some() {
-            let url = self.resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())?;
-            let client = Self::comfyui_client(url)?;
-            let object_info = client.object_info().await.map_err(Self::to_mcp_error)?;
-            let catalog = crate::domain::models::parse_model_catalog(&object_info);
-            available_json = serde_json::to_string(&catalog)
-                .map_err(|e| McpError::internal_error(format!("JSON serialize: {e}"), None))?;
-            envs.push(("VDSL_AVAILABLE", &available_json));
-        }
-
-        let lua_args = vec![
-            script.to_string_lossy().to_string(),
-            target.to_string_lossy().to_string(),
-        ];
-        let result = exec_lua(&lua_args, &work_dir, 60, &envs).await?;
-
-        // exit_code 2 = missing models (not an error, report normally)
-        if result.exit_code != 0 && result.exit_code != 2 {
-            let mut msg = format!("preflight script failed (exit {})", result.exit_code);
-            if !result.stderr.is_empty() {
-                msg.push_str(&format!("\n{}", result.stderr));
-            }
-            return Err(McpError::internal_error(msg, None));
-        }
-
-        let mut response = result.stdout;
-        if !result.stderr.is_empty() {
-            response.push_str(&format!("\n[stderr]\n{}", result.stderr));
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(response)]))
-    }
-
-    #[tool(
         name = "vdsl_comfy_api",
         description = "Call any ComfyUI REST API endpoint with automatic authentication. \
             Supports GET and POST. Authentication (Bearer token) and URL construction \
             (from pod_id) are handled automatically. \
-            Examples: GET /queue, GET /object_info, POST /prompt, GET /history/{id}.",
+            Examples: GET /queue, GET /object_info, POST /prompt, GET /history/{id}. \
+            If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2111,6 +2239,145 @@ impl VdslMcpServer {
             "{method} {url}{path}\n\n{}",
             serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"))
         );
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    // =========================================================================
+    // Remote Exec
+    // =========================================================================
+
+    #[tool(
+        name = "vdsl_exec",
+        description = "Execute a shell command on a RunPod pod via SSH. \
+            Pass a command string (e.g. \"ls /workspace\", \"nvidia-smi\"). \
+            If pod_id is omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn exec(
+        &self,
+        Parameters(req): Parameters<VdslExecRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = Self::pod_service()?;
+        let pod_id = self.resolve_pod_id(req.pod_id.as_deref())?;
+        let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
+        let timeout_secs = req.timeout.or(Some(30));
+
+        // Split command string into shell invocation
+        let cmd = ["bash", "-c", &req.command];
+        let result = svc
+            .pod_exec(&pod_id, &cmd, Some(&ssh_key), timeout_secs)
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        let mut output = format!("$ {}\n\n", req.command);
+        if !result.stdout.is_empty() {
+            output.push_str(&result.stdout);
+        }
+        if !result.stderr.is_empty() {
+            if !result.stdout.is_empty() {
+                output.push('\n');
+            }
+            output.push_str("stderr:\n");
+            output.push_str(&result.stderr);
+        }
+        if !result.success {
+            output.push_str(&format!("\nexit code: {}", result.exit_code));
+        }
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    // =========================================================================
+    // Model Search
+    // =========================================================================
+
+    #[tool(
+        name = "vdsl_model_search",
+        description = "Search for AI models (checkpoints, LoRAs, VAEs, etc.) on model marketplaces. \
+            Returns model names, version IDs, download counts, and base model info. \
+            Use the returned version ID with vdsl_download (source: \"cv:VERSION_ID\") to install. \
+            Currently supports: CivitAI (cv). HuggingFace (hf) support is planned.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn model_search(
+        &self,
+        Parameters(req): Parameters<VdslModelSearchRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let query = req.query.trim();
+        if query.is_empty() {
+            return Err(McpError::invalid_params("query is required", None));
+        }
+
+        let source = req.source.unwrap_or(ModelSource::Cv);
+        match source {
+            ModelSource::Cv => self.search_civitai(&req).await,
+            ModelSource::Hf => Err(McpError::invalid_params(
+                "HuggingFace search is not yet supported. Use source: \"cv\" (CivitAI) for now.",
+                None,
+            )),
+        }
+    }
+
+    /// CivitAI model search via GET /api/v1/models.
+    async fn search_civitai(
+        &self,
+        req: &VdslModelSearchRequest,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = req.limit.unwrap_or(10).min(50);
+        let mut url = format!(
+            "https://civitai.com/api/v1/models?query={}&limit={limit}",
+            urlencoding::encode(req.query.trim())
+        );
+
+        if let Some(mt) = req.model_type {
+            url.push_str(&format!("&types={}", mt.to_civitai_type()));
+        }
+        if let Some(sort) = req.sort {
+            url.push_str(&format!(
+                "&sort={}",
+                urlencoding::encode(sort.to_civitai_sort())
+            ));
+        }
+        if let Some(ref bm) = req.base_model {
+            url.push_str(&format!("&baseModels={}", urlencoding::encode(bm)));
+        }
+        if let Some(nsfw) = req.nsfw {
+            url.push_str(&format!("&nsfw={nsfw}"));
+        }
+
+        let client = reqwest::Client::new();
+        let mut request = client.get(&url);
+        if let Ok(token) = std::env::var("VDSL_CIVITAI_TOKEN") {
+            if !token.is_empty() {
+                request = request.header("Authorization", format!("Bearer {token}"));
+            }
+        }
+
+        let resp = request.send().await.map_err(|e| {
+            McpError::internal_error(format!("CivitAI API request failed: {e}"), None)
+        })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(McpError::internal_error(
+                format!("CivitAI API returned {status}: {body}"),
+                None,
+            ));
+        }
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| {
+            McpError::internal_error(format!("Failed to parse CivitAI response: {e}"), None)
+        })?;
+
+        let output = format_civitai_results(&json);
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -2265,7 +2532,8 @@ impl VdslMcpServer {
         name = "vdsl_interrupt",
         description = "Cancel ComfyUI jobs. \
             Without prompt_ids: sends POST /interrupt to cancel the currently running job. \
-            With prompt_ids: sends POST /queue to delete specific pending jobs from the queue.",
+            With prompt_ids: sends POST /queue to delete specific pending jobs from the queue. \
+            If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2501,6 +2769,151 @@ impl VdslMcpServer {
     }
 
     // =========================================================================
+    // Storage Archive (push → verify → delete)
+    // =========================================================================
+
+    #[tool(
+        name = "vdsl_storage_archive",
+        description = "Archive a model from pod to B2 cold storage and delete from pod. \
+            Safe 3-step flow: 1) push to B2, 2) verify upload (existence + size), \
+            3) delete from pod only after verification. \
+            If verification fails, the pod file is NOT deleted. \
+            Requires VDSL_B2_KEY_ID and VDSL_B2_KEY env vars.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn storage_archive(
+        &self,
+        Parameters(req): Parameters<VdslStorageArchiveRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = Self::pod_service()?;
+        let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
+        let bucket = resolve_bucket(req.bucket.as_deref())?;
+        let dir_name =
+            resolve_model_dir(&req.source_target).map_err(|e| McpError::invalid_params(e, None))?;
+
+        let source_path = format!("{COMFYUI_MODELS_BASE}/{dir_name}/{}", req.filename);
+        let dest_path = req.dest_path.as_deref().unwrap_or("").trim_matches('/');
+        let remote_dir = if dest_path.is_empty() {
+            format!("models/{dir_name}")
+        } else {
+            dest_path.to_string()
+        };
+        let remote = b2_remote(&bucket, &remote_dir)?;
+
+        ensure_rclone(&svc, &req.pod_id, &ssh_key).await?;
+
+        let mut log = Vec::<String>::new();
+
+        // --- Step 0: Verify source file exists on pod ---
+        log.push(format!("[0/3] Checking {source_path} on pod..."));
+        let stat_result = svc
+            .pod_exec(
+                &req.pod_id,
+                &["stat", "--format=%s", &source_path],
+                Some(&ssh_key),
+                Some(30),
+            )
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        if !stat_result.success {
+            log.push(format!("ABORTED: file not found on pod: {source_path}"));
+            return Err(McpError::invalid_params(log.join("\n"), None));
+        }
+        let pod_size: u64 = stat_result.stdout.trim().parse().unwrap_or(0);
+        log.push(format!("  Pod file size: {pod_size} bytes"));
+
+        // --- Step 1: Push to B2 ---
+        log.push(format!(
+            "[1/3] Pushing {source_path} → B2:{bucket}/{remote_dir}/{}",
+            req.filename
+        ));
+        let push_result = svc
+            .pod_exec(
+                &req.pod_id,
+                &["rclone", "copy", "--progress", &source_path, &remote],
+                Some(&ssh_key),
+                Some(RCLONE_OP_TIMEOUT_SECS),
+            )
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        if !push_result.success {
+            log.push(format!(
+                "ABORTED at push (exit {}): {}",
+                push_result.exit_code,
+                push_result.stderr.trim()
+            ));
+            return Err(McpError::internal_error(log.join("\n"), None));
+        }
+        log.push("  Push complete.".to_string());
+
+        // --- Step 2: Verify on B2 (existence + size) ---
+        log.push(format!(
+            "[2/3] Verifying B2:{bucket}/{remote_dir}/{}...",
+            req.filename
+        ));
+        let verify_remote = b2_remote(&bucket, &format!("{remote_dir}/{}", req.filename))?;
+        let verify_result = svc
+            .pod_exec(
+                &req.pod_id,
+                &["rclone", "lsf", "--format", "s", &verify_remote],
+                Some(&ssh_key),
+                Some(RCLONE_OP_TIMEOUT_SECS),
+            )
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        if !verify_result.success || verify_result.stdout.trim().is_empty() {
+            log.push("ABORTED: file not found in B2 after push. Pod file NOT deleted.".to_string());
+            return Err(McpError::internal_error(log.join("\n"), None));
+        }
+
+        let b2_size: u64 = verify_result.stdout.trim().parse().unwrap_or(0);
+        log.push(format!("  B2 file size: {b2_size} bytes"));
+
+        if b2_size != pod_size {
+            log.push(format!(
+                "ABORTED: size mismatch (pod: {pod_size}, B2: {b2_size}). Pod file NOT deleted."
+            ));
+            return Err(McpError::internal_error(log.join("\n"), None));
+        }
+        log.push("  Size verified OK.".to_string());
+
+        // --- Step 3: Delete from pod ---
+        log.push(format!("[3/3] Deleting {source_path} from pod..."));
+        let rm_result = svc
+            .pod_exec(
+                &req.pod_id,
+                &["rm", "-f", &source_path],
+                Some(&ssh_key),
+                Some(30),
+            )
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        if !rm_result.success {
+            log.push(format!(
+                "WARNING: delete failed (exit {}): {}. File may still exist on pod.",
+                rm_result.exit_code,
+                rm_result.stderr.trim()
+            ));
+        } else {
+            log.push("  Deleted from pod.".to_string());
+        }
+
+        log.push(format!(
+            "\nArchived: {} → B2:{bucket}/{remote_dir}/{} ({pod_size} bytes)",
+            req.filename, req.filename
+        ));
+        Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]))
+    }
+
+    // =========================================================================
     // Image batch download
     // =========================================================================
 
@@ -2509,7 +2922,8 @@ impl VdslMcpServer {
         description = "Batch download output images from ComfyUI history. \
             Downloads all output images from recent history entries to a local directory. \
             Optionally specify prompt_ids to download images from specific jobs only. \
-            If prompt_ids is omitted, downloads from all recent history (up to ~100 entries).",
+            If prompt_ids is omitted, downloads from all recent history (up to ~100 entries). \
+            If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2610,7 +3024,9 @@ impl VdslMcpServer {
             The script receives VDSL_OUT_DIR env var and writes .json workflow files there. \
             Phase 2: Sends all compiled workflows to ComfyUI via batch generate, \
             polls for completion, and downloads output images to save_dir. \
-            Set compile_only=true to skip generation (no server required).",
+            Set compile_only=true to skip generation — compiled workflows are checked \
+            for required models and verified against the server if connected (preflight). \
+            If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2680,7 +3096,7 @@ impl VdslMcpServer {
             log.push(format!("\n--- script stderr ---\n{}", lua_result.stderr));
         }
 
-        // --- compile_only: return here ---
+        // --- compile_only: model check + return ---
         if req.compile_only || workflow_files.is_empty() {
             if workflow_files.is_empty() {
                 log.push(
@@ -2688,6 +3104,42 @@ impl VdslMcpServer {
                           Ensure the script writes workflow files there."
                         .to_string(),
                 );
+            } else {
+                // Extract required models from compiled workflows
+                let mut wf_values = Vec::with_capacity(workflow_files.len());
+                for path in &workflow_files {
+                    let tagged = load_tagged_workflow(path).await?;
+                    wf_values.push(tagged.workflow);
+                }
+                let required = crate::domain::models::extract_required_models(&wf_values);
+                if !required.is_empty() {
+                    // Check against server if connection available
+                    if let Ok(url) =
+                        self.resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())
+                    {
+                        let client = Self::comfyui_client(url)?;
+                        let object_info = client.object_info().await.map_err(Self::to_mcp_error)?;
+                        let catalog = crate::domain::models::parse_model_catalog(&object_info);
+                        let missing = crate::domain::models::check_missing(&required, &catalog);
+                        log.push(String::new());
+                        log.push(crate::domain::models::format_preflight_report(
+                            &required, &missing,
+                        ));
+                    } else {
+                        // No server — list required models only
+                        log.push(String::new());
+                        let empty_missing = crate::domain::models::RequiredModels::default();
+                        log.push(crate::domain::models::format_preflight_report(
+                            &required,
+                            &empty_missing,
+                        ));
+                        log.push(
+                            "(No ComfyUI connection — showing required models only. \
+                             Use vdsl_connect first to enable server check.)"
+                                .to_string(),
+                        );
+                    }
+                }
             }
             return Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]));
         }
@@ -3618,7 +4070,7 @@ mod tests {
     #[test]
     fn resolve_url_falls_back_to_session() {
         let server = test_server();
-        server.save_last_url("https://saved-8188.proxy.runpod.net");
+        server.save_session("https://saved-8188.proxy.runpod.net", Some("saved"));
         let url = server.resolve_comfyui_url(None, None).unwrap();
         assert_eq!(url, "https://saved-8188.proxy.runpod.net");
     }
@@ -3626,7 +4078,7 @@ mod tests {
     #[test]
     fn resolve_url_explicit_overrides_session() {
         let server = test_server();
-        server.save_last_url("https://old-8188.proxy.runpod.net");
+        server.save_session("https://old-8188.proxy.runpod.net", Some("old_pod"));
         let url = server.resolve_comfyui_url(Some("new_pod"), None).unwrap();
         assert_eq!(url, "https://new_pod-8188.proxy.runpod.net");
     }
@@ -4082,48 +4534,6 @@ mod tests {
     fn catalogs_request_missing_working_dir() {
         let result = serde_json::from_str::<VdslCatalogsRequest>(r#"{}"#);
         assert!(result.is_err());
-    }
-
-    // --- preflight request tests ---
-
-    #[test]
-    fn preflight_request_full() {
-        let req: VdslPreflightRequest = serde_json::from_str(
-            r#"{"script_file":"gen.lua","working_dir":"/home/user/vdsl","url":"https://example.com","pod_id":"pod_abc","preflight_script":"scripts/custom_preflight.lua"}"#,
-        )
-        .unwrap();
-        assert_eq!(req.script_file, "gen.lua");
-        assert_eq!(req.working_dir, "/home/user/vdsl");
-        assert_eq!(req.url.as_deref(), Some("https://example.com"));
-        assert_eq!(req.pod_id.as_deref(), Some("pod_abc"));
-        assert_eq!(
-            req.preflight_script.as_deref(),
-            Some("scripts/custom_preflight.lua")
-        );
-    }
-
-    #[test]
-    fn preflight_request_minimal() {
-        let req: VdslPreflightRequest =
-            serde_json::from_str(r#"{"script_file":"gen.lua","working_dir":"/home/user/vdsl"}"#)
-                .unwrap();
-        assert_eq!(req.script_file, "gen.lua");
-        assert_eq!(req.working_dir, "/home/user/vdsl");
-        assert!(req.url.is_none());
-        assert!(req.pod_id.is_none());
-        assert!(req.preflight_script.is_none());
-    }
-
-    #[test]
-    fn preflight_request_missing_required() {
-        assert!(serde_json::from_str::<VdslPreflightRequest>(r#"{}"#).is_err());
-        assert!(
-            serde_json::from_str::<VdslPreflightRequest>(r#"{"script_file":"gen.lua"}"#).is_err()
-        );
-        assert!(serde_json::from_str::<VdslPreflightRequest>(
-            r#"{"working_dir":"/home/user/vdsl"}"#
-        )
-        .is_err());
     }
 
     // --- comfy_api request tests ---
@@ -4639,5 +5049,184 @@ mod tests {
         // it will succeed (which is also valid behavior).
         let _result = resolve_bucket(None);
         // Can't assert error without controlling env
+    }
+
+    // --- vdsl_storage_archive tests ---
+
+    #[test]
+    fn storage_archive_request_minimal() {
+        let req: VdslStorageArchiveRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_abc","source_target":"loras","filename":"test.safetensors"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.pod_id, "pod_abc");
+        assert_eq!(req.source_target, "loras");
+        assert_eq!(req.filename, "test.safetensors");
+        assert!(req.bucket.is_none());
+        assert!(req.dest_path.is_none());
+        assert!(req.ssh_key.is_none());
+    }
+
+    #[test]
+    fn storage_archive_request_full() {
+        let req: VdslStorageArchiveRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_x","source_target":"checkpoints","filename":"model.safetensors","bucket":"my-bucket","dest_path":"archive/ckpt","ssh_key":"/tmp/key"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.bucket.as_deref(), Some("my-bucket"));
+        assert_eq!(req.dest_path.as_deref(), Some("archive/ckpt"));
+        assert_eq!(req.ssh_key.as_deref(), Some("/tmp/key"));
+    }
+
+    #[test]
+    fn storage_archive_request_missing_filename() {
+        let result: Result<VdslStorageArchiveRequest, _> =
+            serde_json::from_str(r#"{"pod_id":"pod_abc","source_target":"loras"}"#);
+        assert!(result.is_err());
+    }
+
+    // --- vdsl_model_search tests ---
+
+    #[test]
+    fn model_search_request_minimal() {
+        let req: VdslModelSearchRequest =
+            serde_json::from_str(r#"{"query":"photorealistic"}"#).unwrap();
+        assert_eq!(req.query, "photorealistic");
+        assert!(req.source.is_none());
+        assert!(req.model_type.is_none());
+        assert!(req.sort.is_none());
+        assert!(req.limit.is_none());
+        assert!(req.base_model.is_none());
+        assert!(req.nsfw.is_none());
+    }
+
+    #[test]
+    fn model_search_request_full() {
+        let req: VdslModelSearchRequest = serde_json::from_str(
+            r#"{"query":"anime","source":"cv","model_type":"lora","sort":"newest","limit":20,"base_model":"SDXL 1.0","nsfw":false}"#,
+        )
+        .unwrap();
+        assert_eq!(req.query, "anime");
+        assert!(matches!(req.source, Some(ModelSource::Cv)));
+        assert!(matches!(req.model_type, Some(ModelType::Lora)));
+        assert!(matches!(req.sort, Some(ModelSearchSort::Newest)));
+        assert_eq!(req.limit, Some(20));
+        assert_eq!(req.base_model.as_deref(), Some("SDXL 1.0"));
+        assert_eq!(req.nsfw, Some(false));
+    }
+
+    #[test]
+    fn model_search_hf_source_parses() {
+        let req: VdslModelSearchRequest =
+            serde_json::from_str(r#"{"query":"test","source":"hf"}"#).unwrap();
+        assert!(matches!(req.source, Some(ModelSource::Hf)));
+    }
+
+    #[test]
+    fn model_type_to_civitai() {
+        assert_eq!(ModelType::Checkpoint.to_civitai_type(), "Checkpoint");
+        assert_eq!(ModelType::Lora.to_civitai_type(), "LORA");
+        assert_eq!(ModelType::Controlnet.to_civitai_type(), "Controlnet");
+        assert_eq!(ModelType::Vae.to_civitai_type(), "VAE");
+        assert_eq!(ModelType::Upscale.to_civitai_type(), "Upscaler");
+        assert_eq!(ModelType::Embedding.to_civitai_type(), "TextualInversion");
+    }
+
+    #[test]
+    fn model_search_sort_to_civitai() {
+        assert_eq!(
+            ModelSearchSort::MostDownloaded.to_civitai_sort(),
+            "Most Downloaded"
+        );
+        assert_eq!(
+            ModelSearchSort::HighestRated.to_civitai_sort(),
+            "Highest Rated"
+        );
+        assert_eq!(ModelSearchSort::Newest.to_civitai_sort(), "Newest");
+    }
+
+    #[test]
+    fn format_civitai_results_empty() {
+        let json = serde_json::json!({"items": []});
+        assert_eq!(format_civitai_results(&json), "No models found.");
+    }
+
+    #[test]
+    fn format_civitai_results_no_items_key() {
+        let json = serde_json::json!({});
+        assert_eq!(format_civitai_results(&json), "No models found.");
+    }
+
+    #[test]
+    fn format_civitai_results_single_model() {
+        let json = serde_json::json!({
+            "items": [{
+                "name": "Test LoRA",
+                "type": "LORA",
+                "nsfw": false,
+                "stats": {
+                    "downloadCount": 5000,
+                    "rating": 4.8,
+                    "ratingCount": 120
+                },
+                "modelVersions": [{
+                    "id": 12345,
+                    "name": "v2.0",
+                    "baseModel": "SDXL 1.0",
+                    "trainedWords": ["photo_style", "realistic"],
+                    "files": [{"sizeKB": 153600.0}]
+                }]
+            }],
+            "metadata": {
+                "totalItems": 1,
+                "currentPage": 1,
+                "totalPages": 1
+            }
+        });
+        let out = format_civitai_results(&json);
+        assert!(out.contains("Test LoRA"));
+        assert!(out.contains("LORA"));
+        assert!(out.contains("5000"));
+        assert!(out.contains("4.8"));
+        assert!(out.contains("cv:12345"));
+        assert!(out.contains("SDXL 1.0"));
+        assert!(out.contains("150 MB"));
+        assert!(out.contains("photo_style, realistic"));
+        assert!(out.contains("Page 1/1"));
+    }
+
+    #[test]
+    fn format_civitai_results_nsfw_marker() {
+        let json = serde_json::json!({
+            "items": [{
+                "name": "NSFW Model",
+                "type": "Checkpoint",
+                "nsfw": true,
+                "stats": {"downloadCount": 100, "rating": 3.0, "ratingCount": 5},
+                "modelVersions": []
+            }]
+        });
+        let out = format_civitai_results(&json);
+        assert!(out.contains("NSFW"));
+    }
+
+    #[test]
+    fn format_civitai_results_many_versions_truncated() {
+        let versions: Vec<serde_json::Value> = (1..=12)
+            .map(|i| serde_json::json!({"id": i, "name": format!("v{i}"), "baseModel": "SDXL"}))
+            .collect();
+        let json = serde_json::json!({
+            "items": [{
+                "name": "Multi Version",
+                "type": "Checkpoint",
+                "nsfw": false,
+                "stats": {"downloadCount": 0, "rating": 0.0, "ratingCount": 0},
+                "modelVersions": versions
+            }]
+        });
+        let out = format_civitai_results(&json);
+        assert!(out.contains("cv:10"));
+        assert!(!out.contains("cv:11"));
+        assert!(out.contains("2 more version"));
     }
 }

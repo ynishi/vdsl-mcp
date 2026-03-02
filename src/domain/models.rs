@@ -110,6 +110,129 @@ pub fn format_model_catalog_with_limit(catalog: &ModelCatalog, limit: Option<usi
     out
 }
 
+/// Required models extracted from compiled workflow JSONs.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RequiredModels {
+    pub checkpoints: Vec<String>,
+    pub loras: Vec<String>,
+    pub vaes: Vec<String>,
+    pub controlnets: Vec<String>,
+    pub upscalers: Vec<String>,
+}
+
+impl RequiredModels {
+    pub fn is_empty(&self) -> bool {
+        self.checkpoints.is_empty()
+            && self.loras.is_empty()
+            && self.vaes.is_empty()
+            && self.controlnets.is_empty()
+            && self.upscalers.is_empty()
+    }
+}
+
+/// Extract required model names from compiled ComfyUI API-format workflow JSONs.
+///
+/// Scans each node's `class_type` + `inputs.<field>` against `RESOURCE_MAP`.
+/// Deduplicates results.
+pub fn extract_required_models(workflows: &[serde_json::Value]) -> RequiredModels {
+    use std::collections::HashSet;
+
+    let mut sets: std::collections::HashMap<&str, HashSet<String>> = RESOURCE_MAP
+        .iter()
+        .map(|&(_, _, key)| (key, HashSet::new()))
+        .collect();
+
+    for wf in workflows {
+        let nodes = match wf.as_object() {
+            Some(obj) => obj,
+            None => continue,
+        };
+        for (_node_id, node) in nodes {
+            let class_type = match node["class_type"].as_str() {
+                Some(ct) => ct,
+                None => continue,
+            };
+            for &(node_type, field, key) in RESOURCE_MAP {
+                if class_type == node_type {
+                    if let Some(val) = node["inputs"][field].as_str() {
+                        if !val.is_empty() {
+                            if let Some(set) = sets.get_mut(key) {
+                                set.insert(val.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut to_sorted_vec = |key: &str| -> Vec<String> {
+        let mut v: Vec<String> = sets.remove(key).unwrap_or_default().into_iter().collect();
+        v.sort();
+        v
+    };
+
+    RequiredModels {
+        checkpoints: to_sorted_vec("checkpoints"),
+        loras: to_sorted_vec("loras"),
+        vaes: to_sorted_vec("vaes"),
+        controlnets: to_sorted_vec("controlnets"),
+        upscalers: to_sorted_vec("upscalers"),
+    }
+}
+
+/// Check required models against available catalog. Returns missing models.
+pub fn check_missing(required: &RequiredModels, available: &ModelCatalog) -> RequiredModels {
+    let diff = |req: &[String], avail: &[String]| -> Vec<String> {
+        req.iter()
+            .filter(|r| !avail.iter().any(|a| a == *r))
+            .cloned()
+            .collect()
+    };
+
+    RequiredModels {
+        checkpoints: diff(&required.checkpoints, &available.checkpoints),
+        loras: diff(&required.loras, &available.loras),
+        vaes: diff(&required.vaes, &available.vaes),
+        controlnets: diff(&required.controlnets, &available.controlnets),
+        upscalers: diff(&required.upscalers, &available.upscalers),
+    }
+}
+
+/// Format a preflight report from required and missing models.
+pub fn format_preflight_report(required: &RequiredModels, missing: &RequiredModels) -> String {
+    let mut out = String::new();
+
+    let ok = missing.is_empty();
+    if ok {
+        out.push_str("Preflight OK: all models available.\n\n");
+    } else {
+        out.push_str("Preflight FAILED: missing models detected.\n\n");
+    }
+
+    let sections: &[(&str, &[String], &[String])] = &[
+        ("Checkpoints", &required.checkpoints, &missing.checkpoints),
+        ("LoRAs", &required.loras, &missing.loras),
+        ("VAEs", &required.vaes, &missing.vaes),
+        ("ControlNets", &required.controlnets, &missing.controlnets),
+        ("Upscalers", &required.upscalers, &missing.upscalers),
+    ];
+
+    for &(title, req, miss) in sections {
+        if req.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("# {title}\n"));
+        for r in req {
+            let marker = if miss.contains(r) { "MISSING" } else { "ok" };
+            out.push_str(&format!("  [{marker}] {r}\n"));
+        }
+        out.push('\n');
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
