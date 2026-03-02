@@ -71,7 +71,13 @@ pub fn parse_model_catalog(object_info: &serde_json::Value) -> ModelCatalog {
 }
 
 /// Format model catalog as human-readable text for MCP output.
+/// When `limit` is `Some(n)`, each category shows at most `n` items.
 pub fn format_model_catalog(catalog: &ModelCatalog) -> String {
+    format_model_catalog_with_limit(catalog, None)
+}
+
+/// Format model catalog with optional per-category limit.
+pub fn format_model_catalog_with_limit(catalog: &ModelCatalog, limit: Option<usize>) -> String {
     let mut out = String::new();
 
     let sections: &[(&str, &[String])] = &[
@@ -87,8 +93,15 @@ pub fn format_model_catalog(catalog: &ModelCatalog) -> String {
         if items.is_empty() {
             out.push_str("  (none)\n");
         } else {
-            for item in *items {
+            let show = limit.map_or(items.len(), |l| l.min(items.len()));
+            for item in &items[..show] {
                 out.push_str(&format!("  - {item}\n"));
+            }
+            if show < items.len() {
+                out.push_str(&format!(
+                    "  ... and {} more (set limit to see all)\n",
+                    items.len() - show
+                ));
             }
         }
         out.push('\n');

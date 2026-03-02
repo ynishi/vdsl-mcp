@@ -66,6 +66,25 @@ impl ComfyUiClient {
         self.get_json("/object_info").await
     }
 
+    /// Get info for a specific node by class name (e.g. "FaceDetailer").
+    pub async fn object_info_node(
+        &self,
+        node_name: &str,
+    ) -> Result<serde_json::Value, DomainError> {
+        self.get_json(&format!("/object_info/{node_name}")).await
+    }
+
+    /// List all available node class names from /object_info.
+    /// Returns only the top-level keys (node names), not the full definitions.
+    pub async fn object_info_keys(&self) -> Result<Vec<String>, DomainError> {
+        let info = self.get_json("/object_info").await?;
+        let keys = info
+            .as_object()
+            .map(|obj| obj.keys().cloned().collect())
+            .unwrap_or_default();
+        Ok(keys)
+    }
+
     /// Query job history for a specific prompt.
     ///
     /// Mirrors Lua `Registry:poll()` in `registry.lua` L181-223.
