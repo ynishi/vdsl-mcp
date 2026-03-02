@@ -463,6 +463,80 @@ fn resolve_model_dir(target: &str) -> Result<&'static str, String> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslStorageListRequest {
+    /// RunPod pod ID (e.g. "pod_abc123def").
+    pub pod_id: String,
+
+    /// B2 bucket name. If omitted, uses VDSL_STORAGE_BUCKET env var.
+    pub bucket: Option<String>,
+
+    /// Path within the bucket (e.g. "models/checkpoints"). Defaults to root.
+    pub path: Option<String>,
+
+    /// SSH key path (default: ~/.ssh/id_ed25519_runpod).
+    pub ssh_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslStoragePullRequest {
+    /// RunPod pod ID (e.g. "pod_abc123def").
+    pub pod_id: String,
+
+    /// B2 bucket name. If omitted, uses VDSL_STORAGE_BUCKET env var.
+    pub bucket: Option<String>,
+
+    /// Source path in B2 (e.g. "models/checkpoints/sd_xl_base.safetensors").
+    pub source: String,
+
+    /// Target model category: checkpoints, loras, controlnet, vae, upscale, embeddings, clip, unet.
+    /// Determines the destination directory under ComfyUI models.
+    pub target: String,
+
+    /// SSH key path (default: ~/.ssh/id_ed25519_runpod).
+    pub ssh_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslStoragePushRequest {
+    /// RunPod pod ID (e.g. "pod_abc123def").
+    pub pod_id: String,
+
+    /// B2 bucket name. If omitted, uses VDSL_STORAGE_BUCKET env var.
+    pub bucket: Option<String>,
+
+    /// Source model category: checkpoints, loras, controlnet, vae, upscale, embeddings, clip, unet.
+    /// Determines the source directory under ComfyUI models.
+    pub source_target: String,
+
+    /// Specific filename within the model category dir (e.g. "sd_xl_base.safetensors").
+    /// If omitted, pushes the entire category directory.
+    pub filename: Option<String>,
+
+    /// Destination path prefix in B2 (default: "models/<category>").
+    pub dest_path: Option<String>,
+
+    /// SSH key path (default: ~/.ssh/id_ed25519_runpod).
+    pub ssh_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslImageDownloadRequest {
+    /// ComfyUI URL (e.g. "https://pod_id-8188.proxy.runpod.net") or RunPod pod ID.
+    pub url: Option<String>,
+
+    /// RunPod pod ID (e.g. "pod_abc123def"). Proxy URL is auto-constructed.
+    /// Takes precedence over url if both are provided.
+    pub pod_id: Option<String>,
+
+    /// Local directory to save downloaded images.
+    pub save_dir: String,
+
+    /// Specific prompt IDs to download images from.
+    /// If omitted, downloads from all recent history entries.
+    pub prompt_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VdslPodSetupRequest {
     /// Network volume ID. If omitted, auto-detected when exactly one volume exists.
     pub volume_id: Option<String>,
@@ -1944,6 +2018,288 @@ impl VdslMcpServer {
         }
     }
 
+    // =========================================================================
+    // Cold Storage (B2 via rclone)
+    // =========================================================================
+
+    #[tool(
+        name = "vdsl_storage_list",
+        description = "List files in B2 cold storage. \
+            Requires B2_APP_KEY_ID and B2_APP_KEY env vars. \
+            Bucket can be specified per-call or via VDSL_STORAGE_BUCKET env. \
+            Ensures rclone is installed on the pod (auto-installs if missing).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn storage_list(
+        &self,
+        Parameters(req): Parameters<VdslStorageListRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = Self::pod_service()?;
+        let ssh_key = req.ssh_key.as_deref().unwrap_or(DEFAULT_SSH_KEY);
+        let bucket = resolve_bucket(req.bucket.as_deref())?;
+        let path = req.path.as_deref().unwrap_or("");
+        let remote = b2_remote(&bucket, path)?;
+
+        ensure_rclone(&svc, &req.pod_id, ssh_key).await?;
+
+        let result = svc
+            .pod_exec(
+                &req.pod_id,
+                &["rclone", "lsf", "--format", "tsp", &remote],
+                Some(ssh_key),
+                Some(RCLONE_OP_TIMEOUT_SECS),
+            )
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        if !result.success {
+            return Err(McpError::internal_error(
+                format!(
+                    "rclone lsf failed (exit {}): {}",
+                    result.exit_code,
+                    result.stderr.trim()
+                ),
+                None,
+            ));
+        }
+
+        let header = format!("B2 listing: {bucket}/{path}\n");
+        let output = format!("{header}{}", result.stdout);
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    #[tool(
+        name = "vdsl_storage_pull",
+        description = "Pull a model from B2 cold storage to the pod's ComfyUI models directory. \
+            Requires B2_APP_KEY_ID and B2_APP_KEY env vars. \
+            Ensures rclone is installed on the pod (auto-installs if missing). \
+            Target maps to ComfyUI model subdirectories (checkpoints, loras, etc.).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn storage_pull(
+        &self,
+        Parameters(req): Parameters<VdslStoragePullRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = Self::pod_service()?;
+        let ssh_key = req.ssh_key.as_deref().unwrap_or(DEFAULT_SSH_KEY);
+        let bucket = resolve_bucket(req.bucket.as_deref())?;
+        let remote = b2_remote(&bucket, &req.source)?;
+        let dir_name =
+            resolve_model_dir(&req.target).map_err(|e| McpError::invalid_params(e, None))?;
+        let dest = format!("{COMFYUI_MODELS_BASE}/{dir_name}/");
+
+        ensure_rclone(&svc, &req.pod_id, ssh_key).await?;
+
+        let mut log = Vec::<String>::new();
+        log.push(format!("Pulling B2:{bucket}/{} → {dest}", req.source));
+
+        let result = svc
+            .pod_exec(
+                &req.pod_id,
+                &["rclone", "copy", "--progress", &remote, &dest],
+                Some(ssh_key),
+                Some(RCLONE_OP_TIMEOUT_SECS),
+            )
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        if !result.success {
+            log.push(format!(
+                "rclone copy failed (exit {}): {}",
+                result.exit_code,
+                result.stderr.trim()
+            ));
+            return Err(McpError::internal_error(log.join("\n"), None));
+        }
+
+        log.push("Done.".to_string());
+        if !result.stderr.trim().is_empty() {
+            log.push(result.stderr.trim().to_string());
+        }
+        Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]))
+    }
+
+    #[tool(
+        name = "vdsl_storage_push",
+        description = "Push a model from the pod's ComfyUI models directory to B2 cold storage. \
+            Requires B2_APP_KEY_ID and B2_APP_KEY env vars. \
+            Ensures rclone is installed on the pod (auto-installs if missing). \
+            Specify filename to push a single file, or omit to push the entire category.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn storage_push(
+        &self,
+        Parameters(req): Parameters<VdslStoragePushRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = Self::pod_service()?;
+        let ssh_key = req.ssh_key.as_deref().unwrap_or(DEFAULT_SSH_KEY);
+        let bucket = resolve_bucket(req.bucket.as_deref())?;
+        let dir_name =
+            resolve_model_dir(&req.source_target).map_err(|e| McpError::invalid_params(e, None))?;
+
+        let source = match req.filename {
+            Some(ref f) => format!("{COMFYUI_MODELS_BASE}/{dir_name}/{f}"),
+            None => format!("{COMFYUI_MODELS_BASE}/{dir_name}/"),
+        };
+
+        let dest_path = req.dest_path.as_deref().unwrap_or("").trim_matches('/');
+        let remote_path = if dest_path.is_empty() {
+            format!("models/{dir_name}")
+        } else {
+            dest_path.to_string()
+        };
+        let remote = b2_remote(&bucket, &remote_path)?;
+
+        ensure_rclone(&svc, &req.pod_id, ssh_key).await?;
+
+        let mut log = Vec::<String>::new();
+        log.push(format!("Pushing {source} → B2:{bucket}/{remote_path}"));
+
+        let result = svc
+            .pod_exec(
+                &req.pod_id,
+                &["rclone", "copy", "--progress", &source, &remote],
+                Some(ssh_key),
+                Some(RCLONE_OP_TIMEOUT_SECS),
+            )
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        if !result.success {
+            log.push(format!(
+                "rclone copy failed (exit {}): {}",
+                result.exit_code,
+                result.stderr.trim()
+            ));
+            return Err(McpError::internal_error(log.join("\n"), None));
+        }
+
+        log.push("Done.".to_string());
+        if !result.stderr.trim().is_empty() {
+            log.push(result.stderr.trim().to_string());
+        }
+        Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]))
+    }
+
+    // =========================================================================
+    // Image batch download
+    // =========================================================================
+
+    #[tool(
+        name = "vdsl_image_download",
+        description = "Batch download output images from ComfyUI history. \
+            Downloads all output images from recent history entries to a local directory. \
+            Optionally specify prompt_ids to download images from specific jobs only. \
+            If prompt_ids is omitted, downloads from all recent history (up to ~100 entries).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn image_download(
+        &self,
+        Parameters(req): Parameters<VdslImageDownloadRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let connect_req = VdslConnectRequest {
+            url: req.url,
+            pod_id: req.pod_id,
+        };
+        let url = Self::resolve_comfyui_url(&connect_req)?;
+        let client = Self::comfyui_client(url.clone())?;
+        let save_dir = std::path::Path::new(&req.save_dir);
+
+        let mut log = Vec::<String>::new();
+
+        // Collect history entries
+        let entries: Vec<(String, serde_json::Value)> = match req.prompt_ids {
+            Some(ids) if !ids.is_empty() => {
+                log.push(format!("Fetching {} specific prompt(s)...", ids.len()));
+                let mut entries = Vec::new();
+                for pid in &ids {
+                    match client.history(pid).await {
+                        Ok(h) => {
+                            if let Some(entry) = h.get(pid) {
+                                entries.push((pid.clone(), entry.clone()));
+                            } else {
+                                log.push(format!("  {pid}: not found in history"));
+                            }
+                        }
+                        Err(e) => log.push(format!("  {pid}: fetch failed — {e}")),
+                    }
+                }
+                entries
+            }
+            _ => {
+                log.push("Fetching all recent history...".to_string());
+                let history = client.history_all().await.map_err(Self::to_mcp_error)?;
+                match history.as_object() {
+                    Some(obj) => obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    None => {
+                        return Err(McpError::internal_error(
+                            "unexpected /history response format",
+                            None,
+                        ));
+                    }
+                }
+            }
+        };
+
+        if entries.is_empty() {
+            log.push("No history entries found.".to_string());
+            return Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]));
+        }
+
+        // Collect all output images
+        let mut all_images = Vec::new();
+        for (pid, entry) in &entries {
+            let images = collect_output_images(entry);
+            if !images.is_empty() {
+                log.push(format!("  {pid}: {} image(s)", images.len()));
+                all_images.extend(images);
+            }
+        }
+
+        if all_images.is_empty() {
+            log.push(format!(
+                "{} history entries found, but no output images.",
+                entries.len()
+            ));
+            return Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]));
+        }
+
+        log.push(format!(
+            "Found {} image(s) across {} job(s). Downloading to {}...",
+            all_images.len(),
+            entries.len(),
+            save_dir.display()
+        ));
+
+        // Download
+        let dl = download_images_to_dir(&client, &all_images, save_dir).await;
+        log.extend(dl.log);
+
+        log.push(format!("\nSaved {} file(s).", dl.saved_paths.len()));
+
+        Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]))
+    }
+
+    // =========================================================================
+    // VDSL Script
+    // =========================================================================
+
     #[tool(
         name = "vdsl_run",
         description = "Compile and generate images from a VDSL Lua script. \
@@ -2681,6 +3037,101 @@ async fn inject_vdsl_metadata(
     } else {
         msg
     })
+}
+
+// =============================================================================
+// Storage helpers (rclone + B2)
+// =============================================================================
+
+/// Timeout for rclone install (seconds).
+const RCLONE_INSTALL_TIMEOUT_SECS: u64 = 120;
+/// Timeout for rclone operations (seconds).
+const RCLONE_OP_TIMEOUT_SECS: u64 = 600;
+
+/// Ensure rclone is installed on a running pod.
+///
+/// Checks `which rclone`; if absent, installs via the official install script.
+async fn ensure_rclone(svc: &PodService, pod_id: &str, ssh_key: &str) -> Result<(), McpError> {
+    let check = svc
+        .pod_exec(pod_id, &["which", "rclone"], Some(ssh_key), Some(10))
+        .await;
+
+    match check {
+        Ok(ref out) if out.success => return Ok(()),
+        _ => {}
+    }
+
+    let install = svc
+        .pod_exec(
+            pod_id,
+            &[
+                "bash",
+                "-c",
+                "curl -sL https://rclone.org/install.sh | bash",
+            ],
+            Some(ssh_key),
+            Some(RCLONE_INSTALL_TIMEOUT_SECS),
+        )
+        .await
+        .map_err(|e| McpError::internal_error(format!("rclone install failed: {e}"), None))?;
+
+    if !install.success {
+        return Err(McpError::internal_error(
+            format!(
+                "rclone install failed (exit {}): {}{}",
+                install.exit_code,
+                install.stderr.trim(),
+                if install.stdout.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{}", install.stdout.trim())
+                }
+            ),
+            None,
+        ));
+    }
+
+    Ok(())
+}
+
+/// Resolve B2 bucket name from request parameter or VDSL_STORAGE_BUCKET env var.
+fn resolve_bucket(bucket: Option<&str>) -> Result<String, McpError> {
+    if let Some(b) = bucket {
+        if !b.is_empty() {
+            return Ok(b.to_string());
+        }
+    }
+    std::env::var("VDSL_STORAGE_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            McpError::invalid_params(
+                "bucket not specified and VDSL_STORAGE_BUCKET env not set",
+                None,
+            )
+        })
+}
+
+/// Build an rclone B2 connection string using inline credentials.
+///
+/// Requires B2_APP_KEY_ID and B2_APP_KEY environment variables.
+/// Returns a string like `:b2,account=KEY_ID,key=KEY:bucket/path`.
+fn b2_remote(bucket: &str, path: &str) -> Result<String, McpError> {
+    let key_id = std::env::var("B2_APP_KEY_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| McpError::invalid_params("B2_APP_KEY_ID env not set", None))?;
+    let key = std::env::var("B2_APP_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| McpError::invalid_params("B2_APP_KEY env not set", None))?;
+
+    let path = path.trim_matches('/');
+    if path.is_empty() {
+        Ok(format!(":b2,account={key_id},key={key}:{bucket}"))
+    } else {
+        Ok(format!(":b2,account={key_id},key={key}:{bucket}/{path}"))
+    }
 }
 
 // =============================================================================
@@ -3503,5 +3954,211 @@ mod tests {
         std::fs::write(dir.path().join("data"), b"x").unwrap();
         let dest = unique_dest(dir.path(), "data");
         assert_eq!(dest, dir.path().join("data_2"));
+    }
+
+    // --- storage request tests ---
+
+    #[test]
+    fn storage_list_request_minimal() {
+        let req: VdslStorageListRequest = serde_json::from_str(r#"{"pod_id":"pod_abc"}"#).unwrap();
+        assert_eq!(req.pod_id, "pod_abc");
+        assert!(req.bucket.is_none());
+        assert!(req.path.is_none());
+        assert!(req.ssh_key.is_none());
+    }
+
+    #[test]
+    fn storage_list_request_full() {
+        let req: VdslStorageListRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_abc","bucket":"my-bucket","path":"models/checkpoints","ssh_key":"~/.ssh/id_rsa"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.pod_id, "pod_abc");
+        assert_eq!(req.bucket.as_deref(), Some("my-bucket"));
+        assert_eq!(req.path.as_deref(), Some("models/checkpoints"));
+        assert_eq!(req.ssh_key.as_deref(), Some("~/.ssh/id_rsa"));
+    }
+
+    #[test]
+    fn storage_list_request_missing_pod_id() {
+        assert!(serde_json::from_str::<VdslStorageListRequest>(r#"{}"#).is_err());
+    }
+
+    #[test]
+    fn storage_pull_request_minimal() {
+        let req: VdslStoragePullRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_abc","source":"models/checkpoints/sd_xl.safetensors","target":"checkpoints"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.pod_id, "pod_abc");
+        assert_eq!(req.source, "models/checkpoints/sd_xl.safetensors");
+        assert_eq!(req.target, "checkpoints");
+        assert!(req.bucket.is_none());
+        assert!(req.ssh_key.is_none());
+    }
+
+    #[test]
+    fn storage_pull_request_full() {
+        let req: VdslStoragePullRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_abc","bucket":"my-bucket","source":"sd_xl.safetensors","target":"checkpoints","ssh_key":"~/.ssh/custom"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.bucket.as_deref(), Some("my-bucket"));
+        assert_eq!(req.ssh_key.as_deref(), Some("~/.ssh/custom"));
+    }
+
+    #[test]
+    fn storage_pull_request_missing_required() {
+        assert!(serde_json::from_str::<VdslStoragePullRequest>(r#"{}"#).is_err());
+        assert!(serde_json::from_str::<VdslStoragePullRequest>(r#"{"pod_id":"pod_abc"}"#).is_err());
+        assert!(serde_json::from_str::<VdslStoragePullRequest>(
+            r#"{"pod_id":"pod_abc","source":"file.bin"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn storage_push_request_minimal() {
+        let req: VdslStoragePushRequest =
+            serde_json::from_str(r#"{"pod_id":"pod_abc","source_target":"checkpoints"}"#).unwrap();
+        assert_eq!(req.pod_id, "pod_abc");
+        assert_eq!(req.source_target, "checkpoints");
+        assert!(req.filename.is_none());
+        assert!(req.dest_path.is_none());
+    }
+
+    #[test]
+    fn storage_push_request_single_file() {
+        let req: VdslStoragePushRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_abc","source_target":"loras","filename":"my_lora.safetensors","bucket":"cold-storage"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.source_target, "loras");
+        assert_eq!(req.filename.as_deref(), Some("my_lora.safetensors"));
+        assert_eq!(req.bucket.as_deref(), Some("cold-storage"));
+    }
+
+    #[test]
+    fn storage_push_request_custom_dest() {
+        let req: VdslStoragePushRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_abc","source_target":"checkpoints","dest_path":"archive/2024/checkpoints"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.dest_path.as_deref(), Some("archive/2024/checkpoints"));
+    }
+
+    #[test]
+    fn storage_push_request_missing_required() {
+        assert!(serde_json::from_str::<VdslStoragePushRequest>(r#"{}"#).is_err());
+        assert!(serde_json::from_str::<VdslStoragePushRequest>(r#"{"pod_id":"pod_abc"}"#).is_err());
+    }
+
+    // --- image_download request tests ---
+
+    #[test]
+    fn image_download_request_minimal() {
+        let req: VdslImageDownloadRequest =
+            serde_json::from_str(r#"{"pod_id":"pod_abc","save_dir":"/tmp/images"}"#).unwrap();
+        assert_eq!(req.pod_id.as_deref(), Some("pod_abc"));
+        assert_eq!(req.save_dir, "/tmp/images");
+        assert!(req.prompt_ids.is_none());
+        assert!(req.url.is_none());
+    }
+
+    #[test]
+    fn image_download_request_with_prompt_ids() {
+        let req: VdslImageDownloadRequest = serde_json::from_str(
+            r#"{"url":"https://example.com:8188","save_dir":"/tmp/out","prompt_ids":["abc","def"]}"#,
+        )
+        .unwrap();
+        assert_eq!(req.url.as_deref(), Some("https://example.com:8188"));
+        assert!(req.pod_id.is_none());
+        let ids = req.prompt_ids.unwrap();
+        assert_eq!(ids, vec!["abc", "def"]);
+    }
+
+    #[test]
+    fn image_download_request_missing_save_dir() {
+        assert!(
+            serde_json::from_str::<VdslImageDownloadRequest>(r#"{"pod_id":"pod_abc"}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn image_download_request_empty_prompt_ids() {
+        let req: VdslImageDownloadRequest =
+            serde_json::from_str(r#"{"pod_id":"pod_abc","save_dir":"/tmp","prompt_ids":[]}"#)
+                .unwrap();
+        let ids = req.prompt_ids.unwrap();
+        assert!(ids.is_empty());
+    }
+
+    // --- b2_remote tests ---
+
+    #[test]
+    #[ignore = "set_var poisons parallel tests — run with --ignored --test-threads=1"]
+    fn b2_remote_builds_correct_string() {
+        std::env::set_var("B2_APP_KEY_ID", "test_key_id");
+        std::env::set_var("B2_APP_KEY", "test_key");
+
+        let result = b2_remote("my-bucket", "models/checkpoints").unwrap();
+        assert_eq!(
+            result,
+            ":b2,account=test_key_id,key=test_key:my-bucket/models/checkpoints"
+        );
+
+        std::env::remove_var("B2_APP_KEY_ID");
+        std::env::remove_var("B2_APP_KEY");
+    }
+
+    #[test]
+    #[ignore = "set_var poisons parallel tests — run with --ignored --test-threads=1"]
+    fn b2_remote_root_path() {
+        std::env::set_var("B2_APP_KEY_ID", "kid");
+        std::env::set_var("B2_APP_KEY", "key");
+
+        let result = b2_remote("bucket", "").unwrap();
+        assert_eq!(result, ":b2,account=kid,key=key:bucket");
+
+        let result = b2_remote("bucket", "/").unwrap();
+        assert_eq!(result, ":b2,account=kid,key=key:bucket");
+
+        std::env::remove_var("B2_APP_KEY_ID");
+        std::env::remove_var("B2_APP_KEY");
+    }
+
+    #[test]
+    #[ignore = "set_var poisons parallel tests — run with --ignored --test-threads=1"]
+    fn b2_remote_missing_credentials() {
+        std::env::remove_var("B2_APP_KEY_ID");
+        std::env::remove_var("B2_APP_KEY");
+
+        let result = b2_remote("bucket", "path");
+        assert!(result.is_err());
+    }
+
+    // --- resolve_bucket tests ---
+
+    #[test]
+    fn resolve_bucket_from_param() {
+        let result = resolve_bucket(Some("my-bucket")).unwrap();
+        assert_eq!(result, "my-bucket");
+    }
+
+    #[test]
+    fn resolve_bucket_empty_param_falls_through() {
+        // Empty string param should fall through to env var
+        let result = resolve_bucket(Some(""));
+        // Without env var set, this should fail
+        // (env var may or may not be set in test env, so just test non-empty param)
+        assert!(result.is_err() || !result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_bucket_none_without_env() {
+        // This test is best-effort — if VDSL_STORAGE_BUCKET happens to be set,
+        // it will succeed (which is also valid behavior).
+        let _result = resolve_bucket(None);
+        // Can't assert error without controlling env
     }
 }

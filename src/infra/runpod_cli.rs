@@ -144,6 +144,49 @@ impl RunPodCli {
             .await
     }
 
+    /// Execute a command on a running pod via SSH exec channel.
+    ///
+    /// Wraps `runpod-cli exec <pod_id> -- <command...>`.
+    /// Returns raw stdout/stderr (not JSON-parsed).
+    pub async fn pod_exec(
+        &self,
+        pod_id: &str,
+        command: &[&str],
+        ssh_key: Option<&str>,
+        timeout_secs: Option<u64>,
+    ) -> Result<PodExecOutput, DomainError> {
+        let mut args = vec!["exec"];
+        if let Some(key) = ssh_key {
+            args.push("-i");
+            args.push(key);
+        }
+        let timeout_str;
+        if let Some(t) = timeout_secs {
+            timeout_str = t.to_string();
+            args.push("-t");
+            args.push(&timeout_str);
+        }
+        args.push(pod_id);
+        args.push("--");
+        args.extend(command);
+
+        let output = tokio::process::Command::new("runpod-cli")
+            .env("RUNPOD_API_KEY", &self.api_key)
+            .args(&args)
+            .output()
+            .await
+            .map_err(|e| {
+                DomainError::CliExecution(format!("failed to execute runpod-cli exec: {e}"))
+            })?;
+
+        Ok(PodExecOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            success: output.status.success(),
+            exit_code: output.status.code().unwrap_or(-1),
+        })
+    }
+
     /// List network volumes.
     ///
     /// Equivalent to Lua `M.volumes(opts)` in runpod.lua L626-633.
@@ -156,6 +199,15 @@ impl RunPodCli {
             other => Ok(vec![other]),
         }
     }
+}
+
+/// Output from a remote command executed on a pod via SSH.
+#[derive(Debug, Clone)]
+pub struct PodExecOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub success: bool,
+    pub exit_code: i32,
 }
 
 /// Parse CLI stdout into JSON value.

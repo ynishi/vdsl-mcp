@@ -1,5 +1,5 @@
 use crate::domain::error::DomainError;
-use crate::infra::runpod_cli::RunPodCli;
+use crate::infra::runpod_cli::{PodExecOutput, RunPodCli};
 
 use super::error::AppError;
 
@@ -61,6 +61,20 @@ impl PodService {
     ) -> Result<serde_json::Value, AppError> {
         self.cli
             .download_status(pod_id, job_id, ssh_key)
+            .await
+            .map_err(AppError::from)
+    }
+
+    /// Execute a command on a running pod via SSH.
+    pub async fn pod_exec(
+        &self,
+        pod_id: &str,
+        command: &[&str],
+        ssh_key: Option<&str>,
+        timeout_secs: Option<u64>,
+    ) -> Result<PodExecOutput, AppError> {
+        self.cli
+            .pod_exec(pod_id, command, ssh_key, timeout_secs)
             .await
             .map_err(AppError::from)
     }

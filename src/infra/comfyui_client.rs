@@ -74,6 +74,13 @@ impl ComfyUiClient {
         self.get_json(&format!("/history/{prompt_id}")).await
     }
 
+    /// Query all recent job history.
+    ///
+    /// Returns `GET /history` — a JSON object keyed by prompt_id.
+    pub async fn history_all(&self) -> Result<serde_json::Value, DomainError> {
+        self.get_json("/history").await
+    }
+
     /// Query the current ComfyUI queue state.
     ///
     /// Returns `{ "queue_running": [...], "queue_pending": [...] }`.
