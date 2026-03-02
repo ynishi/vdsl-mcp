@@ -518,14 +518,16 @@ fn inject_civitai_token(url: &str) -> String {
 
 /// Format CivitAI /api/v1/models response into human-readable text.
 ///
-/// Each model shows: name, type, base model, download count, rating,
-/// and the latest version's ID (usable with `vdsl_download source: "cv:ID"`).
-fn format_civitai_results(json: &serde_json::Value) -> String {
+/// `view` controls detail level:
+/// - Compact: one-line per version (name, cv:ID, base, size, DL, rating)
+/// - Full: compact + trigger words + description
+fn format_civitai_results(json: &serde_json::Value, view: ModelSearchView) -> String {
     let items = match json["items"].as_array() {
         Some(arr) if !arr.is_empty() => arr,
         _ => return "No models found.".to_string(),
     };
 
+    let is_full = matches!(view, ModelSearchView::Full);
     let mut out = format!("Found {} model(s):\n\n", items.len());
 
     for (i, model) in items.iter().enumerate() {
@@ -545,6 +547,43 @@ fn format_civitai_results(json: &serde_json::Value) -> String {
             out.push_str(" | NSFW");
         }
         out.push('\n');
+
+        // Description (full view only)
+        if is_full {
+            if let Some(desc) = model["description"].as_str() {
+                // Strip HTML tags for readability
+                let clean = desc
+                    .replace("<br>", "\n")
+                    .replace("<br/>", "\n")
+                    .replace("<br />", "\n")
+                    .replace("<p>", "")
+                    .replace("</p>", "\n");
+                // Rough HTML strip
+                let mut text = String::new();
+                let mut in_tag = false;
+                for ch in clean.chars() {
+                    match ch {
+                        '<' => in_tag = true,
+                        '>' => in_tag = false,
+                        _ if !in_tag => text.push(ch),
+                        _ => {}
+                    }
+                }
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    // Cap at 500 chars
+                    let show = if trimmed.len() > 500 {
+                        &trimmed[..trimmed.floor_char_boundary(500)]
+                    } else {
+                        trimmed
+                    };
+                    out.push_str(&format!("   {show}\n"));
+                    if trimmed.len() > 500 {
+                        out.push_str("   ...\n");
+                    }
+                }
+            }
+        }
 
         // Show versions (latest first, max 10)
         if let Some(versions) = model["modelVersions"].as_array() {
@@ -567,11 +606,13 @@ fn format_civitai_results(json: &serde_json::Value) -> String {
                 }
                 line.push_str(&format!(" → cv:{ver_id}"));
 
-                // Trained words (trigger words for LoRAs)
-                if let Some(words) = ver["trainedWords"].as_array() {
-                    let triggers: Vec<&str> = words.iter().filter_map(|w| w.as_str()).collect();
-                    if !triggers.is_empty() {
-                        line.push_str(&format!("\n     triggers: {}", triggers.join(", ")));
+                // Trained words (full view only)
+                if is_full {
+                    if let Some(words) = ver["trainedWords"].as_array() {
+                        let triggers: Vec<&str> = words.iter().filter_map(|w| w.as_str()).collect();
+                        if !triggers.is_empty() {
+                            line.push_str(&format!("\n     triggers: {}", triggers.join(", ")));
+                        }
                     }
                 }
 
@@ -980,6 +1021,19 @@ impl ModelSearchSort {
     }
 }
 
+/// Output detail level for model search results.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelSearchView {
+    /// One-line per version: name, cv:ID, base, DL count, rating, size, nsfw.
+    /// Default limit: 10. Optimized for comparing and selecting models.
+    #[default]
+    Compact,
+    /// Compact info + trigger words + description.
+    /// Default limit: 3. For deep-diving a specific model.
+    Full,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VdslModelSearchRequest {
     /// Search keyword (e.g. "photorealistic", "anime style", "SDXL").
@@ -995,7 +1049,7 @@ pub struct VdslModelSearchRequest {
     /// Sort order (default: most_downloaded).
     pub sort: Option<ModelSearchSort>,
 
-    /// Maximum results to return (default: 10, max: 50).
+    /// Maximum results to return. Default: 10 (compact) / 3 (full). Max: 50.
     pub limit: Option<u32>,
 
     /// Filter by base model (e.g. "SDXL 1.0", "SD 1.5", "Flux.1 D").
@@ -1003,6 +1057,11 @@ pub struct VdslModelSearchRequest {
 
     /// Include NSFW results (default: false).
     pub nsfw: Option<bool>,
+
+    /// Output detail level (default: compact).
+    /// compact: one-line per version for quick comparison.
+    /// full: includes trigger words and description for deep-diving.
+    pub view: Option<ModelSearchView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2330,7 +2389,12 @@ impl VdslMcpServer {
         &self,
         req: &VdslModelSearchRequest,
     ) -> Result<CallToolResult, McpError> {
-        let limit = req.limit.unwrap_or(10).min(50);
+        let view = req.view.unwrap_or_default();
+        let default_limit = match view {
+            ModelSearchView::Compact => 10,
+            ModelSearchView::Full => 3,
+        };
+        let limit = req.limit.unwrap_or(default_limit).min(50);
         let mut url = format!(
             "https://civitai.com/api/v1/models?query={}&limit={limit}",
             urlencoding::encode(req.query.trim())
@@ -2377,7 +2441,7 @@ impl VdslMcpServer {
             McpError::internal_error(format!("Failed to parse CivitAI response: {e}"), None)
         })?;
 
-        let output = format_civitai_results(&json);
+        let output = format_civitai_results(&json, view);
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -5098,12 +5162,13 @@ mod tests {
         assert!(req.limit.is_none());
         assert!(req.base_model.is_none());
         assert!(req.nsfw.is_none());
+        assert!(req.view.is_none());
     }
 
     #[test]
     fn model_search_request_full() {
         let req: VdslModelSearchRequest = serde_json::from_str(
-            r#"{"query":"anime","source":"cv","model_type":"lora","sort":"newest","limit":20,"base_model":"SDXL 1.0","nsfw":false}"#,
+            r#"{"query":"anime","source":"cv","model_type":"lora","sort":"newest","limit":20,"base_model":"SDXL 1.0","nsfw":false,"view":"full"}"#,
         )
         .unwrap();
         assert_eq!(req.query, "anime");
@@ -5113,6 +5178,14 @@ mod tests {
         assert_eq!(req.limit, Some(20));
         assert_eq!(req.base_model.as_deref(), Some("SDXL 1.0"));
         assert_eq!(req.nsfw, Some(false));
+        assert!(matches!(req.view, Some(ModelSearchView::Full)));
+    }
+
+    #[test]
+    fn model_search_view_compact_parses() {
+        let req: VdslModelSearchRequest =
+            serde_json::from_str(r#"{"query":"test","view":"compact"}"#).unwrap();
+        assert!(matches!(req.view, Some(ModelSearchView::Compact)));
     }
 
     #[test]
@@ -5148,22 +5221,28 @@ mod tests {
     #[test]
     fn format_civitai_results_empty() {
         let json = serde_json::json!({"items": []});
-        assert_eq!(format_civitai_results(&json), "No models found.");
+        assert_eq!(
+            format_civitai_results(&json, ModelSearchView::Compact),
+            "No models found."
+        );
     }
 
     #[test]
     fn format_civitai_results_no_items_key() {
         let json = serde_json::json!({});
-        assert_eq!(format_civitai_results(&json), "No models found.");
+        assert_eq!(
+            format_civitai_results(&json, ModelSearchView::Full),
+            "No models found."
+        );
     }
 
-    #[test]
-    fn format_civitai_results_single_model() {
-        let json = serde_json::json!({
+    fn sample_civitai_json() -> serde_json::Value {
+        serde_json::json!({
             "items": [{
                 "name": "Test LoRA",
                 "type": "LORA",
                 "nsfw": false,
+                "description": "<p>A photorealistic <b>style</b> LoRA for portraits.</p>",
                 "stats": {
                     "downloadCount": 5000,
                     "rating": 4.8,
@@ -5182,8 +5261,13 @@ mod tests {
                 "currentPage": 1,
                 "totalPages": 1
             }
-        });
-        let out = format_civitai_results(&json);
+        })
+    }
+
+    #[test]
+    fn format_civitai_results_compact() {
+        let json = sample_civitai_json();
+        let out = format_civitai_results(&json, ModelSearchView::Compact);
         assert!(out.contains("Test LoRA"));
         assert!(out.contains("LORA"));
         assert!(out.contains("5000"));
@@ -5191,8 +5275,26 @@ mod tests {
         assert!(out.contains("cv:12345"));
         assert!(out.contains("SDXL 1.0"));
         assert!(out.contains("150 MB"));
-        assert!(out.contains("photo_style, realistic"));
         assert!(out.contains("Page 1/1"));
+        // Compact: no triggers, no description
+        assert!(!out.contains("photo_style"));
+        assert!(!out.contains("triggers:"));
+        assert!(!out.contains("photorealistic"));
+    }
+
+    #[test]
+    fn format_civitai_results_full() {
+        let json = sample_civitai_json();
+        let out = format_civitai_results(&json, ModelSearchView::Full);
+        assert!(out.contains("Test LoRA"));
+        assert!(out.contains("cv:12345"));
+        assert!(out.contains("150 MB"));
+        // Full: triggers + description present
+        assert!(out.contains("photo_style, realistic"));
+        assert!(out.contains("photorealistic"));
+        // HTML tags stripped
+        assert!(!out.contains("<p>"));
+        assert!(!out.contains("<b>"));
     }
 
     #[test]
@@ -5206,7 +5308,7 @@ mod tests {
                 "modelVersions": []
             }]
         });
-        let out = format_civitai_results(&json);
+        let out = format_civitai_results(&json, ModelSearchView::Compact);
         assert!(out.contains("NSFW"));
     }
 
@@ -5224,7 +5326,7 @@ mod tests {
                 "modelVersions": versions
             }]
         });
-        let out = format_civitai_results(&json);
+        let out = format_civitai_results(&json, ModelSearchView::Compact);
         assert!(out.contains("cv:10"));
         assert!(!out.contains("cv:11"));
         assert!(out.contains("2 more version"));
