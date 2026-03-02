@@ -87,7 +87,7 @@ impl PodService {
 
 /// Resolve RunPod API key from environment.
 pub fn resolve_api_key() -> Result<String, DomainError> {
-    std::env::var("RUNPOD_API_KEY")
+    std::env::var("VDSL_RUNPOD_API_KEY")
         .map_err(|_| DomainError::ApiKeyMissing)
         .and_then(|k| {
             if k.is_empty() {

@@ -61,9 +61,9 @@ impl VdslMcpServer {
         Ok(PodService::new(cli))
     }
 
-    /// Resolve ComfyUI Bearer token from COMFYUI_TOKEN env var.
+    /// Resolve ComfyUI Bearer token from VDSL_COMFYUI_TOKEN env var.
     fn comfyui_token() -> Option<String> {
-        std::env::var("COMFYUI_TOKEN")
+        std::env::var("VDSL_COMFYUI_TOKEN")
             .ok()
             .filter(|s| !s.is_empty())
     }
@@ -339,7 +339,7 @@ pub struct VdslDownloadRequest {
 
     /// Model source. Formats:
     /// - "hf:user/repo/file.safetensors" (HuggingFace)
-    /// - "cv:VERSION_ID" (CivitAI — token auto-injected from CIVITAI_TOKEN env)
+    /// - "cv:VERSION_ID" (CivitAI — token auto-injected from VDSL_CIVITAI_TOKEN env)
     /// - "https://..." (direct URL — CivitAI URLs get token auto-injected)
     /// - "user/repo/file.safetensors" (bare path defaults to HuggingFace)
     pub source: String,
@@ -364,7 +364,7 @@ struct DownloadInfo {
 ///
 /// Supported prefixes:
 ///   - `hf:user/repo/file.safetensors` — HuggingFace
-///   - `cv:VERSION_ID` — CivitAI (token auto-injected from CIVITAI_TOKEN env)
+///   - `cv:VERSION_ID` — CivitAI (token auto-injected from VDSL_CIVITAI_TOKEN env)
 ///   - `https://...` — direct URL (CivitAI URLs get token auto-injected)
 ///   - `user/repo/file.safetensors` — bare path defaults to HuggingFace
 fn resolve_source(source: &str, filename_override: Option<&str>) -> Result<DownloadInfo, String> {
@@ -403,7 +403,7 @@ fn resolve_source(source: &str, filename_override: Option<&str>) -> Result<Downl
                 return Err("cv: requires a version ID (e.g. cv:1595775)".into());
             }
             let mut url = format!("https://civitai.com/api/download/models/{version_id}");
-            if let Ok(token) = std::env::var("CIVITAI_TOKEN") {
+            if let Ok(token) = std::env::var("VDSL_CIVITAI_TOKEN") {
                 if !token.is_empty() {
                     url.push_str(&format!("?token={token}"));
                 }
@@ -432,7 +432,7 @@ fn resolve_source(source: &str, filename_override: Option<&str>) -> Result<Downl
     Ok(info)
 }
 
-/// Auto-inject CIVITAI_TOKEN into civitai.com download URLs if not already present.
+/// Auto-inject VDSL_CIVITAI_TOKEN into civitai.com download URLs if not already present.
 fn inject_civitai_token(url: &str) -> String {
     if !url.contains("civitai.com") {
         return url.to_string();
@@ -440,7 +440,7 @@ fn inject_civitai_token(url: &str) -> String {
     if url.contains("token=") {
         return url.to_string();
     }
-    let Ok(token) = std::env::var("CIVITAI_TOKEN") else {
+    let Ok(token) = std::env::var("VDSL_CIVITAI_TOKEN") else {
         return url.to_string();
     };
     if token.is_empty() {
@@ -467,7 +467,7 @@ pub struct VdslStorageListRequest {
     /// RunPod pod ID (e.g. "pod_abc123def").
     pub pod_id: String,
 
-    /// B2 bucket name. If omitted, uses VDSL_STORAGE_BUCKET env var.
+    /// B2 bucket name. If omitted, uses VDSL_B2_BUCKET env var.
     pub bucket: Option<String>,
 
     /// Path within the bucket (e.g. "models/checkpoints"). Defaults to root.
@@ -482,7 +482,7 @@ pub struct VdslStoragePullRequest {
     /// RunPod pod ID (e.g. "pod_abc123def").
     pub pod_id: String,
 
-    /// B2 bucket name. If omitted, uses VDSL_STORAGE_BUCKET env var.
+    /// B2 bucket name. If omitted, uses VDSL_B2_BUCKET env var.
     pub bucket: Option<String>,
 
     /// Source path in B2 (e.g. "models/checkpoints/sd_xl_base.safetensors").
@@ -501,7 +501,7 @@ pub struct VdslStoragePushRequest {
     /// RunPod pod ID (e.g. "pod_abc123def").
     pub pod_id: String,
 
-    /// B2 bucket name. If omitted, uses VDSL_STORAGE_BUCKET env var.
+    /// B2 bucket name. If omitted, uses VDSL_B2_BUCKET env var.
     pub bucket: Option<String>,
 
     /// Source model category: checkpoints, loras, controlnet, vae, upscale, embeddings, clip, unet.
@@ -707,7 +707,7 @@ pub struct VdslComfyApiRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VdslRunpodCliRequest {
     /// Arguments to pass to runpod-cli (e.g. ["pods", "list-pods"]).
-    /// RUNPOD_API_KEY and -o json are injected automatically.
+    /// VDSL_RUNPOD_API_KEY and -o json are injected automatically.
     pub args: Vec<String>,
 }
 
@@ -1279,7 +1279,7 @@ impl VdslMcpServer {
         description = "Download a model to a RunPod pod's ComfyUI models directory. \
             Sources: hf:user/repo/file (HuggingFace), cv:VERSION_ID (CivitAI), \
             https://... (direct URL), or bare user/repo/file (defaults to HuggingFace). \
-            CivitAI token is auto-injected from CIVITAI_TOKEN env. \
+            CivitAI token is auto-injected from VDSL_CIVITAI_TOKEN env. \
             Downloads run in background on the pod via SSH; polls until complete. \
             Timeout: 10 minutes.",
         annotations(
@@ -1932,7 +1932,7 @@ impl VdslMcpServer {
     #[tool(
         name = "vdsl_runpod_cli",
         description = "Execute any runpod-cli command directly. \
-            RUNPOD_API_KEY and -o json are injected automatically. \
+            VDSL_RUNPOD_API_KEY and -o json are injected automatically. \
             Pass subcommand + arguments as an array. \
             Examples: [\"pods\", \"list-pods\"], [\"exec\", \"pod_id\", \"nvidia-smi\"], \
             [\"download\", \"list\", \"-i\", \"~/.ssh/id_ed25519_runpod\", \"pod_id\"].",
@@ -2025,8 +2025,8 @@ impl VdslMcpServer {
     #[tool(
         name = "vdsl_storage_list",
         description = "List files in B2 cold storage. \
-            Requires B2_APP_KEY_ID and B2_APP_KEY env vars. \
-            Bucket can be specified per-call or via VDSL_STORAGE_BUCKET env. \
+            Requires VDSL_B2_KEY_ID and VDSL_B2_KEY env vars. \
+            Bucket can be specified per-call or via VDSL_B2_BUCKET env. \
             Ensures rclone is installed on the pod (auto-installs if missing).",
         annotations(
             read_only_hint = true,
@@ -2075,7 +2075,7 @@ impl VdslMcpServer {
     #[tool(
         name = "vdsl_storage_pull",
         description = "Pull a model from B2 cold storage to the pod's ComfyUI models directory. \
-            Requires B2_APP_KEY_ID and B2_APP_KEY env vars. \
+            Requires VDSL_B2_KEY_ID and VDSL_B2_KEY env vars. \
             Ensures rclone is installed on the pod (auto-installs if missing). \
             Target maps to ComfyUI model subdirectories (checkpoints, loras, etc.).",
         annotations(
@@ -2130,7 +2130,7 @@ impl VdslMcpServer {
     #[tool(
         name = "vdsl_storage_push",
         description = "Push a model from the pod's ComfyUI models directory to B2 cold storage. \
-            Requires B2_APP_KEY_ID and B2_APP_KEY env vars. \
+            Requires VDSL_B2_KEY_ID and VDSL_B2_KEY env vars. \
             Ensures rclone is installed on the pod (auto-installs if missing). \
             Specify filename to push a single file, or omit to push the entire category.",
         annotations(
@@ -3094,37 +3094,34 @@ async fn ensure_rclone(svc: &PodService, pod_id: &str, ssh_key: &str) -> Result<
     Ok(())
 }
 
-/// Resolve B2 bucket name from request parameter or VDSL_STORAGE_BUCKET env var.
+/// Resolve B2 bucket name from request parameter or VDSL_B2_BUCKET env var.
 fn resolve_bucket(bucket: Option<&str>) -> Result<String, McpError> {
     if let Some(b) = bucket {
         if !b.is_empty() {
             return Ok(b.to_string());
         }
     }
-    std::env::var("VDSL_STORAGE_BUCKET")
+    std::env::var("VDSL_B2_BUCKET")
         .ok()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            McpError::invalid_params(
-                "bucket not specified and VDSL_STORAGE_BUCKET env not set",
-                None,
-            )
+            McpError::invalid_params("bucket not specified and VDSL_B2_BUCKET env not set", None)
         })
 }
 
 /// Build an rclone B2 connection string using inline credentials.
 ///
-/// Requires B2_APP_KEY_ID and B2_APP_KEY environment variables.
+/// Requires VDSL_B2_KEY_ID and VDSL_B2_KEY environment variables.
 /// Returns a string like `:b2,account=KEY_ID,key=KEY:bucket/path`.
 fn b2_remote(bucket: &str, path: &str) -> Result<String, McpError> {
-    let key_id = std::env::var("B2_APP_KEY_ID")
+    let key_id = std::env::var("VDSL_B2_KEY_ID")
         .ok()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| McpError::invalid_params("B2_APP_KEY_ID env not set", None))?;
-    let key = std::env::var("B2_APP_KEY")
+        .ok_or_else(|| McpError::invalid_params("VDSL_B2_KEY_ID env not set", None))?;
+    let key = std::env::var("VDSL_B2_KEY")
         .ok()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| McpError::invalid_params("B2_APP_KEY env not set", None))?;
+        .ok_or_else(|| McpError::invalid_params("VDSL_B2_KEY env not set", None))?;
 
     let path = path.trim_matches('/');
     if path.is_empty() {
@@ -4098,8 +4095,8 @@ mod tests {
     #[test]
     #[ignore = "set_var poisons parallel tests — run with --ignored --test-threads=1"]
     fn b2_remote_builds_correct_string() {
-        std::env::set_var("B2_APP_KEY_ID", "test_key_id");
-        std::env::set_var("B2_APP_KEY", "test_key");
+        std::env::set_var("VDSL_B2_KEY_ID", "test_key_id");
+        std::env::set_var("VDSL_B2_KEY", "test_key");
 
         let result = b2_remote("my-bucket", "models/checkpoints").unwrap();
         assert_eq!(
@@ -4107,15 +4104,15 @@ mod tests {
             ":b2,account=test_key_id,key=test_key:my-bucket/models/checkpoints"
         );
 
-        std::env::remove_var("B2_APP_KEY_ID");
-        std::env::remove_var("B2_APP_KEY");
+        std::env::remove_var("VDSL_B2_KEY_ID");
+        std::env::remove_var("VDSL_B2_KEY");
     }
 
     #[test]
     #[ignore = "set_var poisons parallel tests — run with --ignored --test-threads=1"]
     fn b2_remote_root_path() {
-        std::env::set_var("B2_APP_KEY_ID", "kid");
-        std::env::set_var("B2_APP_KEY", "key");
+        std::env::set_var("VDSL_B2_KEY_ID", "kid");
+        std::env::set_var("VDSL_B2_KEY", "key");
 
         let result = b2_remote("bucket", "").unwrap();
         assert_eq!(result, ":b2,account=kid,key=key:bucket");
@@ -4123,15 +4120,15 @@ mod tests {
         let result = b2_remote("bucket", "/").unwrap();
         assert_eq!(result, ":b2,account=kid,key=key:bucket");
 
-        std::env::remove_var("B2_APP_KEY_ID");
-        std::env::remove_var("B2_APP_KEY");
+        std::env::remove_var("VDSL_B2_KEY_ID");
+        std::env::remove_var("VDSL_B2_KEY");
     }
 
     #[test]
     #[ignore = "set_var poisons parallel tests — run with --ignored --test-threads=1"]
     fn b2_remote_missing_credentials() {
-        std::env::remove_var("B2_APP_KEY_ID");
-        std::env::remove_var("B2_APP_KEY");
+        std::env::remove_var("VDSL_B2_KEY_ID");
+        std::env::remove_var("VDSL_B2_KEY");
 
         let result = b2_remote("bucket", "path");
         assert!(result.is_err());
@@ -4156,7 +4153,7 @@ mod tests {
 
     #[test]
     fn resolve_bucket_none_without_env() {
-        // This test is best-effort — if VDSL_STORAGE_BUCKET happens to be set,
+        // This test is best-effort — if VDSL_B2_BUCKET happens to be set,
         // it will succeed (which is also valid behavior).
         let _result = resolve_bucket(None);
         // Can't assert error without controlling env

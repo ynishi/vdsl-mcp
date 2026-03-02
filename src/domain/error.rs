@@ -1,6 +1,6 @@
 #[derive(Debug, thiserror::Error)]
 pub enum DomainError {
-    #[error("API key not configured: set RUNPOD_API_KEY environment variable")]
+    #[error("API key not configured: set VDSL_RUNPOD_API_KEY environment variable")]
     ApiKeyMissing,
 
     #[error("runpod-cli execution failed: {0}")]
