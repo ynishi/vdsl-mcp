@@ -87,17 +87,22 @@ impl VdslMcpServer {
         }
     }
 
-    /// Resolve ComfyUI URL from VdslConnectRequest fields.
-    /// Falls back to the last successfully connected URL if pod_id/url are both omitted.
-    fn resolve_comfyui_url(&self, req: &VdslConnectRequest) -> Result<String, McpError> {
-        match (req.pod_id.as_deref(), req.url.as_deref()) {
+    /// Resolve ComfyUI URL from pod_id/url fields.
+    /// Falls back to the last successfully connected URL if both are None.
+    fn resolve_comfyui_url(
+        &self,
+        pod_id: Option<&str>,
+        url: Option<&str>,
+    ) -> Result<String, McpError> {
+        match (pod_id, url) {
             (Some(id), _) => Ok(proxy_url(id, 8188)),
             (None, Some(u)) => Ok(u.to_string()),
             (None, None) => {
                 // Fallback to session state
-                let guard = self.last_url.lock().map_err(|_| {
-                    McpError::internal_error("session state lock poisoned", None)
-                })?;
+                let guard = self
+                    .last_url
+                    .lock()
+                    .map_err(|_| McpError::internal_error("session state lock poisoned", None))?;
                 match guard.as_deref() {
                     Some(url) => Ok(url.to_string()),
                     None => Err(McpError::invalid_params(
@@ -343,6 +348,8 @@ const SETUP_POLL_INTERVAL_SECS: u64 = 10;
 const DEFAULT_SSH_KEY: &str = "~/.ssh/id_ed25519_runpod";
 /// Base path for ComfyUI models on RunPod pods.
 const COMFYUI_MODELS_BASE: &str = "/workspace/runpod-slim/ComfyUI/models";
+/// Base path for ComfyUI custom nodes on RunPod pods.
+const COMFYUI_CUSTOM_NODES: &str = "/workspace/runpod-slim/ComfyUI/custom_nodes";
 /// Max wait time for downloads (seconds).
 const DOWNLOAD_TIMEOUT_SECS: u64 = 600;
 /// Interval between download status polls (seconds).
@@ -1000,13 +1007,13 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslConnectRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let url = self.resolve_comfyui_url(&req)?;
+        let url = self.resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())?;
         let client = Self::comfyui_client(url.clone())?;
 
         let stats = if req.wait {
             // Poll until ComfyUI responds
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_secs(SETUP_TIMEOUT_SECS);
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(SETUP_TIMEOUT_SECS);
             let interval = std::time::Duration::from_secs(SETUP_POLL_INTERVAL_SECS);
 
             loop {
@@ -1035,7 +1042,7 @@ impl VdslMcpServer {
         let output = format!(
             "Connected to {url}\n\
              \nComfyUI models path: {COMFYUI_MODELS_BASE}\n\
-             Custom nodes path: /workspace/runpod-slim/ComfyUI/custom_nodes\n\
+             Custom nodes path: {COMFYUI_CUSTOM_NODES}\n\
              \n{}",
             serde_json::to_string_pretty(&stats).unwrap_or_else(|_| format!("{stats:?}"))
         );
@@ -1151,8 +1158,11 @@ impl VdslMcpServer {
                         log.push(format!(
                             "Start failed: {err_msg}\nDeleting pod and recreating on available host..."
                         ));
-                        let _ = svc.delete_pod(&pod_id).await;
-                        log.push(format!("Deleted pod {pod_id}."));
+                        match svc.delete_pod(&pod_id).await {
+                            Ok(_) => log.push(format!("Deleted pod {pod_id}.")),
+                            Err(del_err) => log
+                                .push(format!("Warning: failed to delete pod {pod_id}: {del_err}")),
+                        }
                         needs_create = true;
                     }
                 }
@@ -1161,9 +1171,7 @@ impl VdslMcpServer {
 
         if needs_create {
             // --- 3. Create new pod ---
-            log.push(format!(
-                "Creating new pod for volume {volume_id}..."
-            ));
+            log.push(format!("Creating new pod for volume {volume_id}..."));
 
             let mut spec = serde_json::Map::new();
             spec.insert(
@@ -1266,12 +1274,7 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslModelsRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let connect_req = VdslConnectRequest {
-            url: req.url,
-            pod_id: req.pod_id,
-            wait: false,
-        };
-        let url = self.resolve_comfyui_url(&connect_req)?;
+        let url = self.resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())?;
         let client = Self::comfyui_client(url.clone())?;
         let object_info = client.object_info().await.map_err(Self::to_mcp_error)?;
         let catalog = parse_model_catalog(&object_info);
@@ -1300,12 +1303,7 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslNodeSearchRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let connect_req = VdslConnectRequest {
-            url: req.url,
-            pod_id: req.pod_id,
-            wait: false,
-        };
-        let url = self.resolve_comfyui_url(&connect_req)?;
+        let url = self.resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())?;
         let client = Self::comfyui_client(url.clone())?;
         let all_keys = client
             .object_info_keys()
@@ -1330,9 +1328,9 @@ impl VdslMcpServer {
         let display_count = found.min(limit);
 
         let mut output = match &req.pattern {
-            Some(pat) => format!(
-                "Node search: \"{pat}\" — {found} matches (of {total} total nodes)\n\n"
-            ),
+            Some(pat) => {
+                format!("Node search: \"{pat}\" — {found} matches (of {total} total nodes)\n\n")
+            }
             None => format!("All available nodes ({total} total):\n\n"),
         };
 
@@ -1363,12 +1361,7 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslQueueStatusRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let connect_req = VdslConnectRequest {
-            url: req.url,
-            pod_id: req.pod_id,
-            wait: false,
-        };
-        let url = self.resolve_comfyui_url(&connect_req)?;
+        let url = self.resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())?;
         let client = Self::comfyui_client(url.clone())?;
 
         match req.prompt_id {
@@ -1431,12 +1424,7 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslUploadRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let connect_req = VdslConnectRequest {
-            url: req.url.clone(),
-            pod_id: req.pod_id.clone(),
-            wait: false,
-        };
-        let url = self.resolve_comfyui_url(&connect_req)?;
+        let url = self.resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())?;
         let client = Self::comfyui_client(url.clone())?;
 
         let file_list = resolve_upload_files(&req)?;
@@ -1602,12 +1590,7 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslGenerateRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let connect_req = VdslConnectRequest {
-            url: req.url,
-            pod_id: req.pod_id,
-            wait: false,
-        };
-        let url = self.resolve_comfyui_url(&connect_req)?;
+        let url = self.resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())?;
         let client = Self::comfyui_client(url.clone())?;
 
         // --- 1. Resolve workflow ---
@@ -1748,12 +1731,7 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslBatchGenerateRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let connect_req = VdslConnectRequest {
-            url: req.url,
-            pod_id: req.pod_id,
-            wait: false,
-        };
-        let url = self.resolve_comfyui_url(&connect_req)?;
+        let url = self.resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())?;
         let client = Self::comfyui_client(url.clone())?;
 
         // --- 1. Resolve all workflows ---
@@ -2066,12 +2044,7 @@ impl VdslMcpServer {
         let mut envs: Vec<(&str, &str)> = Vec::new();
         let available_json;
         if req.url.is_some() || req.pod_id.is_some() {
-            let connect_req = VdslConnectRequest {
-                url: req.url,
-                pod_id: req.pod_id,
-                wait: false,
-            };
-            let url = self.resolve_comfyui_url(&connect_req)?;
+            let url = self.resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())?;
             let client = Self::comfyui_client(url)?;
             let object_info = client.object_info().await.map_err(Self::to_mcp_error)?;
             let catalog = crate::domain::models::parse_model_catalog(&object_info);
@@ -2119,12 +2092,7 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslComfyApiRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let connect_req = VdslConnectRequest {
-            url: req.url,
-            pod_id: req.pod_id,
-            wait: false,
-        };
-        let url = self.resolve_comfyui_url(&connect_req)?;
+        let url = self.resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())?;
         let client = Self::comfyui_client(url.clone())?;
 
         let method = req.method.as_deref().unwrap_or("GET");
@@ -2176,9 +2144,7 @@ impl VdslMcpServer {
 
         // Route 'exec' subcommand through pod_exec (raw text, no JSON parse)
         if req.args.first().map(String::as_str) == Some("exec") {
-            return self
-                .runpod_cli_exec(&cli, &req.args)
-                .await;
+            return self.runpod_cli_exec(&cli, &req.args).await;
         }
 
         let result = cli.raw_exec(&req.args).await.map_err(Self::to_mcp_error)?;
@@ -2225,9 +2191,12 @@ impl VdslMcpServer {
                 }
                 "-t" => {
                     if i + 1 < rest.len() {
-                        timeout_secs = rest[i + 1]
-                            .parse()
-                            .ok();
+                        timeout_secs = Some(rest[i + 1].parse::<u64>().map_err(|_| {
+                            McpError::invalid_params(
+                                format!("invalid timeout value: {:?}", rest[i + 1]),
+                                None,
+                            )
+                        })?);
                         i += 2;
                     } else {
                         return Err(McpError::invalid_params("-t requires a value", None));
@@ -2307,12 +2276,7 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslInterruptRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let connect_req = VdslConnectRequest {
-            url: req.url,
-            pod_id: req.pod_id,
-            wait: false,
-        };
-        let url = self.resolve_comfyui_url(&connect_req)?;
+        let url = self.resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())?;
         let client = Self::comfyui_client(url.clone())?;
 
         match req.prompt_ids {
@@ -2556,12 +2520,7 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslImageDownloadRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let connect_req = VdslConnectRequest {
-            url: req.url,
-            pod_id: req.pod_id,
-            wait: false,
-        };
-        let url = self.resolve_comfyui_url(&connect_req)?;
+        let url = self.resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())?;
         let client = Self::comfyui_client(url.clone())?;
         let save_dir = std::path::Path::new(&req.save_dir);
 
@@ -2734,12 +2693,7 @@ impl VdslMcpServer {
         }
 
         // --- Phase 2: Generate via batch ---
-        let connect_req = VdslConnectRequest {
-            url: req.url,
-            pod_id: req.pod_id,
-            wait: false,
-        };
-        let url = self.resolve_comfyui_url(&connect_req)?;
+        let url = self.resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())?;
         let client = Self::comfyui_client(url.clone())?;
 
         let mut tagged: Vec<TaggedWorkflow> = Vec::with_capacity(workflow_files.len());
@@ -3597,8 +3551,7 @@ mod tests {
 
     #[test]
     fn node_search_request_without_pattern() {
-        let req: VdslNodeSearchRequest =
-            serde_json::from_str(r#"{"pod_id":"pod_abc"}"#).unwrap();
+        let req: VdslNodeSearchRequest = serde_json::from_str(r#"{"pod_id":"pod_abc"}"#).unwrap();
         assert!(req.pattern.is_none());
     }
 
@@ -3619,60 +3572,39 @@ mod tests {
     #[test]
     fn resolve_url_from_pod_id() {
         let server = test_server();
-        let req = VdslConnectRequest {
-            url: None,
-            pod_id: Some("abc123".into()),
-            wait: false,
-        };
-        let url = server.resolve_comfyui_url(&req).unwrap();
+        let url = server.resolve_comfyui_url(Some("abc123"), None).unwrap();
         assert_eq!(url, "https://abc123-8188.proxy.runpod.net");
     }
 
     #[test]
     fn resolve_url_from_url() {
         let server = test_server();
-        let req = VdslConnectRequest {
-            url: Some("http://localhost:8188".into()),
-            pod_id: None,
-            wait: false,
-        };
-        let url = server.resolve_comfyui_url(&req).unwrap();
+        let url = server
+            .resolve_comfyui_url(None, Some("http://localhost:8188"))
+            .unwrap();
         assert_eq!(url, "http://localhost:8188");
     }
 
     #[test]
     fn resolve_url_pod_id_takes_precedence() {
         let server = test_server();
-        let req = VdslConnectRequest {
-            url: Some("http://localhost:8188".into()),
-            pod_id: Some("abc123".into()),
-            wait: false,
-        };
-        let url = server.resolve_comfyui_url(&req).unwrap();
+        let url = server
+            .resolve_comfyui_url(Some("abc123"), Some("http://localhost:8188"))
+            .unwrap();
         assert_eq!(url, "https://abc123-8188.proxy.runpod.net");
     }
 
     #[test]
     fn resolve_url_neither_returns_error_without_session() {
         let server = test_server();
-        let req = VdslConnectRequest {
-            url: None,
-            pod_id: None,
-            wait: false,
-        };
-        assert!(server.resolve_comfyui_url(&req).is_err());
+        assert!(server.resolve_comfyui_url(None, None).is_err());
     }
 
     #[test]
     fn resolve_url_falls_back_to_session() {
         let server = test_server();
         server.save_last_url("https://saved-8188.proxy.runpod.net");
-        let req = VdslConnectRequest {
-            url: None,
-            pod_id: None,
-            wait: false,
-        };
-        let url = server.resolve_comfyui_url(&req).unwrap();
+        let url = server.resolve_comfyui_url(None, None).unwrap();
         assert_eq!(url, "https://saved-8188.proxy.runpod.net");
     }
 
@@ -3680,12 +3612,7 @@ mod tests {
     fn resolve_url_explicit_overrides_session() {
         let server = test_server();
         server.save_last_url("https://old-8188.proxy.runpod.net");
-        let req = VdslConnectRequest {
-            url: None,
-            pod_id: Some("new_pod".into()),
-            wait: false,
-        };
-        let url = server.resolve_comfyui_url(&req).unwrap();
+        let url = server.resolve_comfyui_url(Some("new_pod"), None).unwrap();
         assert_eq!(url, "https://new_pod-8188.proxy.runpod.net");
     }
 
@@ -4255,12 +4182,13 @@ mod tests {
     // --- vdsl_runpod_cli exec routing tests ---
 
     /// Helper to parse exec args the same way `runpod_cli_exec` does.
-    /// Returns (ssh_key, pod_id, command_parts) or error description.
+    /// Returns (ssh_key, timeout, pod_id, command_parts) or error description.
     fn parse_exec_args<'a>(
         args: &'a [&'a str],
-    ) -> Result<(Option<&'a str>, &'a str, Vec<&'a str>), &'static str> {
+    ) -> Result<(Option<&'a str>, Option<u64>, &'a str, Vec<&'a str>), &'static str> {
         let rest = &args[1..]; // skip "exec"
         let mut ssh_key: Option<&str> = None;
+        let mut timeout_secs: Option<u64> = None;
         let mut pod_id: Option<&str> = None;
         let mut command_parts: Vec<&str> = vec![];
         let mut i = 0;
@@ -4275,6 +4203,15 @@ mod tests {
                         return Err("-i requires value");
                     }
                 }
+                "-t" => {
+                    if i + 1 < rest.len() {
+                        timeout_secs =
+                            Some(rest[i + 1].parse().map_err(|_| "invalid timeout value")?);
+                        i += 2;
+                    } else {
+                        return Err("-t requires value");
+                    }
+                }
                 "--" => {
                     command_parts = rest[i + 1..].to_vec();
                     break;
@@ -4287,7 +4224,7 @@ mod tests {
         }
 
         match pod_id {
-            Some(id) => Ok((ssh_key, id, command_parts)),
+            Some(id) => Ok((ssh_key, timeout_secs, id, command_parts)),
             None => Err("missing pod_id"),
         }
     }
@@ -4295,8 +4232,9 @@ mod tests {
     #[test]
     fn exec_args_basic() {
         let args = ["exec", "pod_abc", "--", "ls", "/workspace"];
-        let (ssh_key, pod_id, cmd) = parse_exec_args(&args).unwrap();
+        let (ssh_key, timeout, pod_id, cmd) = parse_exec_args(&args).unwrap();
         assert_eq!(ssh_key, None);
+        assert_eq!(timeout, None);
         assert_eq!(pod_id, "pod_abc");
         assert_eq!(cmd, vec!["ls", "/workspace"]);
     }
@@ -4311,8 +4249,9 @@ mod tests {
             "--",
             "nvidia-smi",
         ];
-        let (ssh_key, pod_id, cmd) = parse_exec_args(&args).unwrap();
+        let (ssh_key, timeout, pod_id, cmd) = parse_exec_args(&args).unwrap();
         assert_eq!(ssh_key, Some("~/.ssh/id_ed25519_runpod"));
+        assert_eq!(timeout, None);
         assert_eq!(pod_id, "pod_abc");
         assert_eq!(cmd, vec!["nvidia-smi"]);
     }
@@ -4320,8 +4259,24 @@ mod tests {
     #[test]
     fn exec_args_missing_command() {
         let args = ["exec", "pod_abc"];
-        let (_, _, cmd) = parse_exec_args(&args).unwrap();
+        let (_, _, _, cmd) = parse_exec_args(&args).unwrap();
         assert!(cmd.is_empty());
+    }
+
+    #[test]
+    fn exec_args_with_timeout() {
+        let args = ["exec", "-t", "30", "pod_abc", "--", "nvidia-smi"];
+        let (ssh_key, timeout, pod_id, cmd) = parse_exec_args(&args).unwrap();
+        assert_eq!(ssh_key, None);
+        assert_eq!(timeout, Some(30));
+        assert_eq!(pod_id, "pod_abc");
+        assert_eq!(cmd, vec!["nvidia-smi"]);
+    }
+
+    #[test]
+    fn exec_args_invalid_timeout() {
+        let args = ["exec", "-t", "abc", "pod_abc", "--", "ls"];
+        assert!(parse_exec_args(&args).is_err());
     }
 
     #[test]
