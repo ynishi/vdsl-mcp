@@ -9,6 +9,8 @@ RunPod GPU provisioning, ComfyUI orchestration, and model management — all acc
 - **RunPod Pod Management** — Create, start, stop, delete GPU pods. Auto-setup with ComfyUI template.
 - **ComfyUI Integration** — Connect, query models, submit workflows, poll results, download images.
 - **Model Download** — HuggingFace (`hf:`), CivitAI (`cv:`) with automatic token injection, or direct URLs.
+- **B2 Cold Storage** — List, pull, and push models between pods and Backblaze B2 via rclone.
+- **Image Batch Download** — Download all output images from ComfyUI history to a local directory.
 - **Batch Generation** — Submit multiple workflows, poll all jobs, download all outputs.
 - **VDSL Script Execution** — Run Lua scripts that compile into ComfyUI workflows.
 - **RunPod CLI Passthrough** — Execute any `runpod-cli` command with auto API key injection.
@@ -30,6 +32,10 @@ RunPod GPU provisioning, ComfyUI orchestration, and model management — all acc
 | `vdsl_queue_status` | Query ComfyUI queue and job history |
 | `vdsl_upload` | Upload files to ComfyUI (single, batch, directory) |
 | `vdsl_download` | Download models to a pod |
+| `vdsl_storage_list` | List files in B2 cold storage |
+| `vdsl_storage_pull` | Pull models from B2 to pod |
+| `vdsl_storage_push` | Push models from pod to B2 |
+| `vdsl_image_download` | Batch download output images from history |
 | `vdsl_generate` | Generate images from a workflow |
 | `vdsl_batch_generate` | Batch generate from multiple workflows |
 | `vdsl_run_script` | Run a VDSL Lua script |
@@ -51,9 +57,12 @@ cargo install vdsl-mcp
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `RUNPOD_API_KEY` | For RunPod operations | RunPod API key |
-| `COMFYUI_TOKEN` | For authenticated ComfyUI | Bearer token for ComfyUI proxy |
-| `CIVITAI_TOKEN` | For CivitAI downloads | CivitAI API token (auto-injected) |
+| `VDSL_RUNPOD_API_KEY` | For RunPod operations | RunPod API key |
+| `VDSL_COMFYUI_TOKEN` | For authenticated ComfyUI | Bearer token for ComfyUI proxy |
+| `VDSL_CIVITAI_TOKEN` | For CivitAI downloads | CivitAI API token (auto-injected) |
+| `VDSL_B2_KEY_ID` | For B2 storage | Backblaze B2 application key ID |
+| `VDSL_B2_KEY` | For B2 storage | Backblaze B2 application key |
+| `VDSL_B2_BUCKET` | For B2 storage (optional) | Default B2 bucket name |
 | `VDSL_INLINE_HISTORY_DIR` | Optional | Override inline script save directory |
 
 ### MCP Client Configuration
@@ -64,9 +73,12 @@ cargo install vdsl-mcp
     "vdsl": {
       "command": "vdsl-mcp",
       "env": {
-        "RUNPOD_API_KEY": "your-api-key",
-        "COMFYUI_TOKEN": "your-token",
-        "CIVITAI_TOKEN": "your-civitai-token"
+        "VDSL_RUNPOD_API_KEY": "your-api-key",
+        "VDSL_COMFYUI_TOKEN": "your-token",
+        "VDSL_CIVITAI_TOKEN": "your-civitai-token",
+        "VDSL_B2_KEY_ID": "your-b2-key-id",
+        "VDSL_B2_KEY": "your-b2-key",
+        "VDSL_B2_BUCKET": "your-bucket-name"
       }
     }
   }
