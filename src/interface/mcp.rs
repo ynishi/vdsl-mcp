@@ -386,7 +386,7 @@ pub struct VdslDownloadRequest {
     /// Override filename (default: extracted from URL).
     pub filename: Option<String>,
 
-    /// SSH key path (default: ~/.ssh/id_ed25519_runpod).
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
     pub ssh_key: Option<String>,
 }
 
@@ -509,7 +509,7 @@ pub struct VdslStorageListRequest {
     /// Path within the bucket (e.g. "models/checkpoints"). Defaults to root.
     pub path: Option<String>,
 
-    /// SSH key path (default: ~/.ssh/id_ed25519_runpod).
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
     pub ssh_key: Option<String>,
 
     /// Maximum number of entries to return (default: 50).
@@ -531,7 +531,7 @@ pub struct VdslStoragePullRequest {
     /// Determines the destination directory under ComfyUI models.
     pub target: String,
 
-    /// SSH key path (default: ~/.ssh/id_ed25519_runpod).
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
     pub ssh_key: Option<String>,
 }
 
@@ -554,7 +554,7 @@ pub struct VdslStoragePushRequest {
     /// Destination path prefix in B2 (default: "models/<category>").
     pub dest_path: Option<String>,
 
-    /// SSH key path (default: ~/.ssh/id_ed25519_runpod).
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
     pub ssh_key: Option<String>,
 }
 
@@ -1481,7 +1481,7 @@ impl VdslMcpServer {
         Parameters(req): Parameters<VdslDownloadRequest>,
     ) -> Result<CallToolResult, McpError> {
         let svc = Self::pod_service()?;
-        let ssh_key = req.ssh_key.as_deref().unwrap_or(DEFAULT_SSH_KEY);
+        let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
 
         // --- 1. Resolve source → URL + filename ---
         let dl_info = resolve_source(&req.source, req.filename.as_deref())
@@ -1503,7 +1503,7 @@ impl VdslMcpServer {
 
         // --- 3. Start download ---
         let resp = svc
-            .download_add(&req.pod_id, &dl_info.url, Some(&dest), ssh_key)
+            .download_add(&req.pod_id, &dl_info.url, Some(&dest), &ssh_key)
             .await
             .map_err(Self::to_mcp_error)?;
 
@@ -1530,7 +1530,7 @@ impl VdslMcpServer {
 
         let final_status = loop {
             let status = svc
-                .download_status(&req.pod_id, &job_id, ssh_key)
+                .download_status(&req.pod_id, &job_id, &ssh_key)
                 .await
                 .map_err(Self::to_mcp_error)?;
 
@@ -2122,7 +2122,7 @@ impl VdslMcpServer {
             Examples: [\"pods\", \"list-pods\"], [\"exec\", \"pod_id\", \"nvidia-smi\"], \
             [\"download\", \"list\", \"-i\", \"~/.ssh/id_ed25519_runpod\", \"pod_id\"]. \
             For 'exec' subcommand: returns raw text output (not JSON-parsed). \
-            SSH key defaults to ~/.ssh/id_ed25519_runpod if -i is not specified.",
+            SSH key defaults to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod if -i is not specified.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2230,11 +2230,11 @@ impl VdslMcpServer {
         }
 
         // Default SSH key if not specified
-        let ssh_key = ssh_key.or(Some(DEFAULT_SSH_KEY));
+        let resolved_key = resolve_ssh_key(ssh_key);
 
         let cmd_refs: Vec<&str> = command_parts.iter().map(String::as_str).collect();
         let result = cli
-            .pod_exec(pod_id, &cmd_refs, ssh_key, timeout_secs)
+            .pod_exec(pod_id, &cmd_refs, Some(&resolved_key), timeout_secs)
             .await
             .map_err(Self::to_mcp_error)?;
 
@@ -2332,18 +2332,18 @@ impl VdslMcpServer {
         Parameters(req): Parameters<VdslStorageListRequest>,
     ) -> Result<CallToolResult, McpError> {
         let svc = Self::pod_service()?;
-        let ssh_key = req.ssh_key.as_deref().unwrap_or(DEFAULT_SSH_KEY);
+        let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
         let bucket = resolve_bucket(req.bucket.as_deref())?;
         let path = req.path.as_deref().unwrap_or("");
         let remote = b2_remote(&bucket, path)?;
 
-        ensure_rclone(&svc, &req.pod_id, ssh_key).await?;
+        ensure_rclone(&svc, &req.pod_id, &ssh_key).await?;
 
         let result = svc
             .pod_exec(
                 &req.pod_id,
                 &["rclone", "lsf", "--format", "tsp", &remote],
-                Some(ssh_key),
+                Some(&ssh_key),
                 Some(RCLONE_OP_TIMEOUT_SECS),
             )
             .await
@@ -2396,14 +2396,14 @@ impl VdslMcpServer {
         Parameters(req): Parameters<VdslStoragePullRequest>,
     ) -> Result<CallToolResult, McpError> {
         let svc = Self::pod_service()?;
-        let ssh_key = req.ssh_key.as_deref().unwrap_or(DEFAULT_SSH_KEY);
+        let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
         let bucket = resolve_bucket(req.bucket.as_deref())?;
         let remote = b2_remote(&bucket, &req.source)?;
         let dir_name =
             resolve_model_dir(&req.target).map_err(|e| McpError::invalid_params(e, None))?;
         let dest = format!("{COMFYUI_MODELS_BASE}/{dir_name}/");
 
-        ensure_rclone(&svc, &req.pod_id, ssh_key).await?;
+        ensure_rclone(&svc, &req.pod_id, &ssh_key).await?;
 
         let mut log = Vec::<String>::new();
         log.push(format!("Pulling B2:{bucket}/{} → {dest}", req.source));
@@ -2412,7 +2412,7 @@ impl VdslMcpServer {
             .pod_exec(
                 &req.pod_id,
                 &["rclone", "copy", "--progress", &remote, &dest],
-                Some(ssh_key),
+                Some(&ssh_key),
                 Some(RCLONE_OP_TIMEOUT_SECS),
             )
             .await
@@ -2451,7 +2451,7 @@ impl VdslMcpServer {
         Parameters(req): Parameters<VdslStoragePushRequest>,
     ) -> Result<CallToolResult, McpError> {
         let svc = Self::pod_service()?;
-        let ssh_key = req.ssh_key.as_deref().unwrap_or(DEFAULT_SSH_KEY);
+        let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
         let bucket = resolve_bucket(req.bucket.as_deref())?;
         let dir_name =
             resolve_model_dir(&req.source_target).map_err(|e| McpError::invalid_params(e, None))?;
@@ -2469,7 +2469,7 @@ impl VdslMcpServer {
         };
         let remote = b2_remote(&bucket, &remote_path)?;
 
-        ensure_rclone(&svc, &req.pod_id, ssh_key).await?;
+        ensure_rclone(&svc, &req.pod_id, &ssh_key).await?;
 
         let mut log = Vec::<String>::new();
         log.push(format!("Pushing {source} → B2:{bucket}/{remote_path}"));
@@ -2478,7 +2478,7 @@ impl VdslMcpServer {
             .pod_exec(
                 &req.pod_id,
                 &["rclone", "copy", "--progress", &source, &remote],
-                Some(ssh_key),
+                Some(&ssh_key),
                 Some(RCLONE_OP_TIMEOUT_SECS),
             )
             .await
@@ -3391,6 +3391,21 @@ async fn ensure_rclone(svc: &PodService, pod_id: &str, ssh_key: &str) -> Result<
     }
 
     Ok(())
+}
+
+/// Resolve SSH key path from request parameter, VDSL_SSH_KEY env var, or hardcoded default.
+///
+/// Priority: request param > VDSL_SSH_KEY env > DEFAULT_SSH_KEY constant.
+fn resolve_ssh_key(param: Option<&str>) -> String {
+    if let Some(k) = param {
+        if !k.is_empty() {
+            return k.to_string();
+        }
+    }
+    std::env::var("VDSL_SSH_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_SSH_KEY.to_string())
 }
 
 /// Resolve B2 bucket name from request parameter or VDSL_B2_BUCKET env var.
