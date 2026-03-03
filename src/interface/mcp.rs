@@ -1169,6 +1169,46 @@ pub struct VdslRunRequest {
     pub compile_only: bool,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct VdslImageSearchRequest {
+    /// Search regex pattern applied to PNG metadata JSON.
+    /// Matched against the serialized metadata (prompt text, model names, VDSL script, etc.).
+    pub query: String,
+
+    /// Search source: "all" (default, both local+pod), "local", or "pod".
+    pub source: Option<String>,
+
+    /// Directories or files to scan for local search.
+    /// Defaults to current directory if omitted.
+    pub paths: Option<Vec<String>>,
+
+    /// Case-insensitive matching (default: false).
+    #[serde(default)]
+    pub case_insensitive: bool,
+
+    /// Maximum number of results to return (default: 20).
+    pub limit: Option<u32>,
+
+    /// Print matching file paths only (no metadata JSON).
+    #[serde(default)]
+    pub files_only: bool,
+
+    /// tEXt chunk keywords to extract (e.g. ["prompt", "vdsl"]).
+    /// If omitted, extracts all chunks.
+    pub chunk: Option<Vec<String>>,
+
+    /// RunPod pod ID for pod search. If omitted, reuses last session.
+    pub pod_id: Option<String>,
+
+    /// Subfolder under ComfyUI output/ to search on pod.
+    /// If omitted, searches the root output/ directory.
+    pub subfolder: Option<String>,
+
+    /// SSH key path for pod access.
+    /// Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    pub ssh_key: Option<String>,
+}
+
 // =============================================================================
 // Tool implementations
 // =============================================================================
@@ -3389,7 +3429,7 @@ impl VdslMcpServer {
                 &client,
                 &pipeline_path,
                 out_dir.path(),
-                &self,
+                self,
                 req.pod_id.as_deref(),
                 req.save_dir.as_deref(),
                 timeout,
@@ -3444,8 +3484,7 @@ impl VdslMcpServer {
             let (download_log, saved_paths) = if let Some(ref dir) = req.save_dir {
                 let owned: Vec<serde_json::Value> =
                     all_images.iter().map(|v| (*v).clone()).collect();
-                let dl =
-                    download_images_to_dir(&client, &owned, std::path::Path::new(dir)).await;
+                let dl = download_images_to_dir(&client, &owned, std::path::Path::new(dir)).await;
                 (dl.log, dl.saved_paths)
             } else {
                 (Vec::new(), Vec::new())
@@ -3471,6 +3510,280 @@ impl VdslMcpServer {
 
         Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]))
     }
+
+    // =========================================================================
+    // Image Search (pngmetagrep)
+    // =========================================================================
+
+    #[tool(
+        name = "vdsl_image_search",
+        description = "Search generated images by PNG metadata (prompt text, model names, VDSL scripts, etc.). \
+            Uses pngmetagrep to search tEXt chunks embedded in PNG files. \
+            Two source modes: \
+            (1) source=\"local\": search local directories. \
+            Specify paths to target specific directories, or omit to search current directory. \
+            (2) source=\"pod\": search ComfyUI output/ directory on a RunPod pod via SSH. \
+            Use subfolder to target a specific subdirectory. \
+            Requires pngmetagrep to be installed (auto-installs on pod if missing). \
+            source=\"all\" (default) searches both local and pod. \
+            Returns NDJSON with file paths and metadata, or paths only with files_only=true.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn image_search(
+        &self,
+        Parameters(req): Parameters<VdslImageSearchRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let source = req.source.as_deref().unwrap_or("all");
+        let limit = req.limit.unwrap_or(DEFAULT_IMAGE_SEARCH_LIMIT) as usize;
+
+        let mut combined_results = Vec::<String>::new();
+        let mut log = Vec::<String>::new();
+
+        match source {
+            "local" => {
+                let results = image_search_local(&req).await?;
+                log.push(format!("local: {} match(es)", results.len()));
+                combined_results.extend(results);
+            }
+            "pod" => {
+                let pod_id = self.resolve_pod_id(req.pod_id.as_deref())?;
+                let results = self.image_search_pod(&req, &pod_id).await?;
+                log.push(format!("pod: {} match(es)", results.len()));
+                combined_results.extend(results);
+            }
+            "all" => {
+                let local_results = image_search_local(&req).await?;
+                log.push(format!("local: {} match(es)", local_results.len()));
+                combined_results.extend(local_results);
+
+                match self.resolve_pod_id(req.pod_id.as_deref()) {
+                    Ok(pod_id) => {
+                        let pod_results = self.image_search_pod(&req, &pod_id).await?;
+                        log.push(format!("pod: {} match(es)", pod_results.len()));
+                        combined_results.extend(pod_results);
+                    }
+                    Err(_) => {
+                        log.push("pod: skipped (no pod session)".to_string());
+                    }
+                }
+            }
+            other => {
+                return Err(McpError::invalid_params(
+                    format!("unknown source: \"{other}\". Use \"local\", \"pod\", or \"all\"."),
+                    None,
+                ));
+            }
+        }
+
+        // Truncate to limit
+        let total = combined_results.len();
+        if total > limit {
+            combined_results.truncate(limit);
+            log.push(format!("showing {limit}/{total} (use limit to see more)"));
+        }
+
+        let mut output = log.join("\n");
+        if !combined_results.is_empty() {
+            output.push_str("\n\n");
+            output.push_str(&combined_results.join("\n"));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+}
+
+// =============================================================================
+// Image search helpers (pngmetagrep)
+// =============================================================================
+
+const DEFAULT_IMAGE_SEARCH_LIMIT: u32 = 20;
+
+const PNGMETAGREP_INSTALL_TIMEOUT_SECS: u64 = 180;
+
+const PNGMETAGREP_INSTALLER_URL: &str =
+    "https://github.com/ynishi/pngmetagrep/releases/latest/download/pngmetagrep-installer.sh";
+
+/// Run pngmetagrep locally via subprocess.
+async fn image_search_local(req: &VdslImageSearchRequest) -> Result<Vec<String>, McpError> {
+    let mut cmd = tokio::process::Command::new("pngmetagrep");
+
+    // Paths
+    if let Some(ref paths) = req.paths {
+        for p in paths {
+            cmd.arg(p);
+        }
+    } else {
+        cmd.arg(".");
+    }
+
+    // Regex filter
+    cmd.arg("-e").arg(&req.query);
+
+    // Case insensitive
+    if req.case_insensitive {
+        cmd.arg("-i");
+    }
+
+    // Files only
+    if req.files_only {
+        cmd.arg("-l");
+    }
+
+    // Chunk filter
+    if let Some(ref chunks) = req.chunk {
+        for c in chunks {
+            cmd.arg("--chunk").arg(c);
+        }
+    }
+
+    let output = cmd.output().await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            McpError::internal_error(
+                "pngmetagrep not found. Install: cargo install pngmetagrep",
+                None,
+            )
+        } else {
+            McpError::internal_error(format!("failed to run pngmetagrep: {e}"), None)
+        }
+    })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results: Vec<String> = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.to_string())
+        .collect();
+
+    Ok(results)
+}
+
+impl VdslMcpServer {
+    /// Run pngmetagrep on a pod via SSH.
+    async fn image_search_pod(
+        &self,
+        req: &VdslImageSearchRequest,
+        pod_id: &str,
+    ) -> Result<Vec<String>, McpError> {
+        let svc = Self::pod_service()?;
+        let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
+
+        // Ensure pngmetagrep is installed on pod
+        ensure_pngmetagrep(&svc, pod_id, &ssh_key).await?;
+
+        // Build the search directory
+        let search_dir = match req.subfolder.as_deref() {
+            Some(sub) if !sub.is_empty() => format!("{COMFYUI_OUTPUT_BASE}/{sub}"),
+            _ => COMFYUI_OUTPUT_BASE.to_string(),
+        };
+
+        // Build pngmetagrep command
+        let mut args = vec!["pngmetagrep".to_string()];
+        args.push(search_dir);
+        args.push("-e".to_string());
+        args.push(req.query.clone());
+
+        if req.case_insensitive {
+            args.push("-i".to_string());
+        }
+        if req.files_only {
+            args.push("-l".to_string());
+        }
+        if let Some(ref chunks) = req.chunk {
+            for c in chunks {
+                args.push("--chunk".to_string());
+                args.push(c.clone());
+            }
+        }
+
+        let cmd_str = shell_escape_args(&args);
+        let result = svc
+            .pod_exec(pod_id, &["sh", "-c", &cmd_str], Some(&ssh_key), Some(60))
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        if !result.success && !result.stdout.is_empty() {
+            // pngmetagrep may return non-zero if no matches, but still have output
+        } else if !result.success {
+            return Err(McpError::internal_error(
+                format!(
+                    "pngmetagrep failed on pod (exit {}): {}",
+                    result.exit_code,
+                    result.stderr.trim()
+                ),
+                None,
+            ));
+        }
+
+        let results: Vec<String> = result
+            .stdout
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect();
+
+        Ok(results)
+    }
+}
+
+/// Ensure pngmetagrep is installed on the pod, auto-install if missing.
+async fn ensure_pngmetagrep(svc: &PodService, pod_id: &str, ssh_key: &str) -> Result<(), McpError> {
+    let check = svc
+        .pod_exec(pod_id, &["which", "pngmetagrep"], Some(ssh_key), Some(10))
+        .await;
+
+    match check {
+        Ok(ref out) if out.success => return Ok(()),
+        _ => {}
+    }
+
+    // Auto-install via cargo-dist shell installer
+    let install_cmd =
+        format!("curl --proto '=https' --tlsv1.2 -LsSf {PNGMETAGREP_INSTALLER_URL} | sh");
+    let install = svc
+        .pod_exec(
+            pod_id,
+            &["bash", "-c", &install_cmd],
+            Some(ssh_key),
+            Some(PNGMETAGREP_INSTALL_TIMEOUT_SECS),
+        )
+        .await
+        .map_err(|e| McpError::internal_error(format!("pngmetagrep install failed: {e}"), None))?;
+
+    if !install.success {
+        return Err(McpError::internal_error(
+            format!(
+                "pngmetagrep install failed (exit {}): {}{}",
+                install.exit_code,
+                install.stderr.trim(),
+                if install.stdout.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{}", install.stdout.trim())
+                }
+            ),
+            None,
+        ));
+    }
+
+    Ok(())
+}
+
+/// Escape arguments for shell execution via `sh -c`.
+fn shell_escape_args(args: &[String]) -> String {
+    args.iter()
+        .map(|a| {
+            if a.contains(|c: char| c.is_whitespace() || "\"'\\$`!#&|;(){}".contains(c)) {
+                format!("'{}'", a.replace('\'', "'\\''"))
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // =============================================================================
@@ -4074,8 +4387,7 @@ async fn execute_pipeline(
 
         // Execute file transfers (copy previous pass outputs to ComfyUI input/)
         if !pass.transfers.is_empty() {
-            let transfer_result =
-                execute_transfers(server, pod_id, &pass.transfers, log).await;
+            let transfer_result = execute_transfers(server, pod_id, &pass.transfers, log).await;
             if let Err(e) = transfer_result {
                 log.push(format!("  WARN: transfer error: {e}"));
                 // Continue — individual workflows will fail if their input is missing
@@ -4158,8 +4470,7 @@ async fn execute_pipeline(
             if let Some(dir) = save_dir {
                 let owned: Vec<serde_json::Value> =
                     all_images.iter().map(|v| (*v).clone()).collect();
-                let dl =
-                    download_images_to_dir(client, &owned, std::path::Path::new(dir)).await;
+                let dl = download_images_to_dir(client, &owned, std::path::Path::new(dir)).await;
                 last_download_log = dl.log;
                 last_saved_paths = dl.saved_paths;
             }
@@ -4225,17 +4536,12 @@ async fn execute_transfers(
 fn extract_variation_key(pass_name: &str, filename: &str) -> String {
     let stem = filename.strip_suffix(".json").unwrap_or(filename);
     let prefix = format!("{pass_name}_");
-    stem.strip_prefix(&prefix)
-        .unwrap_or(stem)
-        .to_string()
+    stem.strip_prefix(&prefix).unwrap_or(stem).to_string()
 }
 
 /// Check if a variation key (or any of its ancestor keys) is in the failed set.
 /// For sweep keys like "char_a__d50", also checks the base key "char_a".
-fn is_variation_failed(
-    var_key: &str,
-    failed_keys: &std::collections::HashSet<String>,
-) -> bool {
+fn is_variation_failed(var_key: &str, failed_keys: &std::collections::HashSet<String>) -> bool {
     if failed_keys.contains(var_key) {
         return true;
     }
@@ -6286,5 +6592,89 @@ mod tests {
     fn pipeline_manifest_invalid_json() {
         assert!(serde_json::from_str::<PipelineManifest>("{}").is_err());
         assert!(serde_json::from_str::<PipelineManifest>(r#"{"version":1}"#).is_err());
+    }
+
+    // =========================================================================
+    // Image search tests
+    // =========================================================================
+
+    #[test]
+    fn image_search_request_minimal() {
+        let json = r#"{"query": "silver hair"}"#;
+        let req: VdslImageSearchRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.query, "silver hair");
+        assert!(req.source.is_none());
+        assert!(req.paths.is_none());
+        assert!(!req.case_insensitive);
+        assert!(!req.files_only);
+        assert!(req.limit.is_none());
+        assert!(req.chunk.is_none());
+        assert!(req.pod_id.is_none());
+        assert!(req.subfolder.is_none());
+        assert!(req.ssh_key.is_none());
+    }
+
+    #[test]
+    fn image_search_request_full() {
+        let json = r#"{
+            "query": "waiIllustrious",
+            "source": "local",
+            "paths": ["/tmp/images", "/tmp/output"],
+            "case_insensitive": true,
+            "limit": 50,
+            "files_only": true,
+            "chunk": ["prompt", "vdsl"],
+            "pod_id": "pod_abc123",
+            "subfolder": "my_project",
+            "ssh_key": "~/.ssh/id_rsa"
+        }"#;
+        let req: VdslImageSearchRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.query, "waiIllustrious");
+        assert_eq!(req.source.as_deref(), Some("local"));
+        assert_eq!(req.paths.as_ref().unwrap().len(), 2);
+        assert!(req.case_insensitive);
+        assert_eq!(req.limit, Some(50));
+        assert!(req.files_only);
+        assert_eq!(req.chunk.as_ref().unwrap().len(), 2);
+        assert_eq!(req.pod_id.as_deref(), Some("pod_abc123"));
+        assert_eq!(req.subfolder.as_deref(), Some("my_project"));
+    }
+
+    #[test]
+    fn image_search_request_missing_query() {
+        let json = r#"{}"#;
+        assert!(serde_json::from_str::<VdslImageSearchRequest>(json).is_err());
+    }
+
+    #[test]
+    fn image_search_default_source_is_all() {
+        let req: VdslImageSearchRequest = serde_json::from_str(r#"{"query": "test"}"#).unwrap();
+        // source is None → resolved to "all" at runtime
+        assert!(req.source.is_none());
+    }
+
+    #[test]
+    fn shell_escape_args_simple() {
+        let args = vec!["pngmetagrep".to_string(), "/tmp/dir".to_string()];
+        assert_eq!(shell_escape_args(&args), "pngmetagrep /tmp/dir");
+    }
+
+    #[test]
+    fn shell_escape_args_with_spaces() {
+        let args = vec![
+            "pngmetagrep".to_string(),
+            "/tmp/my dir".to_string(),
+            "-e".to_string(),
+            "silver hair".to_string(),
+        ];
+        let escaped = shell_escape_args(&args);
+        assert_eq!(escaped, "pngmetagrep '/tmp/my dir' -e 'silver hair'");
+    }
+
+    #[test]
+    fn shell_escape_args_with_single_quotes() {
+        let args = vec!["echo".to_string(), "it's a test".to_string()];
+        let escaped = shell_escape_args(&args);
+        assert!(escaped.contains("it'\\''s a test"));
     }
 }
