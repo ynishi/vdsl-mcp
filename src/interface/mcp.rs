@@ -380,6 +380,8 @@ const DEFAULT_SSH_KEY: &str = "~/.ssh/id_ed25519_runpod";
 const COMFYUI_MODELS_BASE: &str = "/workspace/runpod-slim/ComfyUI/models";
 /// Base path for ComfyUI custom nodes on RunPod pods.
 const COMFYUI_CUSTOM_NODES: &str = "/workspace/runpod-slim/ComfyUI/custom_nodes";
+/// Base path for ComfyUI output images on RunPod pods.
+const COMFYUI_OUTPUT_BASE: &str = "/workspace/runpod-slim/ComfyUI/output";
 /// Max wait time for downloads (seconds).
 const DOWNLOAD_TIMEOUT_SECS: u64 = 600;
 /// Interval between download status polls (seconds).
@@ -761,6 +763,28 @@ pub struct VdslImageDownloadRequest {
     /// Specific prompt IDs to download images from.
     /// If omitted, downloads from all recent history entries.
     pub prompt_ids: Option<Vec<String>>,
+
+    /// Download source: "history" (default) or "output_dir".
+    /// "history" — download from ComfyUI /history API (existing behavior).
+    /// "output_dir" — list files from pod's ComfyUI output directory via SSH,
+    /// then download each via /view API. Requires pod_id.
+    pub source: Option<String>,
+
+    /// Subfolder under ComfyUI output/ to list (only for source="output_dir").
+    /// E.g. "gravure_wai_chars". If omitted, lists the root output/ directory.
+    pub subfolder: Option<String>,
+
+    /// Glob pattern to filter filenames (only for source="output_dir").
+    /// E.g. "*.png", "chitanda_*". If omitted, downloads all image files.
+    pub pattern: Option<String>,
+
+    /// Add date-based prefix to save_dir: "date" (YYYY-MM-DD) or "datetime" (YYYY-MM-DD/HHMMSS).
+    /// E.g. with date_prefix="date", save_dir="/tmp/images" becomes "/tmp/images/2026-03-03/".
+    pub date_prefix: Option<String>,
+
+    /// SSH key path (only for source="output_dir").
+    /// Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    pub ssh_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1021,6 +1045,32 @@ impl ModelSearchSort {
     }
 }
 
+/// Time period for ranking-based sort orders (Most Downloaded, Highest Rated).
+/// Without this, CivitAI defaults to a recent window, making "Most Downloaded"
+/// return mostly new models instead of all-time popular ones.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSearchPeriod {
+    #[default]
+    AllTime,
+    Year,
+    Month,
+    Week,
+    Day,
+}
+
+impl ModelSearchPeriod {
+    fn to_civitai_period(self) -> &'static str {
+        match self {
+            Self::AllTime => "AllTime",
+            Self::Year => "Year",
+            Self::Month => "Month",
+            Self::Week => "Week",
+            Self::Day => "Day",
+        }
+    }
+}
+
 /// Output detail level for model search results.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -1048,6 +1098,11 @@ pub struct VdslModelSearchRequest {
 
     /// Sort order (default: most_downloaded).
     pub sort: Option<ModelSearchSort>,
+
+    /// Time period for ranking sort (default: all_time).
+    /// Controls what "Most Downloaded" / "Highest Rated" means.
+    /// all_time = true all-time ranking. month/week/day = recent trending.
+    pub period: Option<ModelSearchPeriod>,
 
     /// Maximum results to return. Default: 10 (compact) / 3 (full). Max: 50.
     pub limit: Option<u32>,
@@ -2042,7 +2097,7 @@ impl VdslMcpServer {
             ));
         }
 
-        let tagged: Vec<TaggedWorkflow> = if let Some(wfs) = req.workflows {
+        let mut tagged: Vec<TaggedWorkflow> = if let Some(wfs) = req.workflows {
             wfs.into_iter()
                 .enumerate()
                 .map(|(i, w)| TaggedWorkflow {
@@ -2077,7 +2132,10 @@ impl VdslMcpServer {
         let mut log = Vec::<String>::new();
         log.push(format!("Batch: {total} workflow(s) on {url}"));
 
-        // --- 2. Submit all to queue ---
+        // --- 2. Sort by checkpoint to minimize model loading ---
+        sort_workflows_by_checkpoint(&mut tagged);
+
+        // --- 3. Submit all to queue ---
         let jobs = submit_workflows(&client, &tagged, &mut log).await;
         let submitted_count = jobs.len();
         log.push(format!(
@@ -2409,6 +2467,11 @@ impl VdslMcpServer {
                 urlencoding::encode(sort.to_civitai_sort())
             ));
         }
+        // Always send period — defaults to AllTime so "Most Downloaded" reflects
+        // true all-time ranking, not just recent downloads.
+        let period = req.period.unwrap_or_default();
+        url.push_str(&format!("&period={}", period.to_civitai_period()));
+
         if let Some(ref bm) = req.base_model {
             url.push_str(&format!("&baseModels={}", urlencoding::encode(bm)));
         }
@@ -2983,10 +3046,15 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_image_download",
-        description = "Batch download output images from ComfyUI history. \
-            Downloads all output images from recent history entries to a local directory. \
-            Optionally specify prompt_ids to download images from specific jobs only. \
-            If prompt_ids is omitted, downloads from all recent history (up to ~100 entries). \
+        description = "Batch download output images from ComfyUI history or pod filesystem. \
+            Two source modes: \
+            (1) source=\"history\" (default): download from ComfyUI /history API. \
+            Optionally specify prompt_ids for specific jobs, or omit for all recent history. \
+            (2) source=\"output_dir\": list image files from pod's ComfyUI output/ directory \
+            via SSH, then download each via /view API. Use subfolder to target a specific \
+            subdirectory (e.g. \"gravure_wai_chars\"), and pattern to filter filenames (e.g. \"*.png\"). \
+            Requires pod_id for SSH access. \
+            Use date_prefix=\"date\" or \"datetime\" to organize downloads into date-based subdirectories. \
             If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
         annotations(
             read_only_hint = false,
@@ -3000,19 +3068,41 @@ impl VdslMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let url = self.resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())?;
         let client = Self::comfyui_client(url.clone())?;
-        let save_dir = std::path::Path::new(&req.save_dir);
 
+        // Resolve save_dir with optional date prefix
+        let save_dir = resolve_save_dir_with_date(&req.save_dir, req.date_prefix.as_deref())?;
+
+        let source = req.source.as_deref().unwrap_or("history");
+
+        match source {
+            "output_dir" => {
+                self.image_download_from_output_dir(&req, &client, &save_dir)
+                    .await
+            }
+            _ => {
+                self.image_download_from_history(&req, &client, &save_dir)
+                    .await
+            }
+        }
+    }
+
+    /// History-based image download (existing behavior).
+    async fn image_download_from_history(
+        &self,
+        req: &VdslImageDownloadRequest,
+        client: &ComfyUiClient,
+        save_dir: &std::path::Path,
+    ) -> Result<CallToolResult, McpError> {
         let mut log = Vec::<String>::new();
 
-        // Collect history entries
-        let entries: Vec<(String, serde_json::Value)> = match req.prompt_ids {
+        let entries: Vec<(String, serde_json::Value)> = match &req.prompt_ids {
             Some(ids) if !ids.is_empty() => {
                 log.push(format!("Fetching {} specific prompt(s)...", ids.len()));
                 let mut entries = Vec::new();
-                for pid in &ids {
+                for pid in ids {
                     match client.history(pid).await {
                         Ok(h) => {
-                            if let Some(entry) = h.get(pid) {
+                            if let Some(entry) = h.get(pid.as_str()) {
                                 entries.push((pid.clone(), entry.clone()));
                             } else {
                                 log.push(format!("  {pid}: not found in history"));
@@ -3043,7 +3133,6 @@ impl VdslMcpServer {
             return Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]));
         }
 
-        // Collect all output images
         let mut all_images = Vec::new();
         for (pid, entry) in &entries {
             let images = collect_output_images(entry);
@@ -3068,10 +3157,88 @@ impl VdslMcpServer {
             save_dir.display()
         ));
 
-        // Download
-        let dl = download_images_to_dir(&client, &all_images, save_dir).await;
+        let dl = download_images_to_dir(client, &all_images, save_dir).await;
         log.extend(dl.log);
+        log.push(format!("\nSaved {} file(s).", dl.saved_paths.len()));
 
+        Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]))
+    }
+
+    /// Output directory-based image download via SSH + /view API.
+    async fn image_download_from_output_dir(
+        &self,
+        req: &VdslImageDownloadRequest,
+        client: &ComfyUiClient,
+        save_dir: &std::path::Path,
+    ) -> Result<CallToolResult, McpError> {
+        let pod_id = self.resolve_pod_id(req.pod_id.as_deref())?;
+        let svc = Self::pod_service()?;
+        let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
+
+        let mut log = Vec::<String>::new();
+
+        // Build the remote path to list
+        let remote_dir = match req.subfolder.as_deref() {
+            Some(sub) if !sub.is_empty() => format!("{COMFYUI_OUTPUT_BASE}/{sub}"),
+            _ => COMFYUI_OUTPUT_BASE.to_string(),
+        };
+
+        log.push(format!("Listing images in {remote_dir} ..."));
+
+        // List image files via SSH
+        let find_cmd = format!(
+            "find {remote_dir} -maxdepth 1 -type f \\( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' \\) -printf '%f\\n' 2>/dev/null | sort"
+        );
+        let output = svc
+            .pod_exec(&pod_id, &["sh", "-c", &find_cmd], Some(&ssh_key), Some(30))
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        if !output.success {
+            return Err(McpError::internal_error(
+                format!("SSH file listing failed: {}", output.stderr.trim()),
+                None,
+            ));
+        }
+
+        let mut filenames: Vec<&str> = output
+            .stdout
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+
+        // Apply glob pattern filter
+        if let Some(ref pattern) = req.pattern {
+            if !pattern.is_empty() {
+                filenames.retain(|f| glob_match(pattern, f));
+            }
+        }
+
+        if filenames.is_empty() {
+            log.push("No image files found.".to_string());
+            return Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]));
+        }
+
+        log.push(format!(
+            "Found {} image(s). Downloading to {}...",
+            filenames.len(),
+            save_dir.display()
+        ));
+
+        // Build image descriptors for download_images_to_dir
+        let subfolder_val = req.subfolder.as_deref().unwrap_or("");
+        let images: Vec<serde_json::Value> = filenames
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "filename": *f,
+                    "subfolder": subfolder_val,
+                })
+            })
+            .collect();
+
+        let dl = download_images_to_dir(client, &images, save_dir).await;
+        log.extend(dl.log);
         log.push(format!("\nSaved {} file(s).", dl.saved_paths.len()));
 
         Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]))
@@ -3216,6 +3383,9 @@ impl VdslMcpServer {
         for path in &workflow_files {
             tagged.push(load_tagged_workflow(path).await?);
         }
+
+        // Sort by checkpoint to minimize model loading
+        sort_workflows_by_checkpoint(&mut tagged);
 
         let total = tagged.len();
         log.push(format!("\nBatch: {total} workflow(s) → {url}"));
@@ -3589,6 +3759,36 @@ async fn download_images_to_dir(
     DownloadResult { log, saved_paths }
 }
 
+/// Extract the primary checkpoint name from a ComfyUI API-format workflow JSON.
+///
+/// Looks for `CheckpointLoaderSimple` → `inputs.ckpt_name`. Returns empty string
+/// if no checkpoint loader is found (sorts to front — lightweight workflows first).
+fn extract_primary_checkpoint(workflow: &serde_json::Value) -> String {
+    let nodes = match workflow.as_object() {
+        Some(obj) => obj,
+        None => return String::new(),
+    };
+    for (_id, node) in nodes {
+        if node["class_type"].as_str() == Some("CheckpointLoaderSimple") {
+            if let Some(name) = node["inputs"]["ckpt_name"].as_str() {
+                return name.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Sort workflows by primary checkpoint name (stable sort preserves original order
+/// within the same checkpoint group). This minimizes model load/unload cycles
+/// when ComfyUI processes the queue sequentially.
+fn sort_workflows_by_checkpoint(tagged: &mut [TaggedWorkflow]) {
+    tagged.sort_by(|a, b| {
+        let ca = extract_primary_checkpoint(&a.workflow);
+        let cb = extract_primary_checkpoint(&b.workflow);
+        ca.cmp(&cb)
+    });
+}
+
 /// Submit workflows to ComfyUI queue. Returns submitted jobs; errors are logged.
 async fn submit_workflows(
     client: &ComfyUiClient,
@@ -3852,6 +4052,79 @@ async fn inject_vdsl_metadata(
     } else {
         msg
     })
+}
+
+// =============================================================================
+// Image download helpers
+// =============================================================================
+
+/// Resolve save_dir with optional date-based prefix.
+///
+/// - `date_prefix = None` → save_dir as-is
+/// - `date_prefix = "date"` → save_dir/YYYY-MM-DD/
+/// - `date_prefix = "datetime"` → save_dir/YYYY-MM-DD/HHMMSS/
+fn resolve_save_dir_with_date(
+    save_dir: &str,
+    date_prefix: Option<&str>,
+) -> Result<std::path::PathBuf, McpError> {
+    let base = std::path::PathBuf::from(save_dir);
+    match date_prefix {
+        Some("date") => {
+            let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+            Ok(base.join(date))
+        }
+        Some("datetime") => {
+            let now = chrono::Local::now();
+            let date = now.format("%Y-%m-%d").to_string();
+            let time = now.format("%H%M%S").to_string();
+            Ok(base.join(date).join(time))
+        }
+        Some(other) => Err(McpError::invalid_params(
+            format!(
+                "invalid date_prefix: \"{other}\". Use \"date\" (YYYY-MM-DD) or \"datetime\" (YYYY-MM-DD/HHMMSS)"
+            ),
+            None,
+        )),
+        None => Ok(base),
+    }
+}
+
+/// Simple glob matcher supporting `*` and `?` wildcards.
+///
+/// - `*` matches zero or more characters
+/// - `?` matches exactly one character
+/// - All other characters are matched literally (case-insensitive)
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.to_lowercase();
+    let text = text.to_lowercase();
+    glob_match_inner(pattern.as_bytes(), text.as_bytes())
+}
+
+fn glob_match_inner(pattern: &[u8], text: &[u8]) -> bool {
+    let (mut pi, mut ti) = (0, 0);
+    let (mut star_pi, mut star_ti) = (usize::MAX, 0);
+
+    while ti < text.len() {
+        if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == text[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pattern.len() && pattern[pi] == b'*' {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1;
+        } else if star_pi != usize::MAX {
+            pi = star_pi + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pattern.len()
 }
 
 // =============================================================================
@@ -5046,6 +5319,103 @@ mod tests {
         assert!(ids.is_empty());
     }
 
+    // --- image_download extended field tests ---
+
+    #[test]
+    fn image_download_request_with_output_dir_source() {
+        let req: VdslImageDownloadRequest = serde_json::from_str(
+            r#"{"pod_id":"pod_abc","save_dir":"/tmp/images","source":"output_dir","subfolder":"gravure","pattern":"*.png","date_prefix":"date","ssh_key":"~/.ssh/custom"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.source.as_deref(), Some("output_dir"));
+        assert_eq!(req.subfolder.as_deref(), Some("gravure"));
+        assert_eq!(req.pattern.as_deref(), Some("*.png"));
+        assert_eq!(req.date_prefix.as_deref(), Some("date"));
+        assert_eq!(req.ssh_key.as_deref(), Some("~/.ssh/custom"));
+    }
+
+    #[test]
+    fn image_download_request_new_fields_default_none() {
+        let req: VdslImageDownloadRequest =
+            serde_json::from_str(r#"{"pod_id":"pod_abc","save_dir":"/tmp"}"#).unwrap();
+        assert!(req.source.is_none());
+        assert!(req.subfolder.is_none());
+        assert!(req.pattern.is_none());
+        assert!(req.date_prefix.is_none());
+        assert!(req.ssh_key.is_none());
+    }
+
+    // --- resolve_save_dir_with_date tests ---
+
+    #[test]
+    fn save_dir_no_date_prefix() {
+        let result = resolve_save_dir_with_date("/tmp/images", None).unwrap();
+        assert_eq!(result, std::path::PathBuf::from("/tmp/images"));
+    }
+
+    #[test]
+    fn save_dir_with_date_prefix() {
+        let result = resolve_save_dir_with_date("/tmp/images", Some("date")).unwrap();
+        let result_str = result.to_string_lossy();
+        // Should match /tmp/images/YYYY-MM-DD
+        assert!(result_str.starts_with("/tmp/images/"));
+        let date_part = result_str.strip_prefix("/tmp/images/").unwrap();
+        assert_eq!(date_part.len(), 10); // YYYY-MM-DD
+        assert_eq!(&date_part[4..5], "-");
+        assert_eq!(&date_part[7..8], "-");
+    }
+
+    #[test]
+    fn save_dir_with_datetime_prefix() {
+        let result = resolve_save_dir_with_date("/tmp/images", Some("datetime")).unwrap();
+        let result_str = result.to_string_lossy();
+        // Should match /tmp/images/YYYY-MM-DD/HHMMSS
+        assert!(result_str.starts_with("/tmp/images/"));
+        let parts: Vec<&str> = result_str
+            .strip_prefix("/tmp/images/")
+            .unwrap()
+            .split('/')
+            .collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].len(), 10); // YYYY-MM-DD
+        assert_eq!(parts[1].len(), 6); // HHMMSS
+    }
+
+    #[test]
+    fn save_dir_with_invalid_date_prefix() {
+        let result = resolve_save_dir_with_date("/tmp/images", Some("invalid"));
+        assert!(result.is_err());
+    }
+
+    // --- glob_match tests ---
+
+    #[test]
+    fn glob_match_star_wildcard() {
+        assert!(glob_match("*.png", "photo.png"));
+        assert!(glob_match("*.png", "PHOTO.PNG"));
+        assert!(!glob_match("*.png", "photo.jpg"));
+        assert!(glob_match("chitanda_*", "chitanda_eru.png"));
+        assert!(!glob_match("chitanda_*", "akiyama_mio.png"));
+    }
+
+    #[test]
+    fn glob_match_question_wildcard() {
+        assert!(glob_match("photo_?.png", "photo_1.png"));
+        assert!(!glob_match("photo_?.png", "photo_12.png"));
+    }
+
+    #[test]
+    fn glob_match_exact() {
+        assert!(glob_match("photo.png", "photo.png"));
+        assert!(!glob_match("photo.png", "other.png"));
+    }
+
+    #[test]
+    fn glob_match_all() {
+        assert!(glob_match("*", "anything.png"));
+        assert!(glob_match("*.*", "file.ext"));
+    }
+
     // --- b2_remote tests ---
 
     #[test]
@@ -5219,6 +5589,21 @@ mod tests {
     }
 
     #[test]
+    fn model_search_period_to_civitai() {
+        assert_eq!(ModelSearchPeriod::AllTime.to_civitai_period(), "AllTime");
+        assert_eq!(ModelSearchPeriod::Year.to_civitai_period(), "Year");
+        assert_eq!(ModelSearchPeriod::Month.to_civitai_period(), "Month");
+        assert_eq!(ModelSearchPeriod::Week.to_civitai_period(), "Week");
+        assert_eq!(ModelSearchPeriod::Day.to_civitai_period(), "Day");
+    }
+
+    #[test]
+    fn model_search_period_default_is_all_time() {
+        let period = ModelSearchPeriod::default();
+        assert_eq!(period.to_civitai_period(), "AllTime");
+    }
+
+    #[test]
     fn format_civitai_results_empty() {
         let json = serde_json::json!({"items": []});
         assert_eq!(
@@ -5330,5 +5715,89 @@ mod tests {
         assert!(out.contains("cv:10"));
         assert!(!out.contains("cv:11"));
         assert!(out.contains("2 more version"));
+    }
+
+    // ---- extract_primary_checkpoint / sort tests ----
+
+    fn make_workflow(ckpt: &str) -> serde_json::Value {
+        serde_json::json!({
+            "1": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": { "ckpt_name": ckpt }
+            },
+            "2": {
+                "class_type": "KSampler",
+                "inputs": { "seed": 42 }
+            }
+        })
+    }
+
+    #[test]
+    fn extract_checkpoint_found() {
+        let wf = make_workflow("sdxl_base.safetensors");
+        assert_eq!(extract_primary_checkpoint(&wf), "sdxl_base.safetensors");
+    }
+
+    #[test]
+    fn extract_checkpoint_missing() {
+        let wf = serde_json::json!({
+            "1": { "class_type": "KSampler", "inputs": { "seed": 1 } }
+        });
+        assert_eq!(extract_primary_checkpoint(&wf), "");
+    }
+
+    #[test]
+    fn extract_checkpoint_not_object() {
+        let wf = serde_json::json!("not an object");
+        assert_eq!(extract_primary_checkpoint(&wf), "");
+    }
+
+    #[test]
+    fn sort_workflows_groups_by_checkpoint() {
+        let mut tagged = vec![
+            TaggedWorkflow {
+                label: "a".into(),
+                workflow: make_workflow("z_model.safetensors"),
+            },
+            TaggedWorkflow {
+                label: "b".into(),
+                workflow: make_workflow("a_model.safetensors"),
+            },
+            TaggedWorkflow {
+                label: "c".into(),
+                workflow: make_workflow("z_model.safetensors"),
+            },
+            TaggedWorkflow {
+                label: "d".into(),
+                workflow: make_workflow("a_model.safetensors"),
+            },
+        ];
+        sort_workflows_by_checkpoint(&mut tagged);
+
+        let labels: Vec<&str> = tagged.iter().map(|t| t.label.as_str()).collect();
+        // a_model group first, then z_model group. Stable sort preserves order within groups.
+        assert_eq!(labels, &["b", "d", "a", "c"]);
+    }
+
+    #[test]
+    fn sort_workflows_no_checkpoint_sorts_to_front() {
+        let no_ckpt = serde_json::json!({
+            "1": { "class_type": "KSampler", "inputs": {} }
+        });
+        let mut tagged = vec![
+            TaggedWorkflow {
+                label: "with".into(),
+                workflow: make_workflow("model.safetensors"),
+            },
+            TaggedWorkflow {
+                label: "without".into(),
+                workflow: no_ckpt,
+            },
+        ];
+        sort_workflows_by_checkpoint(&mut tagged);
+
+        // Empty string sorts before "model.safetensors"
+        assert_eq!(tagged[0].label, "without");
+        assert_eq!(tagged[1].label, "with");
     }
 }
