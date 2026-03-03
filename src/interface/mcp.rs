@@ -376,6 +376,8 @@ const SETUP_POLL_INTERVAL_SECS: u64 = 10;
 
 /// Default SSH key path for RunPod pods.
 const DEFAULT_SSH_KEY: &str = "~/.ssh/id_ed25519_runpod";
+/// Base path for ComfyUI on RunPod pods.
+const COMFYUI_BASE: &str = "/workspace/runpod-slim/ComfyUI";
 /// Base path for ComfyUI models on RunPod pods.
 const COMFYUI_MODELS_BASE: &str = "/workspace/runpod-slim/ComfyUI/models";
 /// Base path for ComfyUI custom nodes on RunPod pods.
@@ -3375,72 +3377,96 @@ impl VdslMcpServer {
             return Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]));
         }
 
-        // --- Phase 2: Generate via batch ---
+        // --- Phase 2: Generate ---
         let url = self.resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())?;
         let client = Self::comfyui_client(url.clone())?;
 
-        let mut tagged: Vec<TaggedWorkflow> = Vec::with_capacity(workflow_files.len());
-        for path in &workflow_files {
-            tagged.push(load_tagged_workflow(path).await?);
-        }
+        // Check for pipeline manifest
+        let pipeline_path = out_dir.path().join("_pipeline.json");
+        if pipeline_path.exists() {
+            // --- Pipeline mode: execute passes sequentially ---
+            let (download_log, saved_paths) = execute_pipeline(
+                &client,
+                &pipeline_path,
+                out_dir.path(),
+                &self,
+                req.pod_id.as_deref(),
+                req.save_dir.as_deref(),
+                timeout,
+                &mut log,
+            )
+            .await?;
 
-        // Sort by checkpoint to minimize model loading
-        sort_workflows_by_checkpoint(&mut tagged);
+            // Inject VDSL metadata into downloaded PNGs
+            inject_metadata_if_needed(
+                &saved_paths,
+                req.script_file.as_deref(),
+                req.code.as_deref(),
+                &work_dir,
+                &mut log,
+            )
+            .await;
 
-        let total = tagged.len();
-        log.push(format!("\nBatch: {total} workflow(s) → {url}"));
-
-        let jobs = submit_workflows(&client, &tagged, &mut log).await;
-        if jobs.is_empty() {
-            log.push("All workflows failed to submit.".to_string());
-            return Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]));
-        }
-
-        let results = poll_jobs(
-            &client,
-            jobs,
-            total,
-            timeout,
-            BATCH_POLL_INTERVAL_SECS,
-            &mut log,
-        )
-        .await;
-
-        // Download images
-        let all_images: Vec<&serde_json::Value> = collect_batch_images(&results);
-        let (download_log, saved_paths) = if let Some(ref dir) = req.save_dir {
-            let owned: Vec<serde_json::Value> = all_images.iter().map(|v| (*v).clone()).collect();
-            let dl = download_images_to_dir(&client, &owned, std::path::Path::new(dir)).await;
-            (dl.log, dl.saved_paths)
-        } else {
-            (Vec::new(), Vec::new())
-        };
-
-        // Inject VDSL metadata into downloaded PNGs
-        let png_paths: Vec<&std::path::Path> = saved_paths
-            .iter()
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("png"))
-            .map(|p| p.as_path())
-            .collect();
-        if !png_paths.is_empty() {
-            let dsl_source = match (req.script_file.as_deref(), req.code.as_deref()) {
-                (Some(path), _) => tokio::fs::read_to_string(path).await.ok(),
-                (_, Some(c)) => Some(c.to_string()),
-                _ => None,
-            };
-            if let Some(source) = dsl_source {
-                match inject_vdsl_metadata(&png_paths, &source, &work_dir).await {
-                    Ok(msg) => log.push(format!("\nvdsl metadata: {msg}")),
-                    Err(e) => log.push(format!("\nvdsl metadata: injection failed — {e}")),
-                }
+            if !download_log.is_empty() {
+                log.push(format!("\ndownloads:\n{}", download_log.join("\n")));
             }
-        }
+        } else {
+            // --- Flat batch mode (existing behavior) ---
+            let mut tagged: Vec<TaggedWorkflow> = Vec::with_capacity(workflow_files.len());
+            for path in &workflow_files {
+                tagged.push(load_tagged_workflow(path).await?);
+            }
 
-        // Summary
-        format_batch_summary(&results, &mut log);
+            let total = tagged.len();
+            log.push(format!("\nBatch: {total} workflow(s) → {url}"));
 
-        if !download_log.is_empty() {
-            log.push(format!("\ndownloads:\n{}", download_log.join("\n")));
+            // Sort by checkpoint to minimize model loading
+            sort_workflows_by_checkpoint(&mut tagged);
+
+            let jobs = submit_workflows(&client, &tagged, &mut log).await;
+            if jobs.is_empty() {
+                log.push("All workflows failed to submit.".to_string());
+                return Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]));
+            }
+
+            let results = poll_jobs(
+                &client,
+                jobs,
+                total,
+                timeout,
+                BATCH_POLL_INTERVAL_SECS,
+                &mut log,
+            )
+            .await;
+
+            // Download images
+            let all_images: Vec<&serde_json::Value> = collect_batch_images(&results);
+            let (download_log, saved_paths) = if let Some(ref dir) = req.save_dir {
+                let owned: Vec<serde_json::Value> =
+                    all_images.iter().map(|v| (*v).clone()).collect();
+                let dl =
+                    download_images_to_dir(&client, &owned, std::path::Path::new(dir)).await;
+                (dl.log, dl.saved_paths)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+
+            // Inject VDSL metadata into downloaded PNGs
+            inject_metadata_if_needed(
+                &saved_paths,
+                req.script_file.as_deref(),
+                req.code.as_deref(),
+                &work_dir,
+                &mut log,
+            )
+            .await;
+
+            // Summary
+            format_batch_summary(&results, &mut log);
+
+            if !download_log.is_empty() {
+                log.push(format!("\ndownloads:\n{}", download_log.join("\n")));
+            }
         }
 
         Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]))
@@ -3962,6 +3988,292 @@ fn format_batch_summary(results: &[JobResult], log: &mut Vec<String>) {
 /// Collect all images from batch results.
 fn collect_batch_images(results: &[JobResult]) -> Vec<&serde_json::Value> {
     results.iter().flat_map(|r| r.images.iter()).collect()
+}
+
+// =============================================================================
+// Pipeline execution
+// =============================================================================
+
+/// Pipeline manifest produced by Lua `pipeline:compile()`.
+#[derive(Debug, serde::Deserialize)]
+struct PipelineManifest {
+    #[allow(dead_code)]
+    version: u32,
+    name: String,
+    #[allow(dead_code)]
+    save_dir: Option<String>,
+    passes: Vec<PipelinePass>,
+}
+
+/// A single pass in the pipeline manifest.
+#[derive(Debug, serde::Deserialize)]
+struct PipelinePass {
+    name: String,
+    #[allow(dead_code)]
+    depends_on: Option<String>,
+    variation_count: usize,
+    workflows: Vec<String>,
+    transfers: Vec<PipelineTransfer>,
+}
+
+/// File transfer between passes (output → input on ComfyUI server).
+#[derive(Debug, serde::Deserialize)]
+struct PipelineTransfer {
+    #[allow(dead_code)]
+    filename: String,
+    from: String,
+    to: String,
+}
+
+/// Execute a pipeline: passes run sequentially, variations within each pass
+/// run as a batch. Between passes, output images are copied to ComfyUI's
+/// input directory via SSH so the next pass can reference them.
+///
+/// Returns (download_log, saved_paths) from the final pass's image download.
+#[allow(clippy::too_many_arguments)]
+async fn execute_pipeline(
+    client: &ComfyUiClient,
+    manifest_path: &std::path::Path,
+    out_dir: &std::path::Path,
+    server: &VdslMcpServer,
+    pod_id: Option<&str>,
+    save_dir: Option<&str>,
+    timeout: u64,
+    log: &mut Vec<String>,
+) -> Result<(Vec<String>, Vec<std::path::PathBuf>), McpError> {
+    // Read and parse manifest
+    let manifest_str = tokio::fs::read_to_string(manifest_path)
+        .await
+        .map_err(|e| McpError::internal_error(format!("cannot read _pipeline.json: {e}"), None))?;
+    let manifest: PipelineManifest = serde_json::from_str(&manifest_str)
+        .map_err(|e| McpError::internal_error(format!("invalid _pipeline.json: {e}"), None))?;
+
+    let total_passes = manifest.passes.len();
+    let total_workflows: usize = manifest.passes.iter().map(|p| p.workflows.len()).sum();
+    log.push(format!(
+        "\nPipeline '{}': {} passes, {} total workflows",
+        manifest.name, total_passes, total_workflows
+    ));
+
+    // Track failed variation keys across passes.
+    // If a variation fails in pass N, skip it in pass N+1, N+2, ...
+    let mut failed_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let mut all_results: Vec<JobResult> = Vec::new();
+    let mut last_download_log = Vec::new();
+    let mut last_saved_paths = Vec::new();
+
+    for (pass_idx, pass) in manifest.passes.iter().enumerate() {
+        log.push(format!(
+            "\n--- Pass {}/{}: '{}' ({} workflows) ---",
+            pass_idx + 1,
+            total_passes,
+            pass.name,
+            pass.variation_count,
+        ));
+
+        // Execute file transfers (copy previous pass outputs to ComfyUI input/)
+        if !pass.transfers.is_empty() {
+            let transfer_result =
+                execute_transfers(server, pod_id, &pass.transfers, log).await;
+            if let Err(e) = transfer_result {
+                log.push(format!("  WARN: transfer error: {e}"));
+                // Continue — individual workflows will fail if their input is missing
+            }
+        }
+
+        // Load workflows for this pass, filtering out failed variations
+        let mut tagged: Vec<TaggedWorkflow> = Vec::new();
+        for wf_filename in &pass.workflows {
+            // Extract variation key from filename: "p2_char_a__d50.json" → "char_a__d50"
+            let var_key = extract_variation_key(&pass.name, wf_filename);
+
+            // Check if any ancestor variation failed
+            if is_variation_failed(&var_key, &failed_keys) {
+                log.push(format!("  SKIP {wf_filename} (ancestor failed)"));
+                continue;
+            }
+
+            let wf_path = out_dir.join(wf_filename);
+            let wf_path_str = wf_path.to_string_lossy().to_string();
+            match load_tagged_workflow(&wf_path_str).await {
+                Ok(tw) => tagged.push(tw),
+                Err(e) => {
+                    log.push(format!("  SKIP {wf_filename}: {e}"));
+                    failed_keys.insert(var_key);
+                }
+            }
+        }
+
+        if tagged.is_empty() {
+            log.push("  All workflows skipped.".to_string());
+            continue;
+        }
+
+        // Sort by checkpoint within this pass (usually same model, but safe)
+        sort_workflows_by_checkpoint(&mut tagged);
+
+        let pass_total = tagged.len();
+
+        // Submit batch
+        let jobs = submit_workflows(client, &tagged, log).await;
+        if jobs.is_empty() {
+            log.push("  All workflows failed to submit.".to_string());
+            // Mark all as failed
+            for wf_filename in &pass.workflows {
+                let var_key = extract_variation_key(&pass.name, wf_filename);
+                failed_keys.insert(var_key);
+            }
+            continue;
+        }
+
+        // Poll for completion
+        let results = poll_jobs(
+            client,
+            jobs,
+            pass_total,
+            timeout,
+            BATCH_POLL_INTERVAL_SECS,
+            log,
+        )
+        .await;
+
+        // Track failures
+        for jr in &results {
+            if jr.error.is_some() {
+                // Extract variation key from label
+                let var_key = extract_variation_key(&pass.name, &jr.label);
+                failed_keys.insert(var_key);
+            }
+        }
+
+        // Format pass summary
+        format_batch_summary(&results, log);
+
+        // Download images from this pass (only the final pass goes to save_dir,
+        // intermediate passes stay on server)
+        let is_last_pass = pass_idx + 1 == total_passes;
+        if is_last_pass {
+            let all_images: Vec<&serde_json::Value> = collect_batch_images(&results);
+            if let Some(dir) = save_dir {
+                let owned: Vec<serde_json::Value> =
+                    all_images.iter().map(|v| (*v).clone()).collect();
+                let dl =
+                    download_images_to_dir(client, &owned, std::path::Path::new(dir)).await;
+                last_download_log = dl.log;
+                last_saved_paths = dl.saved_paths;
+            }
+        }
+
+        all_results.extend(results);
+    }
+
+    // Final pipeline summary
+    let total_ok = all_results.iter().filter(|r| r.error.is_none()).count();
+    let total_err = all_results.iter().filter(|r| r.error.is_some()).count();
+    let total_images: usize = all_results.iter().map(|r| r.images.len()).sum();
+    log.push(format!(
+        "\nPipeline complete: {total_ok} ok, {total_err} failed, {total_images} images"
+    ));
+
+    Ok((last_download_log, last_saved_paths))
+}
+
+/// Execute file transfers between passes via SSH.
+/// Copies output images from ComfyUI output/ to input/ directory.
+async fn execute_transfers(
+    server: &VdslMcpServer,
+    pod_id: Option<&str>,
+    transfers: &[PipelineTransfer],
+    log: &mut Vec<String>,
+) -> Result<(), McpError> {
+    let svc = VdslMcpServer::pod_service()?;
+    let resolved_pod_id = server.resolve_pod_id(pod_id)?;
+    let ssh_key = resolve_ssh_key(None);
+
+    // Build a single cp command for all transfers
+    let mut cp_commands = Vec::with_capacity(transfers.len());
+    for t in transfers {
+        // Paths are relative to ComfyUI root
+        cp_commands.push(format!(
+            "cp -f {COMFYUI_BASE}/{} {COMFYUI_BASE}/{}",
+            t.from, t.to
+        ));
+    }
+    let combined = cp_commands.join(" && ");
+    let cmd = ["bash", "-c", &combined];
+
+    log.push(format!("  transfers: {} file(s)", transfers.len()));
+
+    let result = svc
+        .pod_exec(&resolved_pod_id, &cmd, Some(&ssh_key), Some(60))
+        .await
+        .map_err(VdslMcpServer::to_mcp_error)?;
+
+    if !result.success {
+        log.push(format!(
+            "  WARN: transfer exit code {}: {}",
+            result.exit_code,
+            result.stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Extract variation key from a workflow filename.
+/// "p2_char_a__d50.json" with pass_name="p2" → "char_a__d50"
+fn extract_variation_key(pass_name: &str, filename: &str) -> String {
+    let stem = filename.strip_suffix(".json").unwrap_or(filename);
+    let prefix = format!("{pass_name}_");
+    stem.strip_prefix(&prefix)
+        .unwrap_or(stem)
+        .to_string()
+}
+
+/// Check if a variation key (or any of its ancestor keys) is in the failed set.
+/// For sweep keys like "char_a__d50", also checks the base key "char_a".
+fn is_variation_failed(
+    var_key: &str,
+    failed_keys: &std::collections::HashSet<String>,
+) -> bool {
+    if failed_keys.contains(var_key) {
+        return true;
+    }
+    // Check ancestor: "char_a__d50" → "char_a"
+    if let Some(base) = var_key.split("__").next() {
+        if base != var_key && failed_keys.contains(base) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Helper: inject VDSL metadata into downloaded PNGs (shared by pipeline & flat batch).
+async fn inject_metadata_if_needed(
+    saved_paths: &[std::path::PathBuf],
+    script_file: Option<&str>,
+    code: Option<&str>,
+    work_dir: &std::path::Path,
+    log: &mut Vec<String>,
+) {
+    let png_paths: Vec<&std::path::Path> = saved_paths
+        .iter()
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("png"))
+        .map(|p| p.as_path())
+        .collect();
+    if !png_paths.is_empty() {
+        let dsl_source = match (script_file, code) {
+            (Some(path), _) => tokio::fs::read_to_string(path).await.ok(),
+            (_, Some(c)) => Some(c.to_string()),
+            _ => None,
+        };
+        if let Some(source) = dsl_source {
+            match inject_vdsl_metadata(&png_paths, &source, work_dir).await {
+                Ok(msg) => log.push(format!("\nvdsl metadata: {msg}")),
+                Err(e) => log.push(format!("\nvdsl metadata: injection failed — {e}")),
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -5799,5 +6111,180 @@ mod tests {
         // Empty string sorts before "model.safetensors"
         assert_eq!(tagged[0].label, "without");
         assert_eq!(tagged[1].label, "with");
+    }
+
+    // --- Pipeline: extract_variation_key tests ---
+
+    #[test]
+    fn extract_variation_key_simple() {
+        assert_eq!(extract_variation_key("p1", "p1_char_a.json"), "char_a");
+    }
+
+    #[test]
+    fn extract_variation_key_with_sweep() {
+        assert_eq!(
+            extract_variation_key("p2", "p2_char_a__d50.json"),
+            "char_a__d50"
+        );
+    }
+
+    #[test]
+    fn extract_variation_key_no_json_suffix() {
+        assert_eq!(extract_variation_key("p1", "p1_char_b"), "char_b");
+    }
+
+    #[test]
+    fn extract_variation_key_no_prefix_match() {
+        // If pass_name doesn't match prefix, returns the whole stem
+        assert_eq!(extract_variation_key("p2", "p1_char_a.json"), "p1_char_a");
+    }
+
+    #[test]
+    fn extract_variation_key_multi_underscore() {
+        assert_eq!(
+            extract_variation_key("pass1", "pass1_my_char_v2__d65_c4.json"),
+            "my_char_v2__d65_c4"
+        );
+    }
+
+    // --- Pipeline: is_variation_failed tests ---
+
+    #[test]
+    fn is_variation_failed_exact_match() {
+        let mut failed = std::collections::HashSet::new();
+        failed.insert("char_a".to_string());
+        assert!(is_variation_failed("char_a", &failed));
+    }
+
+    #[test]
+    fn is_variation_failed_not_failed() {
+        let mut failed = std::collections::HashSet::new();
+        failed.insert("char_a".to_string());
+        assert!(!is_variation_failed("char_b", &failed));
+    }
+
+    #[test]
+    fn is_variation_failed_ancestor_check() {
+        // "char_a__d50" should be detected as failed if "char_a" is in the set
+        let mut failed = std::collections::HashSet::new();
+        failed.insert("char_a".to_string());
+        assert!(is_variation_failed("char_a__d50", &failed));
+    }
+
+    #[test]
+    fn is_variation_failed_sweep_not_ancestor() {
+        // "char_a__d50" is failed, but "char_a__d70" should NOT be affected
+        let mut failed = std::collections::HashSet::new();
+        failed.insert("char_a__d50".to_string());
+        assert!(!is_variation_failed("char_a__d70", &failed));
+        // But the exact match still works
+        assert!(is_variation_failed("char_a__d50", &failed));
+    }
+
+    #[test]
+    fn is_variation_failed_empty_set() {
+        let failed = std::collections::HashSet::new();
+        assert!(!is_variation_failed("anything", &failed));
+    }
+
+    #[test]
+    fn is_variation_failed_no_double_underscore() {
+        // Key without "__" — only exact match should work
+        let mut failed = std::collections::HashSet::new();
+        failed.insert("char_b".to_string());
+        assert!(is_variation_failed("char_b", &failed));
+        assert!(!is_variation_failed("char_b_extra", &failed));
+    }
+
+    // --- Pipeline: PipelineManifest deserialization ---
+
+    #[test]
+    fn pipeline_manifest_deserialize_minimal() {
+        let json = r#"{
+            "version": 1,
+            "name": "test_pipe",
+            "save_dir": "output_dir",
+            "passes": []
+        }"#;
+        let m: PipelineManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.name, "test_pipe");
+        assert!(m.passes.is_empty());
+    }
+
+    #[test]
+    fn pipeline_manifest_deserialize_full() {
+        let json = r#"{
+            "version": 1,
+            "name": "klimt_3pass",
+            "save_dir": "klimt_v9",
+            "passes": [
+                {
+                    "name": "p1",
+                    "depends_on": null,
+                    "variation_count": 2,
+                    "workflows": ["p1_char_a.json", "p1_char_b.json"],
+                    "transfers": []
+                },
+                {
+                    "name": "p2",
+                    "depends_on": "p1",
+                    "variation_count": 4,
+                    "workflows": [
+                        "p2_char_a__d50.json",
+                        "p2_char_a__d70.json",
+                        "p2_char_b__d50.json",
+                        "p2_char_b__d70.json"
+                    ],
+                    "transfers": [
+                        {
+                            "filename": "p1_char_a_00001_.png",
+                            "from": "output/klimt_v9/p1_char_a_00001_.png",
+                            "to": "input/p1_char_a_00001_.png"
+                        },
+                        {
+                            "filename": "p1_char_b_00001_.png",
+                            "from": "output/klimt_v9/p1_char_b_00001_.png",
+                            "to": "input/p1_char_b_00001_.png"
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let m: PipelineManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.name, "klimt_3pass");
+        assert_eq!(m.passes.len(), 2);
+
+        let p1 = &m.passes[0];
+        assert_eq!(p1.name, "p1");
+        assert!(p1.depends_on.is_none());
+        assert_eq!(p1.variation_count, 2);
+        assert_eq!(p1.workflows.len(), 2);
+        assert!(p1.transfers.is_empty());
+
+        let p2 = &m.passes[1];
+        assert_eq!(p2.name, "p2");
+        assert_eq!(p2.depends_on.as_deref(), Some("p1"));
+        assert_eq!(p2.variation_count, 4);
+        assert_eq!(p2.workflows.len(), 4);
+        assert_eq!(p2.transfers.len(), 2);
+        assert_eq!(p2.transfers[0].from, "output/klimt_v9/p1_char_a_00001_.png");
+        assert_eq!(p2.transfers[0].to, "input/p1_char_a_00001_.png");
+    }
+
+    #[test]
+    fn pipeline_manifest_deserialize_no_save_dir() {
+        let json = r#"{
+            "version": 1,
+            "name": "test",
+            "passes": []
+        }"#;
+        let m: PipelineManifest = serde_json::from_str(json).unwrap();
+        assert!(m.save_dir.is_none());
+    }
+
+    #[test]
+    fn pipeline_manifest_invalid_json() {
+        assert!(serde_json::from_str::<PipelineManifest>("{}").is_err());
+        assert!(serde_json::from_str::<PipelineManifest>(r#"{"version":1}"#).is_err());
     }
 }
