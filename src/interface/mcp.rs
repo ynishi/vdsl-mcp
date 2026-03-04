@@ -990,6 +990,13 @@ pub struct VdslExecRequest {
 
     /// Timeout in seconds (default: 30).
     pub timeout: Option<u64>,
+
+    /// Run in background (default: false). When true, the command is launched via
+    /// nohup and SSH returns immediately. Output is written to a log file on the pod
+    /// whose path is returned in the response. Check later with
+    /// `vdsl_exec(command: "cat <log_path>")`.
+    #[serde(default)]
+    pub background: bool,
 }
 
 /// Model marketplace source for search.
@@ -2423,8 +2430,35 @@ impl VdslMcpServer {
         let svc = Self::pod_service()?;
         let pod_id = self.resolve_pod_id(req.pod_id.as_deref())?;
         let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
-        let timeout_secs = req.timeout.or(Some(30));
 
+        if req.background {
+            // Background mode: wrap command with nohup, return immediately.
+            let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+            let log_path = format!("/tmp/vdsl_bg_{ts}.log");
+            let bg_command = format!(
+                "nohup bash -c {} > {} 2>&1 & echo $!",
+                shell_escape_single(&req.command),
+                shell_escape_single(&log_path),
+            );
+            let cmd = ["bash", "-c", &bg_command];
+            // Short timeout — just enough to launch the process
+            let result = svc
+                .pod_exec(&pod_id, &cmd, Some(&ssh_key), Some(15))
+                .await
+                .map_err(Self::to_mcp_error)?;
+
+            let pid = result.stdout.trim();
+            let output = format!(
+                "Background job launched.\n\
+                 PID: {pid}\n\
+                 Log: {log_path}\n\n\
+                 Check output: vdsl_exec(command: \"cat {log_path}\")\n\
+                 Check status: vdsl_exec(command: \"kill -0 {pid} 2>/dev/null && echo running || echo done\")"
+            );
+            return Ok(CallToolResult::success(vec![Content::text(output)]));
+        }
+
+        let timeout_secs = req.timeout.or(Some(30));
         // Split command string into shell invocation
         let cmd = ["bash", "-c", &req.command];
         let result = svc
@@ -3806,6 +3840,11 @@ async fn find_pngmetagrep(svc: &PodService, pod_id: &str, ssh_key: &str) -> Opti
         }
     }
     None
+}
+
+/// Escape a single string for safe use as a shell argument.
+fn shell_escape_single(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Escape arguments for shell execution via `sh -c`.
