@@ -14,4 +14,7 @@ pub enum DomainError {
 
     #[error("ComfyUI connection failed: {0}")]
     ComfyUiConnection(String),
+
+    #[error("command timed out after {seconds}s")]
+    ExecTimeout { seconds: u64 },
 }

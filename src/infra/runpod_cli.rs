@@ -148,6 +148,9 @@ impl RunPodCli {
     ///
     /// Wraps `runpod-cli exec <pod_id> -- <command...>`.
     /// Returns raw stdout/stderr (not JSON-parsed).
+    ///
+    /// `timeout_secs` controls the **total execution timeout** (Rust-side).
+    /// The SSH connection timeout (`-t`) is fixed at 10s (runpod-cli default).
     pub async fn pod_exec(
         &self,
         pod_id: &str,
@@ -160,31 +163,49 @@ impl RunPodCli {
             args.push("-i");
             args.push(key);
         }
-        let timeout_str;
-        if let Some(t) = timeout_secs {
-            timeout_str = t.to_string();
-            args.push("-t");
-            args.push(&timeout_str);
-        }
+        // -t is SSH *connection* timeout, not execution timeout.
+        // Keep it at the default (10s). Execution timeout is handled below.
         args.push(pod_id);
         args.push("--");
         args.extend(command);
 
-        let output = tokio::process::Command::new("runpod-cli")
+        let child = tokio::process::Command::new("runpod-cli")
             .env("RUNPOD_API_KEY", &self.api_key)
             .args(&args)
-            .output()
-            .await
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .map_err(|e| {
-                DomainError::CliExecution(format!("failed to execute runpod-cli exec: {e}"))
+                DomainError::CliExecution(format!("failed to spawn runpod-cli exec: {e}"))
             })?;
 
-        Ok(PodExecOutput {
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            success: output.status.success(),
-            exit_code: output.status.code().unwrap_or(-1),
-        })
+        let timeout_dur = std::time::Duration::from_secs(timeout_secs.unwrap_or(30));
+        // wait_with_output takes ownership, so grab the PID first for kill on timeout.
+        let pid = child.id();
+        match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
+            Ok(Ok(output)) => Ok(PodExecOutput {
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                success: output.status.success(),
+                exit_code: output.status.code().unwrap_or(-1),
+            }),
+            Ok(Err(e)) => Err(DomainError::CliExecution(format!(
+                "runpod-cli exec failed: {e}"
+            ))),
+            Err(_elapsed) => {
+                // Timeout: kill the child process to avoid orphans.
+                // child is consumed by wait_with_output, so use kill(1) via PID.
+                if let Some(id) = pid {
+                    let _ = tokio::process::Command::new("kill")
+                        .args(["-9", &id.to_string()])
+                        .status()
+                        .await;
+                }
+                Err(DomainError::ExecTimeout {
+                    seconds: timeout_dur.as_secs(),
+                })
+            }
+        }
     }
 
     /// List network volumes.
