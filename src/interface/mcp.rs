@@ -3671,8 +3671,8 @@ impl VdslMcpServer {
         let svc = Self::pod_service()?;
         let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
 
-        // Ensure pngmetagrep is installed on pod
-        ensure_pngmetagrep(&svc, pod_id, &ssh_key).await?;
+        // Ensure pngmetagrep is installed on pod (returns resolved binary path)
+        let bin_path = ensure_pngmetagrep(&svc, pod_id, &ssh_key).await?;
 
         // Build the search directory
         let search_dir = match req.subfolder.as_deref() {
@@ -3681,7 +3681,7 @@ impl VdslMcpServer {
         };
 
         // Build pngmetagrep command
-        let mut args = vec!["pngmetagrep".to_string()];
+        let mut args = vec![bin_path];
         args.push(search_dir);
         args.push("-e".to_string());
         args.push(req.query.clone());
@@ -3729,15 +3729,25 @@ impl VdslMcpServer {
     }
 }
 
-/// Ensure pngmetagrep is installed on the pod, auto-install if missing.
-async fn ensure_pngmetagrep(svc: &PodService, pod_id: &str, ssh_key: &str) -> Result<(), McpError> {
-    let check = svc
-        .pod_exec(pod_id, &["which", "pngmetagrep"], Some(ssh_key), Some(10))
-        .await;
+/// Well-known install paths for cargo-dist shell installer.
+/// SSH non-interactive shells may not have these on PATH.
+const PNGMETAGREP_SEARCH_PATHS: &[&str] = &[
+    "pngmetagrep",
+    "$HOME/.cargo/bin/pngmetagrep",
+    "/root/.cargo/bin/pngmetagrep",
+    "/usr/local/bin/pngmetagrep",
+];
 
-    match check {
-        Ok(ref out) if out.success => return Ok(()),
-        _ => {}
+/// Ensure pngmetagrep is installed on the pod, auto-install if missing.
+/// Returns the resolved binary path (may be a full path if not on PATH).
+async fn ensure_pngmetagrep(
+    svc: &PodService,
+    pod_id: &str,
+    ssh_key: &str,
+) -> Result<String, McpError> {
+    // Check known locations
+    if let Some(path) = find_pngmetagrep(svc, pod_id, ssh_key).await {
+        return Ok(path);
     }
 
     // Auto-install via cargo-dist shell installer
@@ -3769,7 +3779,33 @@ async fn ensure_pngmetagrep(svc: &PodService, pod_id: &str, ssh_key: &str) -> Re
         ));
     }
 
-    Ok(())
+    // Re-check after install
+    find_pngmetagrep(svc, pod_id, ssh_key).await.ok_or_else(|| {
+        McpError::internal_error(
+            "pngmetagrep installed but not found in any known path",
+            None,
+        )
+    })
+}
+
+/// Probe known paths for pngmetagrep on the pod.
+async fn find_pngmetagrep(svc: &PodService, pod_id: &str, ssh_key: &str) -> Option<String> {
+    for candidate in PNGMETAGREP_SEARCH_PATHS {
+        let check = svc
+            .pod_exec(
+                pod_id,
+                &["sh", "-c", &format!("{candidate} --version")],
+                Some(ssh_key),
+                Some(10),
+            )
+            .await;
+        if let Ok(ref out) = check {
+            if out.success {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Escape arguments for shell execution via `sh -c`.
