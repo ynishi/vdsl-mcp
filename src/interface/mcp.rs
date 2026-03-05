@@ -990,13 +990,54 @@ pub struct VdslExecRequest {
 
     /// Timeout in seconds (default: 30).
     pub timeout: Option<u64>,
+}
 
-    /// Run in background (default: false). When true, the command is launched via
-    /// nohup and SSH returns immediately. Output is written to a log file on the pod
-    /// whose path is returned in the response. Check later with
-    /// `vdsl_exec(command: "cat <log_path>")`.
-    #[serde(default)]
-    pub background: bool,
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslTaskRunRequest {
+    /// Shell command to run in background (e.g. "pip install torch" or "python train.py").
+    pub command: String,
+
+    /// RunPod pod ID. If omitted, reuses the last vdsl_connect or vdsl_pod_setup session.
+    pub pod_id: Option<String>,
+
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    pub ssh_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslTaskStatusRequest {
+    /// Task job ID (returned by vdsl_task_run).
+    pub job_id: String,
+
+    /// RunPod pod ID. If omitted, reuses the last vdsl_connect or vdsl_pod_setup session.
+    pub pod_id: Option<String>,
+
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    pub ssh_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslTaskListRequest {
+    /// RunPod pod ID. If omitted, reuses the last vdsl_connect or vdsl_pod_setup session.
+    pub pod_id: Option<String>,
+
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    pub ssh_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslTaskLogRequest {
+    /// Task job ID (returned by vdsl_task_run).
+    pub job_id: String,
+
+    /// RunPod pod ID. If omitted, reuses the last vdsl_connect or vdsl_pod_setup session.
+    pub pod_id: Option<String>,
+
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    pub ssh_key: Option<String>,
+
+    /// Number of lines from the end. If omitted, returns full log.
+    pub lines: Option<u64>,
 }
 
 /// Model marketplace source for search.
@@ -1174,6 +1215,12 @@ pub struct VdslRunRequest {
     /// The compiled workflow JSONs and script output are returned without generation.
     #[serde(default)]
     pub compile_only: bool,
+
+    /// Judge gate result from a previous run. When a pipeline has a pending
+    /// judge/pick gate, pass the evaluation result here to resume compilation.
+    /// Format: `{ "<pass_name>": { "survivors": ["suffix1", "suffix2"] } }`
+    /// The value is injected as `VDSL_JUDGE_RESULT` env var for the Lua compiler.
+    pub judge_result: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2416,6 +2463,7 @@ impl VdslMcpServer {
         name = "vdsl_exec",
         description = "Execute a shell command on a RunPod pod via SSH. \
             Pass a command string (e.g. \"ls /workspace\", \"nvidia-smi\"). \
+            For long-running commands, use vdsl_task_run instead. \
             If pod_id is omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
         annotations(
             read_only_hint = false,
@@ -2430,33 +2478,6 @@ impl VdslMcpServer {
         let svc = Self::pod_service()?;
         let pod_id = self.resolve_pod_id(req.pod_id.as_deref())?;
         let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
-
-        if req.background {
-            // Background mode: wrap command with nohup, return immediately.
-            let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-            let log_path = format!("/tmp/vdsl_bg_{ts}.log");
-            let bg_command = format!(
-                "nohup bash -c {} > {} 2>&1 & echo $!",
-                shell_escape_single(&req.command),
-                shell_escape_single(&log_path),
-            );
-            let cmd = ["bash", "-c", &bg_command];
-            // Short timeout — just enough to launch the process
-            let result = svc
-                .pod_exec(&pod_id, &cmd, Some(&ssh_key), Some(15))
-                .await
-                .map_err(Self::to_mcp_error)?;
-
-            let pid = result.stdout.trim();
-            let output = format!(
-                "Background job launched.\n\
-                 PID: {pid}\n\
-                 Log: {log_path}\n\n\
-                 Check output: vdsl_exec(command: \"cat {log_path}\")\n\
-                 Check status: vdsl_exec(command: \"kill -0 {pid} 2>/dev/null && echo running || echo done\")"
-            );
-            return Ok(CallToolResult::success(vec![Content::text(output)]));
-        }
 
         let timeout_secs = req.timeout.or(Some(30));
         // Split command string into shell invocation
@@ -2480,6 +2501,139 @@ impl VdslMcpServer {
         if !result.success {
             output.push_str(&format!("\nexit code: {}", result.exit_code));
         }
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    // =========================================================================
+    // Background Tasks
+    // =========================================================================
+
+    #[tool(
+        name = "vdsl_task_run",
+        description = "Start a long-running command in background on a RunPod pod. \
+            The command continues even after SSH disconnection. \
+            Returns a job_id for tracking. Use vdsl_task_status or vdsl_task_log to monitor. \
+            If pod_id is omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn task_run(
+        &self,
+        Parameters(req): Parameters<VdslTaskRunRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = Self::pod_service()?;
+        let pod_id = self.resolve_pod_id(req.pod_id.as_deref())?;
+        let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
+
+        let cmd_parts: Vec<&str> = vec!["bash", "-c", &req.command];
+        let result = svc
+            .task_run(&pod_id, &cmd_parts, &ssh_key)
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        let job_id = result["id"].as_str().unwrap_or("?");
+        let command = result["command"].as_str().unwrap_or(&req.command);
+        let output = format!(
+            "Task started.\n\
+             Job ID: {job_id}\n\
+             Command: {command}\n\n\
+             Check status: vdsl_task_status(job_id: \"{job_id}\")\n\
+             View log: vdsl_task_log(job_id: \"{job_id}\")"
+        );
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    #[tool(
+        name = "vdsl_task_status",
+        description = "Check the status of a background task on a RunPod pod. \
+            Returns state (running/done), exit code, and last 5 lines of log. \
+            If pod_id is omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn task_status(
+        &self,
+        Parameters(req): Parameters<VdslTaskStatusRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = Self::pod_service()?;
+        let pod_id = self.resolve_pod_id(req.pod_id.as_deref())?;
+        let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
+
+        let result = svc
+            .task_status(&pod_id, &req.job_id, &ssh_key)
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        let output =
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"));
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    #[tool(
+        name = "vdsl_task_list",
+        description = "List all background tasks on a RunPod pod. \
+            Shows job ID, state (running/done), PID, exit code, and command. \
+            If pod_id is omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn task_list(
+        &self,
+        Parameters(req): Parameters<VdslTaskListRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = Self::pod_service()?;
+        let pod_id = self.resolve_pod_id(req.pod_id.as_deref())?;
+        let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
+
+        let result = svc
+            .task_list(&pod_id, &ssh_key)
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        let output =
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"));
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    #[tool(
+        name = "vdsl_task_log",
+        description = "View log output of a background task on a RunPod pod. \
+            Returns full log by default, or last N lines with the lines parameter. \
+            If pod_id is omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn task_log(
+        &self,
+        Parameters(req): Parameters<VdslTaskLogRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = Self::pod_service()?;
+        let pod_id = self.resolve_pod_id(req.pod_id.as_deref())?;
+        let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
+
+        let result = svc
+            .task_log(&pod_id, &req.job_id, &ssh_key, req.lines)
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        let log = result["log"].as_str().unwrap_or("");
+        let output = if log.is_empty() {
+            format!("Task {}: (no output yet)", req.job_id)
+        } else {
+            format!("Task {} log:\n\n{}", req.job_id, log)
+        };
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -3333,7 +3487,12 @@ impl VdslMcpServer {
             polls for completion, and downloads output images to save_dir. \
             Set compile_only=true to skip generation — compiled workflows are checked \
             for required models and verified against the server if connected (preflight). \
-            If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
+            If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session. \
+            Pipeline judge gates: When a pipeline has a judge/pick gate and outputs are not \
+            yet available, the pipeline pauses after the gate pass and returns candidate images. \
+            Evaluate the images (Human or Agent), then call vdsl_run again with judge_result \
+            to resume. Format: { \"pass_name\": { \"survivors\": [\"suffix1\", \"suffix2\"] } }. \
+            The judge_result is passed to the Lua compiler via VDSL_JUDGE_RESULT env var.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3362,13 +3521,18 @@ impl VdslMcpServer {
         })?;
         let out_dir_str = out_dir.path().to_string_lossy().to_string();
 
-        let lua_result = exec_lua(
-            &lua_args,
-            &work_dir,
-            timeout,
-            &[("VDSL_OUT_DIR", &out_dir_str)],
-        )
-        .await?;
+        // Serialize judge_result for env injection
+        let judge_result_json = req
+            .judge_result
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
+
+        let mut envs: Vec<(&str, &str)> = vec![("VDSL_OUT_DIR", &out_dir_str)];
+        if let Some(ref json_str) = judge_result_json {
+            envs.push(("VDSL_JUDGE_RESULT", json_str.as_str()));
+        }
+
+        let lua_result = exec_lua(&lua_args, &work_dir, timeout, &envs).await?;
 
         // Collect script output for reporting
         let mut log = Vec::<String>::new();
@@ -3459,7 +3623,7 @@ impl VdslMcpServer {
         let pipeline_path = out_dir.path().join("_pipeline.json");
         if pipeline_path.exists() {
             // --- Pipeline mode: execute passes sequentially ---
-            let (download_log, saved_paths) = execute_pipeline(
+            let pipe_result = execute_pipeline(
                 &client,
                 &pipeline_path,
                 out_dir.path(),
@@ -3473,7 +3637,7 @@ impl VdslMcpServer {
 
             // Inject VDSL metadata into downloaded PNGs
             inject_metadata_if_needed(
-                &saved_paths,
+                &pipe_result.saved_paths,
                 req.script_file.as_deref(),
                 req.code.as_deref(),
                 &work_dir,
@@ -3481,8 +3645,32 @@ impl VdslMcpServer {
             )
             .await;
 
-            if !download_log.is_empty() {
-                log.push(format!("\ndownloads:\n{}", download_log.join("\n")));
+            if !pipe_result.download_log.is_empty() {
+                log.push(format!(
+                    "\ndownloads:\n{}",
+                    pipe_result.download_log.join("\n")
+                ));
+            }
+
+            // If a judge/pick gate is pending, append structured info for Agent/Human
+            if let Some(ref gate) = pipe_result.pending_gate {
+                log.push(format!(
+                    "\n=== JUDGE GATE PENDING ===\n\
+                     type: {}\n\
+                     after_pass: {}\n\
+                     candidate_images: {}\n\
+                     \n\
+                     To resume: call vdsl_run again with the same script and:\n\
+                     judge_result: {{ \"{}\": {{ \"survivors\": [\"suffix1\", \"suffix2\"] }} }}",
+                    gate.gate_type,
+                    gate.after_pass,
+                    gate.candidate_images
+                        .iter()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    gate.after_pass,
+                ));
             }
         } else {
             // --- Flat batch mode (existing behavior) ---
@@ -3840,11 +4028,6 @@ async fn find_pngmetagrep(svc: &PodService, pod_id: &str, ssh_key: &str) -> Opti
         }
     }
     None
-}
-
-/// Escape a single string for safe use as a shell argument.
-fn shell_escape_single(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Escape arguments for shell execution via `sh -c`.
@@ -4391,6 +4574,31 @@ struct PipelineManifest {
     #[allow(dead_code)]
     save_dir: Option<String>,
     passes: Vec<PipelinePass>,
+    /// Judge gate info (N→K survival). Present when pipe:judge() is defined.
+    judge_gate: Option<PipelineGate>,
+    /// Pick gate info (N→1 selection). Present when pipe:pick() is defined.
+    pick_gate: Option<PipelineGate>,
+}
+
+/// Gate status in the pipeline manifest (judge or pick).
+#[derive(Debug, serde::Deserialize)]
+struct PipelineGate {
+    /// Pass name after which the gate is defined.
+    after_pass: String,
+    /// "pending" = outputs not yet available, "resolved" = gate evaluated.
+    status: String,
+    /// Gate type — "judge" for pick_gate with type=judge (Lua quirk).
+    #[serde(rename = "type")]
+    gate_type: Option<String>,
+    /// Survivor suffixes (only when resolved).
+    #[allow(dead_code)]
+    survivors: Option<Vec<String>>,
+    /// Pruned suffixes (only when resolved).
+    #[allow(dead_code)]
+    pruned: Option<Vec<String>>,
+    /// Per-suffix scores (only when resolved).
+    #[allow(dead_code)]
+    scores: Option<serde_json::Value>,
 }
 
 /// A single pass in the pipeline manifest.
@@ -4413,11 +4621,30 @@ struct PipelineTransfer {
     to: String,
 }
 
+/// Result of pipeline execution.
+struct PipelineExecResult {
+    download_log: Vec<String>,
+    saved_paths: Vec<std::path::PathBuf>,
+    /// If a judge/pick gate is pending, contains gate info for the caller.
+    pending_gate: Option<PendingGateInfo>,
+}
+
+/// Information about a pending judge/pick gate, returned to the caller
+/// so that Agent/Human can evaluate images and resume with judge_result.
+struct PendingGateInfo {
+    /// The pass after which the gate is pending.
+    after_pass: String,
+    /// Gate type: "judge" or "pick".
+    gate_type: String,
+    /// Candidate image paths that were downloaded for evaluation.
+    candidate_images: Vec<std::path::PathBuf>,
+}
+
 /// Execute a pipeline: passes run sequentially, variations within each pass
 /// run as a batch. Between passes, output images are copied to ComfyUI's
 /// input directory via SSH so the next pass can reference them.
 ///
-/// Returns (download_log, saved_paths) from the final pass's image download.
+/// Returns execution results including download info and any pending gate.
 #[allow(clippy::too_many_arguments)]
 async fn execute_pipeline(
     client: &ComfyUiClient,
@@ -4428,7 +4655,7 @@ async fn execute_pipeline(
     save_dir: Option<&str>,
     timeout: u64,
     log: &mut Vec<String>,
-) -> Result<(Vec<String>, Vec<std::path::PathBuf>), McpError> {
+) -> Result<PipelineExecResult, McpError> {
     // Read and parse manifest
     let manifest_str = tokio::fs::read_to_string(manifest_path)
         .await
@@ -4558,11 +4785,82 @@ async fn execute_pipeline(
     let total_ok = all_results.iter().filter(|r| r.error.is_none()).count();
     let total_err = all_results.iter().filter(|r| r.error.is_some()).count();
     let total_images: usize = all_results.iter().map(|r| r.images.len()).sum();
+
+    // Check for pending judge/pick gate
+    let pending_gate = detect_pending_gate(&manifest);
+    if let Some(ref gate) = pending_gate {
+        log.push(format!(
+            "\n[{}] Gate pending after pass '{}'. \
+             Execute pass outputs, then resume with judge_result.",
+            gate.gate_type, gate.after_pass
+        ));
+
+        // Download the gate pass's output images for evaluation
+        let gate_images: Vec<&serde_json::Value> = collect_batch_images(&all_results);
+        if let Some(dir) = save_dir {
+            let owned: Vec<serde_json::Value> = gate_images.iter().map(|v| (*v).clone()).collect();
+            let dl = download_images_to_dir(client, &owned, std::path::Path::new(dir)).await;
+            last_download_log = dl.log;
+            last_saved_paths = dl.saved_paths.clone();
+
+            log.push(format!(
+                "\nDownloaded {} candidate images for judge evaluation to {}",
+                dl.saved_paths.len(),
+                dir
+            ));
+        }
+
+        log.push(format!(
+            "\nPipeline paused: {total_ok} ok, {total_err} failed, {total_images} images (gate pending)"
+        ));
+
+        return Ok(PipelineExecResult {
+            download_log: last_download_log,
+            saved_paths: last_saved_paths.clone(),
+            pending_gate: Some(PendingGateInfo {
+                after_pass: gate.after_pass.clone(),
+                gate_type: gate.gate_type.clone(),
+                candidate_images: last_saved_paths,
+            }),
+        });
+    }
+
     log.push(format!(
         "\nPipeline complete: {total_ok} ok, {total_err} failed, {total_images} images"
     ));
 
-    Ok((last_download_log, last_saved_paths))
+    Ok(PipelineExecResult {
+        download_log: last_download_log,
+        saved_paths: last_saved_paths,
+        pending_gate: None,
+    })
+}
+
+/// Detect a pending gate (judge or pick) in the pipeline manifest.
+fn detect_pending_gate(manifest: &PipelineManifest) -> Option<PendingGateInfo> {
+    // Check judge_gate first
+    if let Some(ref gate) = manifest.judge_gate {
+        if gate.status == "pending" {
+            let gt = gate.gate_type.as_deref().unwrap_or("judge").to_string();
+            return Some(PendingGateInfo {
+                after_pass: gate.after_pass.clone(),
+                gate_type: gt,
+                candidate_images: Vec::new(),
+            });
+        }
+    }
+    // Check pick_gate
+    if let Some(ref gate) = manifest.pick_gate {
+        if gate.status == "pending" {
+            let gt = gate.gate_type.as_deref().unwrap_or("pick").to_string();
+            return Some(PendingGateInfo {
+                after_pass: gate.after_pass.clone(),
+                gate_type: gt,
+                candidate_images: Vec::new(),
+            });
+        }
+    }
+    None
 }
 
 /// Execute file transfers between passes via SSH.
@@ -6667,6 +6965,94 @@ mod tests {
     fn pipeline_manifest_invalid_json() {
         assert!(serde_json::from_str::<PipelineManifest>("{}").is_err());
         assert!(serde_json::from_str::<PipelineManifest>(r#"{"version":1}"#).is_err());
+    }
+
+    #[test]
+    fn pipeline_manifest_with_judge_gate_pending() {
+        let json = r#"{
+            "version": 1,
+            "name": "klimt_judge",
+            "save_dir": "klimt_judge",
+            "passes": [
+                { "name": "p1", "variation_count": 3, "workflows": [], "transfers": [] },
+                { "name": "p2", "variation_count": 12, "workflows": [], "transfers": [] }
+            ],
+            "pick_gate": {
+                "after_pass": "p2",
+                "status": "pending",
+                "type": "judge"
+            }
+        }"#;
+        let m: PipelineManifest = serde_json::from_str(json).unwrap();
+        assert!(m.judge_gate.is_none());
+        let pg = m.pick_gate.as_ref().unwrap();
+        assert_eq!(pg.after_pass, "p2");
+        assert_eq!(pg.status, "pending");
+        assert_eq!(pg.gate_type.as_deref(), Some("judge"));
+
+        let gate = detect_pending_gate(&m).unwrap();
+        assert_eq!(gate.after_pass, "p2");
+        assert_eq!(gate.gate_type, "judge");
+    }
+
+    #[test]
+    fn pipeline_manifest_with_judge_gate_resolved() {
+        let json = r#"{
+            "version": 1,
+            "name": "klimt_judge",
+            "save_dir": "klimt_judge",
+            "passes": [
+                { "name": "p1", "variation_count": 3, "workflows": [], "transfers": [] },
+                { "name": "p2", "variation_count": 12, "workflows": [], "transfers": [] },
+                { "name": "p3", "variation_count": 6, "workflows": [], "transfers": [] }
+            ],
+            "judge_gate": {
+                "after_pass": "p2",
+                "status": "resolved",
+                "survivors": ["d060", "d065"],
+                "pruned": ["d055", "d070"],
+                "scores": {"d055": 3.0, "d060": 9.0, "d065": 7.5, "d070": 2.0}
+            }
+        }"#;
+        let m: PipelineManifest = serde_json::from_str(json).unwrap();
+        let jg = m.judge_gate.as_ref().unwrap();
+        assert_eq!(jg.status, "resolved");
+        assert_eq!(jg.survivors.as_ref().unwrap().len(), 2);
+
+        // Resolved gate should NOT be detected as pending
+        assert!(detect_pending_gate(&m).is_none());
+    }
+
+    #[test]
+    fn pipeline_manifest_no_gates() {
+        let json = r#"{
+            "version": 1,
+            "name": "simple",
+            "passes": []
+        }"#;
+        let m: PipelineManifest = serde_json::from_str(json).unwrap();
+        assert!(m.judge_gate.is_none());
+        assert!(m.pick_gate.is_none());
+        assert!(detect_pending_gate(&m).is_none());
+    }
+
+    #[test]
+    fn vdsl_run_request_with_judge_result() {
+        let json = r#"{
+            "script_file": "test.lua",
+            "judge_result": { "p2": { "survivors": ["d060", "d065"] } }
+        }"#;
+        let req: VdslRunRequest = serde_json::from_str(json).unwrap();
+        assert!(req.judge_result.is_some());
+        let jr = req.judge_result.unwrap();
+        assert!(jr["p2"]["survivors"].is_array());
+    }
+
+    #[test]
+    fn vdsl_run_request_without_judge_result() {
+        let json = r#"{ "script_file": "test.lua" }"#;
+        let req: VdslRunRequest = serde_json::from_str(json).unwrap();
+        assert!(req.judge_result.is_none());
     }
 
     // =========================================================================

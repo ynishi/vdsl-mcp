@@ -208,6 +208,64 @@ impl RunPodCli {
         }
     }
 
+    /// Start a background task on a pod.
+    ///
+    /// Wraps `runpod-cli task run -i <key> <pod_id> -- <command...>`.
+    pub async fn task_run(
+        &self,
+        pod_id: &str,
+        command: &[&str],
+        ssh_key: &str,
+    ) -> Result<serde_json::Value, DomainError> {
+        let mut args = vec!["task", "run", "-i", ssh_key, pod_id, "--"];
+        args.extend(command);
+        self.exec(&args).await
+    }
+
+    /// Check task status.
+    ///
+    /// Wraps `runpod-cli task status -i <key> <pod_id> <job_id>`.
+    pub async fn task_status(
+        &self,
+        pod_id: &str,
+        job_id: &str,
+        ssh_key: &str,
+    ) -> Result<serde_json::Value, DomainError> {
+        self.exec(&["task", "status", "-i", ssh_key, pod_id, job_id])
+            .await
+    }
+
+    /// List all tasks on a pod.
+    ///
+    /// Wraps `runpod-cli task list -i <key> <pod_id>`.
+    pub async fn task_list(
+        &self,
+        pod_id: &str,
+        ssh_key: &str,
+    ) -> Result<serde_json::Value, DomainError> {
+        self.exec(&["task", "list", "-i", ssh_key, pod_id]).await
+    }
+
+    /// View task log output.
+    ///
+    /// Wraps `runpod-cli task log -i <key> <pod_id> <job_id> [-n <lines>]`.
+    pub async fn task_log(
+        &self,
+        pod_id: &str,
+        job_id: &str,
+        ssh_key: &str,
+        lines: Option<u64>,
+    ) -> Result<serde_json::Value, DomainError> {
+        let mut args = vec!["task", "log", "-i", ssh_key, pod_id, job_id];
+        let lines_str;
+        if let Some(n) = lines {
+            lines_str = n.to_string();
+            args.push("-n");
+            args.push(&lines_str);
+        }
+        self.exec(&args).await
+    }
+
     /// List network volumes.
     ///
     /// Equivalent to Lua `M.volumes(opts)` in runpod.lua L626-633.

@@ -79,6 +79,58 @@ impl PodService {
             .map_err(AppError::from)
     }
 
+    /// Start a background task on a pod.
+    pub async fn task_run(
+        &self,
+        pod_id: &str,
+        command: &[&str],
+        ssh_key: &str,
+    ) -> Result<serde_json::Value, AppError> {
+        self.cli
+            .task_run(pod_id, command, ssh_key)
+            .await
+            .map_err(AppError::from)
+    }
+
+    /// Check task status.
+    pub async fn task_status(
+        &self,
+        pod_id: &str,
+        job_id: &str,
+        ssh_key: &str,
+    ) -> Result<serde_json::Value, AppError> {
+        self.cli
+            .task_status(pod_id, job_id, ssh_key)
+            .await
+            .map_err(AppError::from)
+    }
+
+    /// List all tasks on a pod.
+    pub async fn task_list(
+        &self,
+        pod_id: &str,
+        ssh_key: &str,
+    ) -> Result<serde_json::Value, AppError> {
+        self.cli
+            .task_list(pod_id, ssh_key)
+            .await
+            .map_err(AppError::from)
+    }
+
+    /// View task log output.
+    pub async fn task_log(
+        &self,
+        pod_id: &str,
+        job_id: &str,
+        ssh_key: &str,
+        lines: Option<u64>,
+    ) -> Result<serde_json::Value, AppError> {
+        self.cli
+            .task_log(pod_id, job_id, ssh_key, lines)
+            .await
+            .map_err(AppError::from)
+    }
+
     /// List network volumes.
     pub async fn list_volumes(&self) -> Result<Vec<serde_json::Value>, AppError> {
         self.cli.list_volumes().await.map_err(AppError::from)
