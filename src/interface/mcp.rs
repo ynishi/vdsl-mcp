@@ -57,6 +57,9 @@ struct VdslMcpServer {
     /// Set alongside `last_url` when the pod ID is known.
     /// Used by `vdsl_exec` to avoid requiring pod_id on every call.
     last_pod_id: Arc<Mutex<Option<String>>>,
+    /// Whether the current session is an ephemeral pod (no network volume).
+    /// When true, tools warn if images are not downloaded locally.
+    ephemeral: Arc<Mutex<bool>>,
     /// Lazy-initialized repository keyed by working_dir path.
     repos: Arc<Mutex<std::collections::HashMap<PathBuf, Arc<SqliteRepository>>>>,
 }
@@ -67,6 +70,7 @@ impl VdslMcpServer {
             tool_router: Self::tool_router(),
             last_url: Arc::new(Mutex::new(None)),
             last_pod_id: Arc::new(Mutex::new(None)),
+            ephemeral: Arc::new(Mutex::new(false)),
             repos: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
@@ -112,6 +116,11 @@ impl VdslMcpServer {
 
     /// Store the last successfully connected URL and pod ID for session reuse.
     fn save_session(&self, url: &str, pod_id: Option<&str>) {
+        self.save_session_with_ephemeral(url, pod_id, false);
+    }
+
+    /// Store session state including ephemeral flag.
+    fn save_session_with_ephemeral(&self, url: &str, pod_id: Option<&str>, is_ephemeral: bool) {
         if let Ok(mut guard) = self.last_url.lock() {
             *guard = Some(url.to_string());
         }
@@ -120,6 +129,14 @@ impl VdslMcpServer {
                 *guard = Some(id.to_string());
             }
         }
+        if let Ok(mut guard) = self.ephemeral.lock() {
+            *guard = is_ephemeral;
+        }
+    }
+
+    /// Check if current session is ephemeral.
+    fn is_ephemeral(&self) -> bool {
+        self.ephemeral.lock().map(|g| *g).unwrap_or(false)
     }
 
     /// Resolve pod ID from explicit parameter or session state.
@@ -402,6 +419,8 @@ fn resolve_upload_files(req: &VdslUploadRequest) -> Result<Vec<std::path::PathBu
 const COMFY_DEFAULTS_NAME: &str = "comfyui-vdsl";
 const COMFY_DEFAULTS_TEMPLATE: &str = "cw3nka7d08";
 const COMFY_DEFAULTS_DISK: u32 = 30;
+/// Default container disk for ephemeral pods (no network volume).
+const COMFY_DEFAULTS_EPHEMERAL_DISK: u32 = 100;
 
 /// Max wait time for pod + ComfyUI readiness (seconds).
 const SETUP_TIMEOUT_SECS: u64 = 300;
@@ -826,6 +845,7 @@ pub struct VdslImageDownloadRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VdslPodSetupRequest {
     /// Network volume ID. If omitted, auto-detected when exactly one volume exists.
+    /// Ignored when ephemeral=true.
     pub volume_id: Option<String>,
 
     /// GPU type (e.g. "NVIDIA A40", "NVIDIA L4"). Can be a single type or comma-separated list.
@@ -833,12 +853,19 @@ pub struct VdslPodSetupRequest {
 
     /// Datacenter ID (e.g. "EU-SE-1"). Can be a single ID or comma-separated list.
     pub datacenter: Option<String>,
+
+    /// Create an ephemeral pod without a network volume.
+    /// Use when network drives are full or unavailable.
+    /// Data is lost on pod deletion. Use vdsl_storage_pull to restore models from B2.
+    #[serde(default)]
+    pub ephemeral: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VdslPodCreateRequest {
     /// Network volume ID to attach (from vdsl_volume_list).
-    pub volume_id: String,
+    /// Omit to create an ephemeral pod without persistent storage.
+    pub volume_id: Option<String>,
 
     /// GPU type (e.g. "NVIDIA A40", "NVIDIA L4"). Can be a single type or comma-separated list.
     pub gpu: Option<String>,
@@ -849,7 +876,7 @@ pub struct VdslPodCreateRequest {
     /// Datacenter ID (e.g. "EU-SE-1"). Can be a single ID or comma-separated list.
     pub datacenter: Option<String>,
 
-    /// Container disk size in GB (default: 30).
+    /// Container disk size in GB (default: 30 with volume, 100 without).
     pub disk_gb: Option<u32>,
 }
 
@@ -1437,7 +1464,10 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_pod_create",
-        description = "[infra] Create a new ComfyUI pod on RunPod. Requires a network volume ID (from vdsl_volume_list). Applies ComfyUI defaults (template, ports, disk) automatically.",
+        description = "[infra] Create a new ComfyUI pod on RunPod. \
+            Omit volume_id to create an ephemeral pod (no persistent storage, disk default 100GB). \
+            Use vdsl_storage_pull after setup to restore models from B2 cold storage. \
+            Applies ComfyUI defaults (template, ports) automatically.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1457,15 +1487,23 @@ impl VdslMcpServer {
             "templateId".into(),
             serde_json::Value::String(COMFY_DEFAULTS_TEMPLATE.to_string()),
         );
+        let is_ephemeral = req.volume_id.is_none();
+        let default_disk = if is_ephemeral {
+            COMFY_DEFAULTS_EPHEMERAL_DISK
+        } else {
+            COMFY_DEFAULTS_DISK
+        };
         spec.insert(
             "containerDiskInGb".into(),
-            serde_json::Value::Number(req.disk_gb.unwrap_or(COMFY_DEFAULTS_DISK).into()),
+            serde_json::Value::Number(req.disk_gb.unwrap_or(default_disk).into()),
         );
         spec.insert("ports".into(), serde_json::json!(["8188/http", "22/tcp"]));
-        spec.insert(
-            "networkVolumeId".into(),
-            serde_json::Value::String(req.volume_id),
-        );
+        if let Some(vol) = req.volume_id {
+            spec.insert(
+                "networkVolumeId".into(),
+                serde_json::Value::String(vol),
+            );
+        }
 
         if let Some(gpu) = req.gpu {
             let gpu_list: Vec<serde_json::Value> = gpu
@@ -1492,8 +1530,14 @@ impl VdslMcpServer {
 
         let pod_id = result["id"].as_str().unwrap_or("?");
         let pod_name = result["name"].as_str().unwrap_or("?");
+        let ephemeral_note = if is_ephemeral {
+            "\n\n⚠ Ephemeral pod (no network volume). Data is lost on deletion.\n\
+             Use vdsl_storage_pull to restore models from B2 cold storage."
+        } else {
+            ""
+        };
         let output = format!(
-            "Pod created: {pod_id} ({pod_name})\n\n{}",
+            "Pod created: {pod_id} ({pod_name}){ephemeral_note}\n\n{}",
             serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"))
         );
         Ok(CallToolResult::success(vec![Content::text(output)]))
@@ -1607,6 +1651,8 @@ impl VdslMcpServer {
         description = "[infra] Find or create a ComfyUI pod and wait until it's ready. \
             Searches for an existing 'comfyui-vdsl' pod first; starts it if stopped, \
             creates a new one if none found. Returns connection info when ComfyUI is responding. \
+            Set ephemeral=true to skip network volume and create a disposable pod (100GB disk). \
+            Use vdsl_storage_pull after setup to restore models from B2. \
             Timeout: 5 minutes.",
         annotations(
             read_only_hint = false,
@@ -1620,80 +1666,95 @@ impl VdslMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let svc = Self::pod_service()?;
         let mut log = Vec::<String>::new();
+        let is_ephemeral = req.ephemeral;
 
-        // --- 1. Resolve volume_id ---
-        let volume_id = match req.volume_id {
-            Some(v) => v,
-            None => {
-                let volumes = svc.list_volumes().await.map_err(Self::to_mcp_error)?;
-                match volumes.len() {
-                    0 => {
-                        return Err(McpError::invalid_params(
-                            "no network volumes found. Create one first via RunPod dashboard.",
-                            None,
-                        ))
-                    }
-                    1 => {
-                        let id = volumes[0]["id"]
-                            .as_str()
-                            .ok_or_else(|| {
-                                McpError::invalid_params("volume has no id field", None)
-                            })?
-                            .to_string();
-                        log.push(format!("Auto-detected volume: {id}"));
-                        id
-                    }
-                    n => {
-                        let list = format_volume_list(&volumes);
-                        return Err(McpError::invalid_params(
-                            format!("{n} volumes found — specify volume_id explicitly.\n\n{list}"),
-                            None,
-                        ));
+        // --- 1. Resolve volume_id (skip for ephemeral) ---
+        let volume_id: Option<String> = if is_ephemeral {
+            log.push("Ephemeral mode: skipping network volume.".to_string());
+            None
+        } else {
+            Some(match req.volume_id {
+                Some(v) => v,
+                None => {
+                    let volumes = svc.list_volumes().await.map_err(Self::to_mcp_error)?;
+                    match volumes.len() {
+                        0 => {
+                            return Err(McpError::invalid_params(
+                                "no network volumes found. Create one first via RunPod dashboard, \
+                                 or use ephemeral=true for a disposable pod.",
+                                None,
+                            ))
+                        }
+                        1 => {
+                            let id = volumes[0]["id"]
+                                .as_str()
+                                .ok_or_else(|| {
+                                    McpError::invalid_params("volume has no id field", None)
+                                })?
+                                .to_string();
+                            log.push(format!("Auto-detected volume: {id}"));
+                            id
+                        }
+                        n => {
+                            let list = format_volume_list(&volumes);
+                            return Err(McpError::invalid_params(
+                                format!(
+                                    "{n} volumes found — specify volume_id explicitly, \
+                                     or use ephemeral=true.\n\n{list}"
+                                ),
+                                None,
+                            ));
+                        }
                     }
                 }
-            }
+            })
         };
 
-        // --- 2. Find existing pod ---
-        let pods = svc.list_pods().await.map_err(Self::to_mcp_error)?;
-        let candidate = pods.iter().find(|p| {
-            let name_match = p["name"].as_str() == Some(COMFY_DEFAULTS_NAME);
-            let vol_match = p["networkVolume"]["id"].as_str() == Some(&volume_id)
-                || p["networkVolumeId"].as_str() == Some(&volume_id);
-            name_match && vol_match
-        });
-
+        // --- 2. Find existing pod (skip for ephemeral — always create new) ---
         let mut pod_id: String = String::new();
-        let mut needs_create = candidate.is_none();
+        let mut needs_create = is_ephemeral;
 
-        if let Some(pod) = candidate {
-            pod_id = pod["id"]
-                .as_str()
-                .ok_or_else(|| McpError::invalid_params("pod has no id field", None))?
-                .to_string();
-            let status = pod["desiredStatus"]
-                .as_str()
-                .or_else(|| pod["status"].as_str())
-                .unwrap_or("unknown");
+        if !is_ephemeral {
+            let vol_id = volume_id.as_deref().expect("volume_id resolved for non-ephemeral");
+            let pods = svc.list_pods().await.map_err(Self::to_mcp_error)?;
+            let candidate = pods.iter().find(|p| {
+                let name_match = p["name"].as_str() == Some(COMFY_DEFAULTS_NAME);
+                let vol_match = p["networkVolume"]["id"].as_str() == Some(vol_id)
+                    || p["networkVolumeId"].as_str() == Some(vol_id);
+                name_match && vol_match
+            });
 
-            log.push(format!("Found existing pod: {pod_id} (status: {status})"));
+            needs_create = candidate.is_none();
 
-            if status != "RUNNING" {
-                log.push("Starting pod...".to_string());
-                match svc.start_pod(&pod_id).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        // GPU unavailable or host full — delete and recreate
-                        let err_msg = e.to_string();
-                        log.push(format!(
-                            "Start failed: {err_msg}\nDeleting pod and recreating on available host..."
-                        ));
-                        match svc.delete_pod(&pod_id).await {
-                            Ok(_) => log.push(format!("Deleted pod {pod_id}.")),
-                            Err(del_err) => log
-                                .push(format!("Warning: failed to delete pod {pod_id}: {del_err}")),
+            if let Some(pod) = candidate {
+                pod_id = pod["id"]
+                    .as_str()
+                    .ok_or_else(|| McpError::invalid_params("pod has no id field", None))?
+                    .to_string();
+                let status = pod["desiredStatus"]
+                    .as_str()
+                    .or_else(|| pod["status"].as_str())
+                    .unwrap_or("unknown");
+
+                log.push(format!("Found existing pod: {pod_id} (status: {status})"));
+
+                if status != "RUNNING" {
+                    log.push("Starting pod...".to_string());
+                    match svc.start_pod(&pod_id).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            let err_msg = e.to_string();
+                            log.push(format!(
+                                "Start failed: {err_msg}\nDeleting pod and recreating on available host..."
+                            ));
+                            match svc.delete_pod(&pod_id).await {
+                                Ok(_) => log.push(format!("Deleted pod {pod_id}.")),
+                                Err(del_err) => log.push(format!(
+                                    "Warning: failed to delete pod {pod_id}: {del_err}"
+                                )),
+                            }
+                            needs_create = true;
                         }
-                        needs_create = true;
                     }
                 }
             }
@@ -1701,7 +1762,19 @@ impl VdslMcpServer {
 
         if needs_create {
             // --- 3. Create new pod ---
-            log.push(format!("Creating new pod for volume {volume_id}..."));
+            let default_disk = if is_ephemeral {
+                COMFY_DEFAULTS_EPHEMERAL_DISK
+            } else {
+                COMFY_DEFAULTS_DISK
+            };
+            if is_ephemeral {
+                log.push("Creating ephemeral pod (no network volume)...".to_string());
+            } else {
+                log.push(format!(
+                    "Creating new pod for volume {}...",
+                    volume_id.as_deref().unwrap_or("?")
+                ));
+            }
 
             let mut spec = serde_json::Map::new();
             spec.insert(
@@ -1714,13 +1787,15 @@ impl VdslMcpServer {
             );
             spec.insert(
                 "containerDiskInGb".into(),
-                serde_json::Value::Number(COMFY_DEFAULTS_DISK.into()),
+                serde_json::Value::Number(default_disk.into()),
             );
             spec.insert("ports".into(), serde_json::json!(["8188/http", "22/tcp"]));
-            spec.insert(
-                "networkVolumeId".into(),
-                serde_json::Value::String(volume_id),
-            );
+            if let Some(ref vol) = volume_id {
+                spec.insert(
+                    "networkVolumeId".into(),
+                    serde_json::Value::String(vol.clone()),
+                );
+            }
 
             if let Some(gpu) = req.gpu {
                 let gpu_list: Vec<serde_json::Value> = gpu
@@ -1779,9 +1854,16 @@ impl VdslMcpServer {
         };
 
         log.push("ComfyUI is ready.".to_string());
+        if is_ephemeral {
+            log.push(
+                "⚠ Ephemeral pod — data is lost on deletion. \
+                 Use vdsl_storage_pull to restore models from B2 cold storage."
+                    .to_string(),
+            );
+        }
 
         // Save successful connection for session reuse
-        self.save_session(&url, Some(&pod_id));
+        self.save_session_with_ephemeral(&url, Some(&pod_id), is_ephemeral);
 
         let output = format!(
             "{}\n\npod_id: {pod_id}\nurl: {url}\n\
@@ -2241,6 +2323,11 @@ impl VdslMcpServer {
 
         if !download_log.is_empty() {
             output.push_str(&format!("\n\ndownloads:\n{}", download_log.join("\n")));
+        } else if self.is_ephemeral() {
+            output.push_str(
+                "\n\n⚠ Ephemeral pod — images exist only on the pod and will be lost on deletion.\n\
+                 Specify save_dir to download images locally.",
+            );
         }
 
         output.push_str(&format!(
@@ -2377,6 +2464,11 @@ impl VdslMcpServer {
         let mut output = log.join("\n");
         if !download_log.is_empty() {
             output.push_str(&format!("\n\ndownloads:\n{}", download_log.join("\n")));
+        } else if self.is_ephemeral() {
+            output.push_str(
+                "\n\n⚠ Ephemeral pod — images exist only on the pod and will be lost on deletion.\n\
+                 Specify save_dir to download images locally.",
+            );
         }
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
@@ -3891,6 +3983,12 @@ impl VdslMcpServer {
 
             if !download_log.is_empty() {
                 log.push(format!("\ndownloads:\n{}", download_log.join("\n")));
+            } else if self.is_ephemeral() {
+                log.push(
+                    "\n⚠ Ephemeral pod — images exist only on the pod and will be lost on deletion.\n\
+                     Specify save_dir to download images locally."
+                        .to_string(),
+                );
             }
         }
 
@@ -6076,7 +6174,7 @@ mod tests {
     #[test]
     fn pod_create_request_minimal() {
         let req: VdslPodCreateRequest = serde_json::from_str(r#"{"volume_id":"vol_001"}"#).unwrap();
-        assert_eq!(req.volume_id, "vol_001");
+        assert_eq!(req.volume_id.as_deref(), Some("vol_001"));
         assert!(req.gpu.is_none());
         assert!(req.name.is_none());
         assert!(req.datacenter.is_none());
@@ -6089,7 +6187,7 @@ mod tests {
             r#"{"volume_id":"vol_001","gpu":"NVIDIA A40","name":"my-pod","datacenter":"EU-SE-1","disk_gb":50}"#,
         )
         .unwrap();
-        assert_eq!(req.volume_id, "vol_001");
+        assert_eq!(req.volume_id.as_deref(), Some("vol_001"));
         assert_eq!(req.gpu.as_deref(), Some("NVIDIA A40"));
         assert_eq!(req.name.as_deref(), Some("my-pod"));
         assert_eq!(req.datacenter.as_deref(), Some("EU-SE-1"));
@@ -6097,9 +6195,10 @@ mod tests {
     }
 
     #[test]
-    fn pod_create_request_missing_volume() {
-        let result = serde_json::from_str::<VdslPodCreateRequest>("{}");
-        assert!(result.is_err());
+    fn pod_create_request_ephemeral() {
+        let req: VdslPodCreateRequest = serde_json::from_str("{}").unwrap();
+        assert!(req.volume_id.is_none());
+        assert!(req.gpu.is_none());
     }
 
     #[test]
@@ -6291,6 +6390,7 @@ mod tests {
         assert!(req.volume_id.is_none());
         assert!(req.gpu.is_none());
         assert!(req.datacenter.is_none());
+        assert!(!req.ephemeral);
     }
 
     #[test]
@@ -6302,6 +6402,7 @@ mod tests {
         assert_eq!(req.volume_id.as_deref(), Some("vol_001"));
         assert_eq!(req.gpu.as_deref(), Some("NVIDIA A40"));
         assert_eq!(req.datacenter.as_deref(), Some("EU-SE-1"));
+        assert!(!req.ephemeral);
     }
 
     #[test]
@@ -6309,6 +6410,22 @@ mod tests {
         let req: VdslPodSetupRequest = serde_json::from_str(r#"{"volume_id":"vol_abc"}"#).unwrap();
         assert_eq!(req.volume_id.as_deref(), Some("vol_abc"));
         assert!(req.gpu.is_none());
+    }
+
+    #[test]
+    fn pod_setup_request_ephemeral() {
+        let req: VdslPodSetupRequest =
+            serde_json::from_str(r#"{"ephemeral":true}"#).unwrap();
+        assert!(req.ephemeral);
+        assert!(req.volume_id.is_none());
+    }
+
+    #[test]
+    fn pod_setup_request_ephemeral_with_gpu() {
+        let req: VdslPodSetupRequest =
+            serde_json::from_str(r#"{"ephemeral":true,"gpu":"NVIDIA L4"}"#).unwrap();
+        assert!(req.ephemeral);
+        assert_eq!(req.gpu.as_deref(), Some("NVIDIA L4"));
     }
 
     // --- Download request tests ---
