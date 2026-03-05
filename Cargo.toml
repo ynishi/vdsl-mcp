@@ -24,5 +24,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 urlencoding = "2"
 tempfile = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+rusqlite = { version = "0.34", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

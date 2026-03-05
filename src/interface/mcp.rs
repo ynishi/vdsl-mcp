@@ -19,13 +19,16 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::application::pod_service::{resolve_api_key, PodService};
 use crate::domain::models::{format_model_catalog_with_limit, parse_model_catalog};
 use crate::domain::pod::{format_pod_list, format_volume_list};
+use crate::domain::repository::{Generation, GenerationFilter, QueryOpts, Repository, StatRow};
 use crate::infra::comfyui_client::{proxy_url, ComfyUiClient};
 use crate::infra::runpod_cli::RunPodCli;
+use crate::infra::sqlite::SqliteRepository;
 
 // =============================================================================
 // Public entry point
@@ -54,6 +57,8 @@ struct VdslMcpServer {
     /// Set alongside `last_url` when the pod ID is known.
     /// Used by `vdsl_exec` to avoid requiring pod_id on every call.
     last_pod_id: Arc<Mutex<Option<String>>>,
+    /// Lazy-initialized repository keyed by working_dir path.
+    repos: Arc<Mutex<std::collections::HashMap<PathBuf, Arc<SqliteRepository>>>>,
 }
 
 impl VdslMcpServer {
@@ -62,7 +67,27 @@ impl VdslMcpServer {
             tool_router: Self::tool_router(),
             last_url: Arc::new(Mutex::new(None)),
             last_pod_id: Arc::new(Mutex::new(None)),
+            repos: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// Get or create a SqliteRepository for the given working directory.
+    fn get_repo(&self, work_dir: &std::path::Path) -> Result<Arc<SqliteRepository>, McpError> {
+        let mut repos = self
+            .repos
+            .lock()
+            .map_err(|e| McpError::internal_error(format!("repo lock failed: {e}"), None))?;
+
+        if let Some(repo) = repos.get(work_dir) {
+            return Ok(Arc::clone(repo));
+        }
+
+        let repo = SqliteRepository::open(work_dir).map_err(|e| {
+            McpError::internal_error(format!("failed to open repository: {e}"), None)
+        })?;
+        let repo = Arc::new(repo);
+        repos.insert(work_dir.to_path_buf(), Arc::clone(&repo));
+        Ok(repo)
     }
 
     /// Create a PodService from environment API key.
@@ -136,7 +161,16 @@ impl VdslMcpServer {
                 match guard.as_deref() {
                     Some(url) => Ok(url.to_string()),
                     None => Err(McpError::invalid_params(
-                        "either pod_id or url is required (no previous connection to fall back to)",
+                        "No ComfyUI connection. Use vdsl_pod_setup or vdsl_connect first.\n\n\
+                         Alternatively, these tools work WITHOUT a connection:\n\
+                         • vdsl_run (compile_only=true) — compile & validate workflows locally\n\
+                         • vdsl_image_search (source=\"local\") — search local PNG metadata\n\
+                         • vdsl_catalogs — list available VDSL catalogs\n\
+                         • vdsl_repo_query / vdsl_repo_stats — query generation DB\n\
+                         • vdsl_repo_meta_get / vdsl_repo_meta_set — read/write generation metadata\n\
+                         • vdsl_repo_reindex — rebuild DB from local PNGs\n\
+                         • vdsl_model_search — search models on CivitAI\n\
+                         • vdsl_pod_list / vdsl_volume_list — list RunPod resources",
                         None,
                     )),
                 }
@@ -1263,6 +1297,72 @@ pub struct VdslImageSearchRequest {
     pub ssh_key: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct VdslRepoQueryRequest {
+    /// VDSL working directory (must contain lua/).
+    pub working_dir: String,
+
+    /// Filter by model filename.
+    pub model: Option<String>,
+
+    /// Filter by script filename.
+    pub script: Option<String>,
+
+    /// Filter by workspace name.
+    pub workspace: Option<String>,
+
+    /// Filter: created_at >= date_from (ISO 8601).
+    pub date_from: Option<String>,
+
+    /// Filter: created_at <= date_to (ISO 8601).
+    pub date_to: Option<String>,
+
+    /// Maximum results (default: 50).
+    pub limit: Option<u32>,
+
+    /// Offset for pagination.
+    pub offset: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct VdslRepoStatsRequest {
+    /// VDSL working directory (must contain lua/).
+    pub working_dir: String,
+
+    /// Group by: "model", "script", "workspace", or "date".
+    pub group_by: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct VdslRepoMetaGetRequest {
+    /// VDSL working directory (must contain lua/).
+    pub working_dir: String,
+
+    /// Generation ID to read metadata from.
+    pub generation_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct VdslRepoMetaSetRequest {
+    /// VDSL working directory (must contain lua/).
+    pub working_dir: String,
+
+    /// Generation ID to write metadata to.
+    pub generation_id: String,
+
+    /// Metadata JSON string to store (replaces existing).
+    pub meta: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct VdslRepoReindexRequest {
+    /// VDSL working directory (must contain lua/).
+    pub working_dir: String,
+
+    /// Directory to scan for PNGs (default: "output/").
+    pub scan_dir: Option<String>,
+}
+
 // =============================================================================
 // Tool implementations
 // =============================================================================
@@ -1271,7 +1371,7 @@ pub struct VdslImageSearchRequest {
 impl VdslMcpServer {
     #[tool(
         name = "vdsl_pod_list",
-        description = "List all RunPod pods with their status, GPU, and cost. Infrastructure tool — not needed for normal image generation.",
+        description = "[infra] List all RunPod pods with their status, GPU, and cost.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1291,7 +1391,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_pod_start",
-        description = "Start (or resume) a RunPod pod. Returns the API response with updated pod status.",
+        description = "[infra] Start (or resume) a RunPod pod. Returns the API response with updated pod status.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1314,7 +1414,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_pod_stop",
-        description = "Stop a running RunPod pod. The pod can be restarted later with vdsl_pod_start.",
+        description = "[infra] Stop a running RunPod pod. The pod can be restarted later with vdsl_pod_start.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1337,7 +1437,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_pod_create",
-        description = "Create a new ComfyUI pod on RunPod. Requires a network volume ID (from vdsl_volume_list). Applies ComfyUI defaults (template, ports, disk) automatically.",
+        description = "[infra] Create a new ComfyUI pod on RunPod. Requires a network volume ID (from vdsl_volume_list). Applies ComfyUI defaults (template, ports, disk) automatically.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1401,7 +1501,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_volume_list",
-        description = "List all RunPod network volumes with their size, datacenter, and usage.",
+        description = "[infra] List all RunPod network volumes with their size, datacenter, and usage.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1420,7 +1520,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_connect",
-        description = "Connect to a ComfyUI instance. Pass a full URL or a RunPod pod ID (proxy URL is auto-constructed). \
+        description = "[infra] Connect to a ComfyUI instance. Pass a full URL or a RunPod pod ID (proxy URL is auto-constructed). \
             Returns system stats if ComfyUI is reachable. \
             If pod_id/url are omitted, reuses the last successful connection. \
             Set wait=true to poll until ComfyUI becomes ready (up to 5 minutes) — \
@@ -1481,7 +1581,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_pod_delete",
-        description = "Delete a RunPod pod permanently. This action is irreversible — the pod and all its data will be destroyed.",
+        description = "[infra] Delete a RunPod pod permanently. This action is irreversible — the pod and all its data will be destroyed.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1504,7 +1604,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_pod_setup",
-        description = "Find or create a ComfyUI pod and wait until it's ready. \
+        description = "[infra] Find or create a ComfyUI pod and wait until it's ready. \
             Searches for an existing 'comfyui-vdsl' pod first; starts it if stopped, \
             creates a new one if none found. Returns connection info when ComfyUI is responding. \
             Timeout: 5 minutes.",
@@ -1696,7 +1796,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_models",
-        description = "List available models (checkpoints, LoRAs, VAEs, ControlNets, upscalers) on a running ComfyUI instance. \
+        description = "[gen] List available models (checkpoints, LoRAs, VAEs, ControlNets, upscalers) on a running ComfyUI instance. \
             If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
         annotations(
             read_only_hint = true,
@@ -1722,7 +1822,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_node_search",
-        description = "Search available ComfyUI node types by name pattern. \
+        description = "[gen] Search available ComfyUI node types by name pattern. \
             Returns matching node class names (case-insensitive substring match). \
             Use this instead of /object_info which can exceed token limits. \
             Examples: pattern='Face' finds FaceDetailer, FaceRestore, etc. \
@@ -1785,7 +1885,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_queue_status",
-        description = "Check ComfyUI queue status. With prompt_id: check specific job (pending/running/completed/error). Without: show full queue state. \
+        description = "[gen] Check ComfyUI queue status. With prompt_id: check specific job (pending/running/completed/error). Without: show full queue state. \
             If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
         annotations(
             read_only_hint = true,
@@ -1846,7 +1946,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_upload",
-        description = "Upload local files to a running ComfyUI instance (input/ directory). \
+        description = "[transfer] Upload local files to a running ComfyUI instance (input/ directory). \
             Accepts a single file (filepath), multiple files (files), \
             or an entire directory (dir). Mutually exclusive. \
             Used for ControlNet images, training data, etc. \
@@ -1901,7 +2001,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_download",
-        description = "Download a model to a RunPod pod's ComfyUI models directory. \
+        description = "[transfer] Download a model to a RunPod pod's ComfyUI models directory. \
             Sources: hf:user/repo/file (HuggingFace), cv:VERSION_ID (CivitAI), \
             https://... (direct URL), or bare user/repo/file (defaults to HuggingFace). \
             CivitAI token is auto-injected from VDSL_CIVITAI_TOKEN env. \
@@ -2013,7 +2113,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_generate",
-        description = "Queue a ComfyUI workflow and wait for completion. \
+        description = "[gen] Queue a ComfyUI workflow and wait for completion. \
             Accepts workflow JSON inline (workflow) or as a file path (workflow_file). \
             Polls /history until done, returns prompt_id and output images. \
             Timeout: 5 minutes (configurable). \
@@ -2153,7 +2253,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_batch_generate",
-        description = "Queue multiple ComfyUI workflows and wait for all to complete. \
+        description = "[gen] Queue multiple ComfyUI workflows and wait for all to complete. \
             Accepts workflows as: inline array (workflows), file list (workflow_files), \
             or directory of .json files (load_dir). \
             All workflows are submitted to the queue, then polled until every job finishes. \
@@ -2284,7 +2384,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_run_script",
-        description = "Run a VDSL Lua script via the lua interpreter. \
+        description = "[gen] Run a VDSL Lua script via the lua interpreter. \
             Accepts a script file path or inline code. \
             Captures stdout and stderr. \
             The working directory must contain lua/ and scripts/ for VDSL module resolution. \
@@ -2337,7 +2437,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_catalogs",
-        description = "List all available VDSL catalog entries (built-in + user-defined). \
+        description = "[gen] List all available VDSL catalog entries (built-in + user-defined). \
             Returns catalog names and their entries grouped by top-level catalogs and packs. \
             Useful for discovering available style/quality/camera/lighting entries \
             before writing VDSL scripts. \
@@ -2418,7 +2518,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_comfy_api",
-        description = "Call any ComfyUI REST API endpoint with automatic authentication. \
+        description = "[low-level] Call any ComfyUI REST API endpoint with automatic authentication. \
             Supports GET and POST. Authentication (Bearer token) and URL construction \
             (from pod_id) are handled automatically. \
             Examples: GET /queue, GET /object_info, POST /prompt, GET /history/{id}. \
@@ -2461,7 +2561,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_exec",
-        description = "Execute a shell command on a RunPod pod via SSH. \
+        description = "[low-level] Execute a shell command on a RunPod pod via SSH. \
             Pass a command string (e.g. \"ls /workspace\", \"nvidia-smi\"). \
             For long-running commands, use vdsl_task_run instead. \
             If pod_id is omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
@@ -2510,7 +2610,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_task_run",
-        description = "Start a long-running command in background on a RunPod pod. \
+        description = "[task] Start a long-running command in background on a RunPod pod. \
             The command continues even after SSH disconnection. \
             Returns a job_id for tracking. Use vdsl_task_status or vdsl_task_log to monitor. \
             If pod_id is omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
@@ -2548,7 +2648,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_task_status",
-        description = "Check the status of a background task on a RunPod pod. \
+        description = "[task] Check the status of a background task on a RunPod pod. \
             Returns state (running/done), exit code, and last 5 lines of log. \
             If pod_id is omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
         annotations(
@@ -2577,7 +2677,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_task_list",
-        description = "List all background tasks on a RunPod pod. \
+        description = "[task] List all background tasks on a RunPod pod. \
             Shows job ID, state (running/done), PID, exit code, and command. \
             If pod_id is omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
         annotations(
@@ -2606,7 +2706,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_task_log",
-        description = "View log output of a background task on a RunPod pod. \
+        description = "[task] View log output of a background task on a RunPod pod. \
             Returns full log by default, or last N lines with the lines parameter. \
             If pod_id is omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
         annotations(
@@ -2643,7 +2743,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_model_search",
-        description = "Search for AI models (checkpoints, LoRAs, VAEs, etc.) on model marketplaces. \
+        description = "[gen] Search for AI models (checkpoints, LoRAs, VAEs, etc.) on model marketplaces. \
             Returns model names, version IDs, download counts, and base model info. \
             Use the returned version ID with vdsl_download (source: \"cv:VERSION_ID\") to install. \
             Currently supports: CivitAI (cv). HuggingFace (hf) support is planned.",
@@ -2740,7 +2840,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_runpod_cli",
-        description = "Execute any runpod-cli command directly. \
+        description = "[low-level] Execute any runpod-cli command directly. \
             VDSL_RUNPOD_API_KEY and -o json are injected automatically. \
             Pass subcommand + arguments as an array. \
             Examples: [\"pods\", \"list-pods\"], [\"exec\", \"pod_id\", \"nvidia-smi\"], \
@@ -2887,7 +2987,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_interrupt",
-        description = "Cancel ComfyUI jobs. \
+        description = "[gen] Cancel ComfyUI jobs. \
             Without prompt_ids: sends POST /interrupt to cancel the currently running job. \
             With prompt_ids: sends POST /queue to delete specific pending jobs from the queue. \
             If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
@@ -2942,7 +3042,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_storage_list",
-        description = "List files in B2 cold storage. \
+        description = "[storage] List files in B2 cold storage. \
             Requires VDSL_B2_KEY_ID and VDSL_B2_KEY env vars. \
             Bucket can be specified per-call or via VDSL_B2_BUCKET env. \
             Ensures rclone is installed on the pod (auto-installs if missing).",
@@ -3006,7 +3106,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_storage_pull",
-        description = "Pull a model from B2 cold storage to the pod's ComfyUI models directory. \
+        description = "[storage] Pull a model from B2 cold storage to the pod's ComfyUI models directory. \
             Requires VDSL_B2_KEY_ID and VDSL_B2_KEY env vars. \
             Ensures rclone is installed on the pod (auto-installs if missing). \
             Target maps to ComfyUI model subdirectories (checkpoints, loras, etc.).",
@@ -3061,7 +3161,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_storage_push",
-        description = "Push a model from the pod's ComfyUI models directory to B2 cold storage. \
+        description = "[storage] Push a model from the pod's ComfyUI models directory to B2 cold storage. \
             Requires VDSL_B2_KEY_ID and VDSL_B2_KEY env vars. \
             Ensures rclone is installed on the pod (auto-installs if missing). \
             Specify filename to push a single file, or omit to push the entire category.",
@@ -3131,7 +3231,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_storage_archive",
-        description = "Archive a model from pod to B2 cold storage and delete from pod. \
+        description = "[storage] Archive a model from pod to B2 cold storage and delete from pod. \
             Safe 3-step flow: 1) push to B2, 2) verify upload (existence + size), \
             3) delete from pod only after verification. \
             If verification fails, the pod file is NOT deleted. \
@@ -3276,7 +3376,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_image_download",
-        description = "Batch download output images from ComfyUI history or pod filesystem. \
+        description = "[transfer] Batch download output images from ComfyUI history or pod filesystem. \
             Two source modes: \
             (1) source=\"history\" (default): download from ComfyUI /history API. \
             Optionally specify prompt_ids for specific jobs, or omit for all recent history. \
@@ -3480,7 +3580,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_run",
-        description = "Compile and generate images from a VDSL Lua script. \
+        description = "[gen] Compile and generate images from a VDSL Lua script. \
             Phase 1: Runs the script to compile workflows (vdsl.render) into a temp directory. \
             The script receives VDSL_OUT_DIR env var and writes .json workflow files there. \
             Phase 2: Sends all compiled workflows to ComfyUI via batch generate, \
@@ -3616,7 +3716,22 @@ impl VdslMcpServer {
         }
 
         // --- Phase 2: Generate ---
-        let url = self.resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())?;
+        let url = self
+            .resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())
+            .map_err(|_| {
+                McpError::invalid_params(
+                    format!(
+                        "Compilation succeeded ({} workflow(s)), but no ComfyUI connection for generation.\n\
+                         Options:\n\
+                         • vdsl_pod_setup — start a pod and generate\n\
+                         • vdsl_connect — connect to an existing ComfyUI\n\
+                         • compile_only=true — compile without generating (already compiled {} workflow(s))",
+                        workflow_files.len(),
+                        workflow_files.len(),
+                    ),
+                    None,
+                )
+            })?;
         let client = Self::comfyui_client(url.clone())?;
 
         // Check for pipeline manifest
@@ -3644,6 +3759,42 @@ impl VdslMcpServer {
                 &mut log,
             )
             .await;
+
+            // --- Repository persistence (pipeline mode) ---
+            // Pipeline workflows are not available as TaggedWorkflow here,
+            // so we pass an empty slice (no per-workflow model/seed/recipe).
+            // Recipe sidecar files from out_dir are still loaded if available.
+            let pipe_tagged: Vec<TaggedWorkflow> = scan_json_dir(&out_dir.path().to_string_lossy())
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|p| {
+                    let path = std::path::Path::new(p);
+                    let label = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if label.starts_with('_') {
+                        return None;
+                    }
+                    let data = std::fs::read_to_string(path).ok()?;
+                    let workflow: serde_json::Value = serde_json::from_str(&data).ok()?;
+                    Some(TaggedWorkflow { label, workflow })
+                })
+                .collect();
+            persist_to_repo(
+                &PersistParams {
+                    server: self,
+                    work_dir: &work_dir,
+                    script_label: &script_label,
+                    saved_paths: &pipe_result.saved_paths,
+                    tagged_workflows: &pipe_tagged,
+                    out_dir: Some(out_dir.path()),
+                    labeled_paths: &[],
+                },
+                &mut log,
+            );
 
             if !pipe_result.download_log.is_empty() {
                 log.push(format!(
@@ -3701,15 +3852,14 @@ impl VdslMcpServer {
             )
             .await;
 
-            // Download images
-            let all_images: Vec<&serde_json::Value> = collect_batch_images(&results);
-            let (download_log, saved_paths) = if let Some(ref dir) = req.save_dir {
-                let owned: Vec<serde_json::Value> =
-                    all_images.iter().map(|v| (*v).clone()).collect();
-                let dl = download_images_to_dir(&client, &owned, std::path::Path::new(dir)).await;
-                (dl.log, dl.saved_paths)
+            // Download images (labeled: each path knows its workflow label)
+            let (download_log, saved_paths, labeled_paths) = if let Some(ref dir) = req.save_dir {
+                let dl =
+                    download_batch_images_labeled(&client, &results, std::path::Path::new(dir))
+                        .await;
+                (dl.log, dl.saved_paths, dl.labeled_paths)
             } else {
-                (Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), Vec::new())
             };
 
             // Inject VDSL metadata into downloaded PNGs
@@ -3721,6 +3871,20 @@ impl VdslMcpServer {
                 &mut log,
             )
             .await;
+
+            // --- Repository persistence ---
+            persist_to_repo(
+                &PersistParams {
+                    server: self,
+                    work_dir: &work_dir,
+                    script_label: &script_label,
+                    saved_paths: &saved_paths,
+                    tagged_workflows: &tagged,
+                    out_dir: Some(out_dir.path()),
+                    labeled_paths: &labeled_paths,
+                },
+                &mut log,
+            );
 
             // Summary
             format_batch_summary(&results, &mut log);
@@ -3739,7 +3903,7 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_image_search",
-        description = "Search generated images by PNG metadata (prompt text, model names, VDSL scripts, etc.). \
+        description = "[repo] Search generated images by PNG metadata (prompt text, model names, VDSL scripts, etc.). \
             Uses pngmetagrep to search tEXt chunks embedded in PNG files. \
             Two source modes: \
             (1) source=\"local\": search local directories. \
@@ -3772,7 +3936,15 @@ impl VdslMcpServer {
                 combined_results.extend(results);
             }
             "pod" => {
-                let pod_id = self.resolve_pod_id(req.pod_id.as_deref())?;
+                let pod_id = self.resolve_pod_id(req.pod_id.as_deref()).map_err(|_| {
+                    McpError::invalid_params(
+                        "No pod session for source=\"pod\".\n\
+                         Options:\n\
+                         • vdsl_pod_setup — start a pod first\n\
+                         • source=\"local\" — search local PNG metadata without a pod",
+                        None,
+                    )
+                })?;
                 let results = self.image_search_pod(&req, &pod_id).await?;
                 log.push(format!("pod: {} match(es)", results.len()));
                 combined_results.extend(results);
@@ -3789,7 +3961,11 @@ impl VdslMcpServer {
                         combined_results.extend(pod_results);
                     }
                     Err(_) => {
-                        log.push("pod: skipped (no pod session)".to_string());
+                        log.push(
+                            "pod: skipped (no pod session — use vdsl_pod_setup to enable, \
+                             or source=\"local\" for local-only search)"
+                                .to_string(),
+                        );
                     }
                 }
             }
@@ -3816,7 +3992,359 @@ impl VdslMcpServer {
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
+
+    // =========================================================================
+    // Repository Query
+    // =========================================================================
+
+    #[tool(
+        name = "vdsl_repo_query",
+        description = "[repo] Query the VDSL generation repository. \
+            Returns generation records with optional filters (model, script, workspace, date range). \
+            working_dir must contain lua/ and .vdsl/generations.db.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn repo_query(
+        &self,
+        Parameters(req): Parameters<VdslRepoQueryRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let work_dir = std::path::PathBuf::from(&req.working_dir);
+        let repo = self.get_repo(&work_dir)?;
+
+        let filter = GenerationFilter {
+            model: req.model,
+            script: req.script,
+            workspace: req.workspace,
+            date_from: req.date_from,
+            date_to: req.date_to,
+        };
+
+        let opts = QueryOpts {
+            limit: Some(req.limit.unwrap_or(50)),
+            offset: req.offset,
+        };
+
+        let rows = repo
+            .query_generations(&filter, &opts)
+            .map_err(|e| McpError::internal_error(format!("query failed: {e}"), None))?;
+
+        let mut output = format!("{} generation(s) found\n", rows.len());
+        for row in &rows {
+            output.push_str(&format!(
+                "\n- {} | ws={} script={} model={} seed={} output={}",
+                &row.gen.id[..8],
+                row.workspace_name.as_deref().unwrap_or("-"),
+                row.script.as_deref().unwrap_or("-"),
+                row.gen.model.as_deref().unwrap_or("-"),
+                row.gen
+                    .seed
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                row.gen.output.as_deref().unwrap_or("-"),
+            ));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    // =========================================================================
+    // Repository Stats
+    // =========================================================================
+
+    #[tool(
+        name = "vdsl_repo_stats",
+        description = "[repo] Get statistics from the VDSL generation repository. \
+            Groups by: model, script, workspace, or date. \
+            working_dir must contain lua/ and .vdsl/generations.db.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn repo_stats(
+        &self,
+        Parameters(req): Parameters<VdslRepoStatsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let work_dir = std::path::PathBuf::from(&req.working_dir);
+        let repo = self.get_repo(&work_dir)?;
+
+        let stats: Vec<StatRow> = repo
+            .stats(&req.group_by)
+            .map_err(|e| McpError::internal_error(format!("stats failed: {e}"), None))?;
+
+        let mut output = format!("Stats by {}\n", req.group_by);
+        for row in &stats {
+            output.push_str(&format!("  {}: {}\n", row.group, row.count));
+        }
+        if stats.is_empty() {
+            output.push_str("  (no data)\n");
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    // =========================================================================
+    // Repository Meta Get
+    // =========================================================================
+
+    #[tool(
+        name = "vdsl_repo_meta_get",
+        description = "[repo] Get metadata JSON for a specific generation. \
+            Returns the meta field (arbitrary JSON) stored with the generation record.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn repo_meta_get(
+        &self,
+        Parameters(req): Parameters<VdslRepoMetaGetRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let work_dir = std::path::PathBuf::from(&req.working_dir);
+        let repo = self.get_repo(&work_dir)?;
+
+        let meta = repo
+            .get_meta(&req.generation_id)
+            .map_err(|e| McpError::internal_error(format!("get_meta failed: {e}"), None))?;
+
+        match meta {
+            Some(json) => Ok(CallToolResult::success(vec![Content::text(json)])),
+            None => Ok(CallToolResult::success(vec![Content::text(
+                "null (no metadata or generation not found)",
+            )])),
+        }
+    }
+
+    // =========================================================================
+    // Repository Meta Set
+    // =========================================================================
+
+    #[tool(
+        name = "vdsl_repo_meta_set",
+        description = "[repo] Set metadata JSON for a specific generation. \
+            Replaces any existing meta field. The value must be valid JSON.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn repo_meta_set(
+        &self,
+        Parameters(req): Parameters<VdslRepoMetaSetRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        // Validate JSON
+        serde_json::from_str::<serde_json::Value>(&req.meta)
+            .map_err(|e| McpError::invalid_params(format!("meta is not valid JSON: {e}"), None))?;
+
+        let work_dir = std::path::PathBuf::from(&req.working_dir);
+        let repo = self.get_repo(&work_dir)?;
+
+        repo.set_meta(&req.generation_id, &req.meta)
+            .map_err(|e| McpError::internal_error(format!("set_meta failed: {e}"), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "meta updated for generation {}",
+            &req.generation_id
+        ))]))
+    }
+
+    // =========================================================================
+    // Repository Reindex
+    // =========================================================================
+
+    #[tool(
+        name = "vdsl_repo_reindex",
+        description = "[repo] Rebuild the generation DB by scanning PNGs for embedded VDSL metadata. \
+            Reads 'vdsl' and 'vdsl_meta' tEXt chunks from each PNG. \
+            Skips PNGs without VDSL chunks or already in DB. \
+            scan_dir defaults to 'output/' relative to working_dir.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn repo_reindex(
+        &self,
+        Parameters(req): Parameters<VdslRepoReindexRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let work_dir = std::path::PathBuf::from(&req.working_dir);
+        let scan_dir = req.scan_dir.unwrap_or_else(|| "output/".to_string());
+        let scan_path = work_dir.join(&scan_dir);
+
+        if !scan_path.is_dir() {
+            return Err(McpError::invalid_params(
+                format!("scan_dir does not exist: {}", scan_path.display()),
+                None,
+            ));
+        }
+
+        let repo = self.get_repo(&work_dir)?;
+
+        // Run Lua scanner to extract VDSL metadata from PNGs (NDJSON output)
+        let lua_path = work_dir.join("lua");
+        let output = tokio::process::Command::new("lua")
+            .arg("-e")
+            .arg(VDSL_REINDEX_LUA)
+            .env("VDSL_SCAN_DIR", &scan_path)
+            .env(
+                "LUA_PATH",
+                format!(
+                    "{}/?.lua;{}/?/init.lua",
+                    lua_path.display(),
+                    lua_path.display()
+                ),
+            )
+            .current_dir(&work_dir)
+            .output()
+            .await
+            .map_err(|e| McpError::internal_error(format!("lua spawn failed: {e}"), None))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(McpError::internal_error(
+                format!("reindex lua failed: {stderr}"),
+                None,
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut indexed = 0u32;
+        let mut skipped = 0u32;
+        let mut errors = 0u32;
+
+        for line in stdout.lines() {
+            let record: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => {
+                    errors += 1;
+                    continue;
+                }
+            };
+
+            let gen_id = match record["gen_id"].as_str() {
+                Some(id) => id.to_string(),
+                None => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            // Skip if already in DB
+            if let Ok(Some(_)) = repo.find_generation(&gen_id) {
+                skipped += 1;
+                continue;
+            }
+
+            let filepath = record["filepath"].as_str().unwrap_or("").to_string();
+            let recipe_json = record["recipe"].as_str().map(|s| s.to_string());
+            let meta_json = record["meta"].as_str().map(|s| s.to_string());
+            let seed = record["seed"].as_i64();
+            let model = record["model"].as_str().map(|s| s.to_string());
+            let script = record["script"].as_str().map(|s| s.to_string());
+            let ts = record["ts"].as_str().unwrap_or("").to_string();
+            let run_id = record["run_id"]
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+            // Ensure workspace
+            let ws_name = script
+                .as_deref()
+                .map(derive_workspace_name)
+                .unwrap_or_else(|| "unknown".to_string());
+            let ws = match repo.ensure_workspace(&ws_name) {
+                Ok(ws) => ws,
+                Err(_) => {
+                    errors += 1;
+                    continue;
+                }
+            };
+
+            // Ensure run
+            if repo.find_generation(&run_id).is_err() {
+                let _ = repo.create_run(&ws.id, script.as_deref());
+            }
+
+            let created_at = if ts.is_empty() {
+                chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+            } else {
+                ts
+            };
+
+            let gen = Generation {
+                id: gen_id.clone(),
+                run_id: run_id.clone(),
+                seed,
+                model,
+                output: Some(filepath),
+                created_at,
+                recipe: recipe_json,
+                meta: meta_json.clone(),
+            };
+
+            match repo.save_generation(&gen) {
+                Ok(()) => {
+                    // Also set meta if present
+                    if let Some(ref meta) = meta_json {
+                        let _ = repo.set_meta(&gen_id, meta);
+                    }
+                    indexed += 1;
+                }
+                Err(_) => errors += 1,
+            }
+        }
+
+        let scanned: u32 = indexed + skipped + errors;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "reindex complete: scanned={scanned} indexed={indexed} skipped={skipped} errors={errors}"
+        ))]))
+    }
 }
+
+/// Lua script for reindex: scans PNGs, outputs NDJSON with vdsl metadata.
+const VDSL_REINDEX_LUA: &str = r#"
+local png = require("vdsl.util.png")
+local json = require("vdsl.util.json")
+
+local scan_dir = os.getenv("VDSL_SCAN_DIR")
+if not scan_dir then
+    io.stderr:write("VDSL_SCAN_DIR not set\n")
+    os.exit(1)
+end
+
+local handle = io.popen('find "' .. scan_dir .. '" -name "*.png" -type f 2>/dev/null')
+if not handle then os.exit(0) end
+
+for filepath in handle:lines() do
+    local ok_read, chunks = pcall(png.read_text, filepath)
+    if ok_read and chunks and chunks["vdsl"] then
+        local ok_dec, recipe = pcall(json.decode, chunks["vdsl"])
+        if ok_dec and type(recipe) == "table" and recipe.gen_id then
+            local record = {
+                filepath = filepath,
+                gen_id   = recipe.gen_id,
+                run_id   = recipe.run_id,
+                seed     = recipe.seed,
+                script   = recipe.script,
+                ts       = recipe.ts,
+                model    = recipe.world and recipe.world.model or nil,
+                recipe   = chunks["vdsl"],
+                meta     = chunks["vdsl_meta"],
+            }
+            io.write(json.encode(record) .. "\n")
+        end
+    end
+end
+handle:close()
+"#;
 
 // =============================================================================
 // Image search helpers (pngmetagrep)
@@ -4328,6 +4856,8 @@ fn check_execution_error(status: &serde_json::Value) -> Option<String> {
 struct DownloadResult {
     log: Vec<String>,
     saved_paths: Vec<std::path::PathBuf>,
+    /// Each saved path paired with its originating workflow label.
+    labeled_paths: Vec<(String, std::path::PathBuf)>,
 }
 
 /// Download images to a local directory, returning log lines and saved file paths.
@@ -4353,7 +4883,45 @@ async fn download_images_to_dir(
             Err(e) => log.push(format!("  FAILED: {} — {e}", dest.display())),
         }
     }
-    DownloadResult { log, saved_paths }
+    DownloadResult {
+        log,
+        saved_paths,
+        labeled_paths: Vec::new(),
+    }
+}
+
+/// Download images per-job, preserving the workflow label → saved path association.
+async fn download_batch_images_labeled(
+    client: &ComfyUiClient,
+    results: &[JobResult],
+    save_dir: &std::path::Path,
+) -> DownloadResult {
+    let mut log = Vec::new();
+    let mut saved_paths = Vec::new();
+    let mut labeled_paths = Vec::new();
+    for job in results {
+        for img in &job.images {
+            let filename = match img["filename"].as_str() {
+                Some(f) => f,
+                None => continue,
+            };
+            let subfolder = img["subfolder"].as_str().unwrap_or("");
+            let dest = unique_dest(save_dir, filename);
+            match client.download_image(filename, subfolder, &dest).await {
+                Ok(size) => {
+                    log.push(format!("  saved: {} ({size} bytes)", dest.display()));
+                    labeled_paths.push((job.label.clone(), dest.clone()));
+                    saved_paths.push(dest);
+                }
+                Err(e) => log.push(format!("  FAILED: {} — {e}", dest.display())),
+            }
+        }
+    }
+    DownloadResult {
+        log,
+        saved_paths,
+        labeled_paths,
+    }
 }
 
 /// Extract the primary checkpoint name from a ComfyUI API-format workflow JSON.
@@ -4516,8 +5084,15 @@ async fn scan_json_dir(dir: &str) -> Result<Vec<String>, McpError> {
     {
         let p = entry.path();
         if p.extension().and_then(|s| s.to_str()) == Some("json") {
-            if let Some(s) = p.to_str() {
-                entries.push(s.to_string());
+            // Skip recipe sidecar files (_recipe_*.json)
+            let is_recipe = p
+                .file_name()
+                .and_then(|f| f.to_str())
+                .is_some_and(|f| f.starts_with("_recipe_"));
+            if !is_recipe {
+                if let Some(s) = p.to_str() {
+                    entries.push(s.to_string());
+                }
             }
         }
     }
@@ -4953,6 +5528,221 @@ async fn inject_metadata_if_needed(
             }
         }
     }
+}
+
+// =============================================================================
+// Repository persistence (shared helper)
+// =============================================================================
+
+/// Derive workspace name from script label: "gravure_klimt_p1.lua" → "gravure_klimt".
+fn derive_workspace_name(script_label: &str) -> String {
+    let base = script_label
+        .rsplit('/')
+        .next()
+        .unwrap_or(script_label)
+        .trim_end_matches(".lua");
+    // Take first two underscore-separated segments
+    let parts: Vec<&str> = base.splitn(3, '_').collect();
+    if parts.len() >= 2 {
+        format!("{}_{}", parts[0], parts[1])
+    } else {
+        base.to_string()
+    }
+}
+
+/// Extract model name from a ComfyUI workflow JSON.
+fn extract_model_from_workflow(wf: &serde_json::Value) -> Option<String> {
+    // Walk all nodes looking for CheckpointLoaderSimple or similar
+    if let Some(obj) = wf.as_object() {
+        for (_node_id, node) in obj {
+            if let Some(class) = node.get("class_type").and_then(|v| v.as_str()) {
+                if class.contains("CheckpointLoader") {
+                    if let Some(ckpt) = node.pointer("/inputs/ckpt_name").and_then(|v| v.as_str()) {
+                        return Some(ckpt.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract seed from a ComfyUI workflow JSON.
+fn extract_seed_from_workflow(wf: &serde_json::Value) -> Option<i64> {
+    if let Some(obj) = wf.as_object() {
+        for (_node_id, node) in obj {
+            if let Some(class) = node.get("class_type").and_then(|v| v.as_str()) {
+                if class.contains("KSampler") {
+                    if let Some(seed) = node.pointer("/inputs/seed").and_then(|v| v.as_i64()) {
+                        return Some(seed);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Load recipe JSON from VDSL_OUT_DIR sidecar file.
+/// Looks for `_recipe_{label}.json` in the output directory.
+fn load_recipe(out_dir: &std::path::Path, label: &str) -> Option<String> {
+    let recipe_path = out_dir.join(format!("_recipe_{label}.json"));
+    std::fs::read_to_string(recipe_path).ok()
+}
+
+/// Match a saved image path to a workflow label.
+/// ComfyUI filenames typically contain the filename_prefix from SaveImage.
+/// We try to find which workflow label best matches the image filename.
+fn match_workflow_label<'a>(image_path: &std::path::Path, labels: &'a [String]) -> Option<&'a str> {
+    let filename = image_path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("");
+    // Longest match first (most specific)
+    let mut best: Option<&str> = None;
+    let mut best_len = 0;
+    for label in labels {
+        if filename.contains(label.as_str()) && label.len() > best_len {
+            best = Some(label.as_str());
+            best_len = label.len();
+        }
+    }
+    best
+}
+
+/// Per-workflow metadata: (model, seed, recipe).
+type WorkflowMeta = (Option<String>, Option<i64>, Option<String>);
+
+/// Parameters for repository persistence after a vdsl_run.
+struct PersistParams<'a> {
+    server: &'a VdslMcpServer,
+    work_dir: &'a std::path::Path,
+    script_label: &'a str,
+    saved_paths: &'a [std::path::PathBuf],
+    tagged_workflows: &'a [TaggedWorkflow],
+    out_dir: Option<&'a std::path::Path>,
+    labeled_paths: &'a [(String, std::path::PathBuf)],
+}
+
+fn persist_to_repo(params: &PersistParams<'_>, log: &mut Vec<String>) {
+    if params.saved_paths.is_empty() {
+        return;
+    }
+
+    let repo = match params.server.get_repo(params.work_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            log.push(format!("repo: skipped — {e}"));
+            return;
+        }
+    };
+
+    let ws_name = derive_workspace_name(params.script_label);
+    let ws = match repo.ensure_workspace(&ws_name) {
+        Ok(ws) => ws,
+        Err(e) => {
+            log.push(format!("repo: workspace failed — {e}"));
+            return;
+        }
+    };
+
+    let script_filename = if params.script_label == "<inline>" {
+        None
+    } else {
+        Some(
+            params
+                .script_label
+                .rsplit('/')
+                .next()
+                .unwrap_or(params.script_label),
+        )
+    };
+
+    let run = match repo.create_run(&ws.id, script_filename) {
+        Ok(r) => r,
+        Err(e) => {
+            log.push(format!("repo: run failed — {e}"));
+            return;
+        }
+    };
+
+    // Build per-workflow metadata index: label → (model, seed, recipe)
+    let wf_labels: Vec<String> = params
+        .tagged_workflows
+        .iter()
+        .map(|tw| tw.label.clone())
+        .collect();
+    let wf_meta: std::collections::HashMap<String, WorkflowMeta> = params
+        .tagged_workflows
+        .iter()
+        .map(|tw| {
+            let model = extract_model_from_workflow(&tw.workflow);
+            let seed = extract_seed_from_workflow(&tw.workflow);
+            let recipe = params.out_dir.and_then(|dir| load_recipe(dir, &tw.label));
+            (tw.label.clone(), (model, seed, recipe))
+        })
+        .collect();
+
+    // Build path → label lookup from deterministic labeled_paths
+    let path_to_label: std::collections::HashMap<&std::path::Path, &str> = params
+        .labeled_paths
+        .iter()
+        .map(|(label, path)| (path.as_path(), label.as_str()))
+        .collect();
+
+    let fallback: WorkflowMeta = wf_meta
+        .values()
+        .next()
+        .cloned()
+        .unwrap_or((None, None, None));
+
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let mut saved_count = 0u32;
+    let mut recipe_count = 0u32;
+
+    for path in params.saved_paths {
+        // 1. Deterministic: use labeled_paths mapping (flat batch)
+        // 2. Heuristic: filename matching (pipeline mode fallback)
+        let label = path_to_label
+            .get(path.as_path())
+            .copied()
+            .or_else(|| match_workflow_label(path, &wf_labels));
+
+        let (model, seed, recipe) = label
+            .and_then(|l| wf_meta.get(l).cloned())
+            .unwrap_or_else(|| fallback.clone());
+
+        if recipe.is_some() {
+            recipe_count += 1;
+        }
+
+        let gen = Generation {
+            id: uuid::Uuid::new_v4().to_string(),
+            run_id: run.id.clone(),
+            seed,
+            model,
+            output: Some(path.to_string_lossy().to_string()),
+            created_at: now.clone(),
+            recipe,
+            meta: None,
+        };
+        match repo.save_generation(&gen) {
+            Ok(()) => saved_count += 1,
+            Err(e) => {
+                log.push(format!("repo: gen save failed — {e}"));
+            }
+        }
+    }
+
+    log.push(format!(
+        "\nrepo: ws={} run={} saved={}/{} recipe={}/{}",
+        ws_name,
+        &run.id[..8],
+        saved_count,
+        params.saved_paths.len(),
+        recipe_count,
+        params.saved_paths.len(),
+    ));
 }
 
 // =============================================================================
@@ -7137,5 +7927,127 @@ mod tests {
         let args = vec!["echo".to_string(), "it's a test".to_string()];
         let escaped = shell_escape_args(&args);
         assert!(escaped.contains("it'\\''s a test"));
+    }
+
+    #[test]
+    fn derive_workspace_name_two_segments() {
+        assert_eq!(
+            derive_workspace_name("gravure_klimt_p1.lua"),
+            "gravure_klimt"
+        );
+    }
+
+    #[test]
+    fn derive_workspace_name_with_path() {
+        assert_eq!(
+            derive_workspace_name("examples/gravure_klimt_p1.lua"),
+            "gravure_klimt"
+        );
+    }
+
+    #[test]
+    fn derive_workspace_name_single_segment() {
+        assert_eq!(derive_workspace_name("simple.lua"), "simple");
+    }
+
+    #[test]
+    fn derive_workspace_name_inline() {
+        assert_eq!(derive_workspace_name("<inline>"), "<inline>");
+    }
+
+    #[test]
+    fn extract_model_from_workflow_found() {
+        let wf = serde_json::json!({
+            "4": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {
+                    "ckpt_name": "waiANIMIXV13_v13.safetensors"
+                }
+            }
+        });
+        assert_eq!(
+            extract_model_from_workflow(&wf),
+            Some("waiANIMIXV13_v13.safetensors".into())
+        );
+    }
+
+    #[test]
+    fn extract_seed_from_workflow_found() {
+        let wf = serde_json::json!({
+            "3": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "seed": 12345,
+                    "steps": 20
+                }
+            }
+        });
+        assert_eq!(extract_seed_from_workflow(&wf), Some(12345));
+    }
+
+    #[test]
+    fn extract_seed_from_workflow_missing() {
+        let wf = serde_json::json!({
+            "3": {
+                "class_type": "CLIPTextEncode",
+                "inputs": { "text": "hello" }
+            }
+        });
+        assert_eq!(extract_seed_from_workflow(&wf), None);
+    }
+
+    #[test]
+    fn extract_model_from_workflow_missing() {
+        let wf = serde_json::json!({
+            "3": {
+                "class_type": "KSampler",
+                "inputs": { "seed": 1 }
+            }
+        });
+        assert_eq!(extract_model_from_workflow(&wf), None);
+    }
+
+    #[test]
+    fn match_workflow_label_exact() {
+        let labels = vec!["gothic_lolita".to_string(), "cyberpunk".to_string()];
+        let path = std::path::Path::new("output/gothic_lolita_00001_.png");
+        assert_eq!(match_workflow_label(path, &labels), Some("gothic_lolita"));
+    }
+
+    #[test]
+    fn match_workflow_label_longest_wins() {
+        let labels = vec!["cyber".to_string(), "cyberpunk_neon".to_string()];
+        let path = std::path::Path::new("output/cyberpunk_neon_00003_.png");
+        assert_eq!(match_workflow_label(path, &labels), Some("cyberpunk_neon"));
+    }
+
+    #[test]
+    fn match_workflow_label_no_match() {
+        let labels = vec!["gothic".to_string(), "cyber".to_string()];
+        let path = std::path::Path::new("output/fantasy_00001_.png");
+        assert_eq!(match_workflow_label(path, &labels), None);
+    }
+
+    #[test]
+    fn match_workflow_label_empty_labels() {
+        let labels: Vec<String> = vec![];
+        let path = std::path::Path::new("output/test_00001_.png");
+        assert_eq!(match_workflow_label(path, &labels), None);
+    }
+
+    #[test]
+    fn load_recipe_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let recipe_content = r#"{"world":{"model":"test.safetensors"}}"#;
+        std::fs::write(dir.path().join("_recipe_gothic.json"), recipe_content).unwrap();
+        let result = load_recipe(dir.path(), "gothic");
+        assert_eq!(result, Some(recipe_content.to_string()));
+    }
+
+    #[test]
+    fn load_recipe_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = load_recipe(dir.path(), "nonexistent");
+        assert_eq!(result, None);
     }
 }
