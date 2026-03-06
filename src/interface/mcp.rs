@@ -867,16 +867,30 @@ const VDSL_PACKAGE_PATH: &str = "lua/?.lua;lua/?/init.lua;scripts/?.lua;";
 
 /// Lua execution backend selector.
 ///
-/// `Process` spawns an external `lua` CLI process (default, always available).
+/// `Process` spawns an external `lua` CLI process (always available).
 /// `Mlua` runs Lua in-process via mlua-isle (requires `mlua-backend` feature).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+///
+/// Default: `Mlua` when built with `mlua-backend` feature, `Process` otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum LuaBackend {
-    /// External lua process (default).
-    #[default]
+    /// External lua process.
     Process,
     /// In-process mlua VM via mlua-isle.
     Mlua,
+}
+
+impl Default for LuaBackend {
+    fn default() -> Self {
+        #[cfg(feature = "mlua-backend")]
+        {
+            Self::Mlua
+        }
+        #[cfg(not(feature = "mlua-backend"))]
+        {
+            Self::Process
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -945,8 +959,7 @@ pub struct VdslRunScriptRequest {
     /// Timeout in seconds (default: 600).
     pub timeout: Option<u64>,
 
-    /// Lua execution backend: "process" (default) or "mlua" (in-process).
-    /// "mlua" requires the mlua-backend feature to be enabled at build time.
+    /// Lua execution backend: "process" or "mlua" (default when mlua-backend feature enabled).
     #[serde(default)]
     pub backend: LuaBackend,
 }
@@ -968,7 +981,7 @@ pub struct VdslCatalogsRequest {
     /// Maximum output lines to return (default: 200).
     pub limit: Option<usize>,
 
-    /// Lua execution backend: "process" (default) or "mlua" (in-process).
+    /// Lua execution backend: "process" or "mlua" (default when mlua-backend feature enabled).
     #[serde(default)]
     pub backend: LuaBackend,
 }
@@ -1280,7 +1293,7 @@ pub struct VdslRunRequest {
     /// The value is injected as `VDSL_JUDGE_RESULT` env var for the Lua compiler.
     pub judge_result: Option<serde_json::Value>,
 
-    /// Lua execution backend: "process" (default) or "mlua" (in-process).
+    /// Lua execution backend: "process" or "mlua" (default when mlua-backend feature enabled).
     #[serde(default)]
     pub backend: LuaBackend,
 }
@@ -5464,7 +5477,7 @@ async fn inject_vdsl_metadata(
         work_dir,
         VDSL_INJECT_TIMEOUT_SECS,
         &[("VDSL_INJECT_MANIFEST", &manifest_path)],
-        &LuaBackend::Process,
+        &LuaBackend::default(),
     )
     .await
     .map_err(|e| format!("{e}"))?;
