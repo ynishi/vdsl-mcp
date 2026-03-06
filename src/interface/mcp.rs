@@ -27,6 +27,8 @@ use crate::domain::models::{format_model_catalog_with_limit, parse_model_catalog
 use crate::domain::pod::{format_pod_list, format_volume_list};
 use crate::domain::repository::{Generation, GenerationFilter, QueryOpts, Repository, StatRow};
 use crate::infra::comfyui_client::{proxy_url, ComfyUiClient};
+#[cfg(feature = "mlua-backend")]
+use crate::infra::mlua_runtime::MluaRuntime;
 use crate::infra::runpod_cli::RunPodCli;
 use crate::infra::sqlite::SqliteRepository;
 
@@ -891,6 +893,20 @@ const SCRIPT_TIMEOUT_SECS: u64 = 600;
 /// Lua package.path prefix for VDSL module resolution.
 const VDSL_PACKAGE_PATH: &str = "lua/?.lua;lua/?/init.lua;scripts/?.lua;";
 
+/// Lua execution backend selector.
+///
+/// `Process` spawns an external `lua` CLI process (default, always available).
+/// `Mlua` runs Lua in-process via mlua-isle (requires `mlua-backend` feature).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LuaBackend {
+    /// External lua process (default).
+    #[default]
+    Process,
+    /// In-process mlua VM via mlua-isle.
+    Mlua,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VdslGenerateRequest {
     /// ComfyUI URL (e.g. "https://pod_id-8188.proxy.runpod.net") or RunPod pod ID.
@@ -956,6 +972,11 @@ pub struct VdslRunScriptRequest {
 
     /// Timeout in seconds (default: 600).
     pub timeout: Option<u64>,
+
+    /// Lua execution backend: "process" (default) or "mlua" (in-process).
+    /// "mlua" requires the mlua-backend feature to be enabled at build time.
+    #[serde(default)]
+    pub backend: LuaBackend,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -974,6 +995,10 @@ pub struct VdslCatalogsRequest {
 
     /// Maximum output lines to return (default: 200).
     pub limit: Option<usize>,
+
+    /// Lua execution backend: "process" (default) or "mlua" (in-process).
+    #[serde(default)]
+    pub backend: LuaBackend,
 }
 
 const DEFAULT_CATALOG_SCRIPT: &str = "scripts/catalog_available.lua";
@@ -1282,6 +1307,10 @@ pub struct VdslRunRequest {
     /// Format: `{ "<pass_name>": { "survivors": ["suffix1", "suffix2"] } }`
     /// The value is injected as `VDSL_JUDGE_RESULT` env var for the Lua compiler.
     pub judge_result: Option<serde_json::Value>,
+
+    /// Lua execution backend: "process" (default) or "mlua" (in-process).
+    #[serde(default)]
+    pub backend: LuaBackend,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1499,10 +1528,7 @@ impl VdslMcpServer {
         );
         spec.insert("ports".into(), serde_json::json!(["8188/http", "22/tcp"]));
         if let Some(vol) = req.volume_id {
-            spec.insert(
-                "networkVolumeId".into(),
-                serde_json::Value::String(vol),
-            );
+            spec.insert("networkVolumeId".into(), serde_json::Value::String(vol));
         }
 
         if let Some(gpu) = req.gpu {
@@ -1669,53 +1695,54 @@ impl VdslMcpServer {
         let is_ephemeral = req.ephemeral;
 
         // --- 1. Resolve volume_id (skip for ephemeral) ---
-        let volume_id: Option<String> = if is_ephemeral {
-            log.push("Ephemeral mode: skipping network volume.".to_string());
-            None
-        } else {
-            Some(match req.volume_id {
-                Some(v) => v,
-                None => {
-                    let volumes = svc.list_volumes().await.map_err(Self::to_mcp_error)?;
-                    match volumes.len() {
-                        0 => {
-                            return Err(McpError::invalid_params(
+        let volume_id: Option<String> =
+            if is_ephemeral {
+                log.push("Ephemeral mode: skipping network volume.".to_string());
+                None
+            } else {
+                Some(match req.volume_id {
+                    Some(v) => v,
+                    None => {
+                        let volumes = svc.list_volumes().await.map_err(Self::to_mcp_error)?;
+                        match volumes.len() {
+                            0 => return Err(McpError::invalid_params(
                                 "no network volumes found. Create one first via RunPod dashboard, \
                                  or use ephemeral=true for a disposable pod.",
                                 None,
-                            ))
-                        }
-                        1 => {
-                            let id = volumes[0]["id"]
-                                .as_str()
-                                .ok_or_else(|| {
-                                    McpError::invalid_params("volume has no id field", None)
-                                })?
-                                .to_string();
-                            log.push(format!("Auto-detected volume: {id}"));
-                            id
-                        }
-                        n => {
-                            let list = format_volume_list(&volumes);
-                            return Err(McpError::invalid_params(
-                                format!(
-                                    "{n} volumes found — specify volume_id explicitly, \
+                            )),
+                            1 => {
+                                let id = volumes[0]["id"]
+                                    .as_str()
+                                    .ok_or_else(|| {
+                                        McpError::invalid_params("volume has no id field", None)
+                                    })?
+                                    .to_string();
+                                log.push(format!("Auto-detected volume: {id}"));
+                                id
+                            }
+                            n => {
+                                let list = format_volume_list(&volumes);
+                                return Err(McpError::invalid_params(
+                                    format!(
+                                        "{n} volumes found — specify volume_id explicitly, \
                                      or use ephemeral=true.\n\n{list}"
-                                ),
-                                None,
-                            ));
+                                    ),
+                                    None,
+                                ));
+                            }
                         }
                     }
-                }
-            })
-        };
+                })
+            };
 
         // --- 2. Find existing pod (skip for ephemeral — always create new) ---
         let mut pod_id: String = String::new();
         let mut needs_create = is_ephemeral;
 
         if !is_ephemeral {
-            let vol_id = volume_id.as_deref().expect("volume_id resolved for non-ephemeral");
+            let vol_id = volume_id
+                .as_deref()
+                .expect("volume_id resolved for non-ephemeral");
             let pods = svc.list_pods().await.map_err(Self::to_mcp_error)?;
             let candidate = pods.iter().find(|p| {
                 let name_match = p["name"].as_str() == Some(COMFY_DEFAULTS_NAME);
@@ -2504,7 +2531,7 @@ impl VdslMcpServer {
             None
         };
 
-        let result = exec_lua(&lua_args, &work_dir, timeout, &[]).await?;
+        let result = exec_lua(&lua_args, &work_dir, timeout, &[], &req.backend).await?;
 
         let mut response = format!(
             "script: {script_label}\nworking_dir: {}\nexit_code: {}",
@@ -2582,7 +2609,7 @@ impl VdslMcpServer {
         }
 
         let lua_args = vec![script.to_string_lossy().to_string()];
-        let result = exec_lua(&lua_args, &work_dir, 30, &envs).await?;
+        let result = exec_lua(&lua_args, &work_dir, 30, &envs, &req.backend).await?;
 
         if result.exit_code != 0 {
             let mut msg = format!("catalog script failed (exit {})", result.exit_code);
@@ -3724,7 +3751,7 @@ impl VdslMcpServer {
             envs.push(("VDSL_JUDGE_RESULT", json_str.as_str()));
         }
 
-        let lua_result = exec_lua(&lua_args, &work_dir, timeout, &envs).await?;
+        let lua_result = exec_lua(&lua_args, &work_dir, timeout, &envs, &req.backend).await?;
 
         // Collect script output for reporting
         let mut log = Vec::<String>::new();
@@ -3825,6 +3852,37 @@ impl VdslMcpServer {
                 )
             })?;
         let client = Self::comfyui_client(url.clone())?;
+
+        // --- Preflight: check required models/nodes before submitting ---
+        // Scope: model file existence + node type availability only.
+        // Does NOT catch node wiring errors, parameter type/range issues,
+        // or missing output nodes — those are validated by ComfyUI's /prompt endpoint.
+        // Note: fetches /object_info each time (a few hundred ms). Caching is a
+        // future optimisation if this becomes a bottleneck.
+        {
+            let mut wf_values = Vec::with_capacity(workflow_files.len());
+            for path in &workflow_files {
+                let tagged = load_tagged_workflow(path).await?;
+                wf_values.push(tagged.workflow);
+            }
+            let required = crate::domain::models::extract_required_models(&wf_values);
+            if !required.is_empty() {
+                let object_info = client.object_info().await.map_err(Self::to_mcp_error)?;
+                let catalog = crate::domain::models::parse_model_catalog(&object_info);
+                let missing = crate::domain::models::check_missing(&required, &catalog);
+                if !missing.is_empty() {
+                    let report =
+                        crate::domain::models::format_preflight_report(&required, &missing);
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "Preflight FAILED — aborting generation.\n\n{report}\
+                             Fix missing models/nodes before running again."
+                        ),
+                        None,
+                    ));
+                }
+            }
+        }
 
         // Check for pipeline manifest
         let pipeline_path = out_dir.path().join("_pipeline.json");
@@ -4831,9 +4889,115 @@ struct LuaExecResult {
     stderr: String,
 }
 
-/// Execute a Lua script with VDSL package.path setup.
-/// Extra environment variables can be injected via `envs`.
+/// Execute Lua code via the specified backend.
+///
+/// For `LuaBackend::Process`, spawns an external `lua` process (original behaviour).
+/// For `LuaBackend::Mlua`, runs in-process via mlua-isle (requires `mlua-backend` feature).
 async fn exec_lua(
+    lua_args: &[String],
+    work_dir: &std::path::Path,
+    timeout_secs: u64,
+    envs: &[(&str, &str)],
+    backend: &LuaBackend,
+) -> Result<LuaExecResult, McpError> {
+    match backend {
+        LuaBackend::Process => exec_lua_process(lua_args, work_dir, timeout_secs, envs).await,
+        LuaBackend::Mlua => {
+            #[cfg(feature = "mlua-backend")]
+            {
+                exec_lua_mlua(lua_args, work_dir, envs).await
+            }
+            #[cfg(not(feature = "mlua-backend"))]
+            {
+                Err(McpError::invalid_params(
+                    "mlua backend requested but vdsl-mcp was built without the 'mlua-backend' feature",
+                    None,
+                ))
+            }
+        }
+    }
+}
+
+/// Execute Lua via mlua-isle in-process VM.
+#[cfg(feature = "mlua-backend")]
+async fn exec_lua_mlua(
+    lua_args: &[String],
+    work_dir: &std::path::Path,
+    envs: &[(&str, &str)],
+) -> Result<LuaExecResult, McpError> {
+    let work_dir = work_dir.to_path_buf();
+    let envs: Vec<(String, String)> = envs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let lua_args = lua_args.to_vec();
+
+    // Run on blocking thread to avoid blocking the async runtime
+    tokio::task::spawn_blocking(move || {
+        let runtime = MluaRuntime::new(&work_dir)?;
+
+        // Reconstruct the code to execute from lua_args.
+        // lua_args patterns:
+        //   ["-e", "<code>"]           — inline code
+        //   ["<script_path>"]          — script file
+        //   ["-e", "<code>", ...]      — code with extra args
+        let (code, is_file) = parse_lua_args_to_code(&lua_args)?;
+
+        let env_refs: Vec<(&str, &str)> =
+            envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+        let result = if is_file {
+            // Inject env vars, then dofile
+            let mut preamble = String::new();
+            for (k, v) in &env_refs {
+                let escaped = v.replace('\\', "\\\\").replace('\'', "\\'");
+                preamble.push_str(&format!("{k} = '{escaped}'\n"));
+            }
+            preamble.push_str(&format!(
+                "dofile('{}')",
+                code.replace('\\', "\\\\").replace('\'', "\\'")
+            ));
+            runtime.exec_code(&preamble)?
+        } else {
+            runtime.exec_code_with_env(&code, &env_refs)?
+        };
+
+        // Shutdown the VM
+        let _ = runtime.shutdown();
+
+        Ok(LuaExecResult {
+            exit_code: result.exit_code,
+            stdout: result.stdout,
+            stderr: result.stderr,
+        })
+    })
+    .await
+    .map_err(|e| McpError::internal_error(format!("mlua task join failed: {e}"), None))?
+}
+
+/// Parse lua CLI args into code string for mlua execution.
+///
+/// Returns `(code_or_path, is_file)`.
+#[cfg(feature = "mlua-backend")]
+fn parse_lua_args_to_code(lua_args: &[String]) -> Result<(String, bool), McpError> {
+    if lua_args.is_empty() {
+        return Err(McpError::invalid_params("no lua arguments provided", None));
+    }
+
+    if lua_args[0] == "-e" {
+        // Inline code: lua -e "code"
+        if lua_args.len() < 2 {
+            return Err(McpError::invalid_params("missing code after -e", None));
+        }
+        Ok((lua_args[1].clone(), false))
+    } else {
+        // Script file path
+        Ok((lua_args[0].clone(), true))
+    }
+}
+
+/// Execute a Lua script via external process with VDSL package.path setup.
+async fn exec_lua_process(
     lua_args: &[String],
     work_dir: &std::path::Path,
     timeout_secs: u64,
@@ -5916,6 +6080,7 @@ async fn inject_vdsl_metadata(
         work_dir,
         VDSL_INJECT_TIMEOUT_SECS,
         &[("VDSL_INJECT_MANIFEST", &manifest_path)],
+        &LuaBackend::Process,
     )
     .await
     .map_err(|e| format!("{e}"))?;
@@ -6414,8 +6579,7 @@ mod tests {
 
     #[test]
     fn pod_setup_request_ephemeral() {
-        let req: VdslPodSetupRequest =
-            serde_json::from_str(r#"{"ephemeral":true}"#).unwrap();
+        let req: VdslPodSetupRequest = serde_json::from_str(r#"{"ephemeral":true}"#).unwrap();
         assert!(req.ephemeral);
         assert!(req.volume_id.is_none());
     }
