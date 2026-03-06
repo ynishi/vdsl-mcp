@@ -402,7 +402,7 @@ const SETUP_TIMEOUT_SECS: u64 = 300;
 const SETUP_POLL_INTERVAL_SECS: u64 = 10;
 
 /// Default SSH key path for RunPod pods.
-const DEFAULT_SSH_KEY: &str = "~/.ssh/id_ed25519_runpod";
+const DEFAULT_SSH_KEY: &str = "~/.ssh/id_ed25519";
 /// Base path for ComfyUI on RunPod pods.
 const COMFYUI_BASE: &str = "/workspace/runpod-slim/ComfyUI";
 /// Base path for ComfyUI models on RunPod pods.
