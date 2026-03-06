@@ -18,33 +18,61 @@ mod inner {
     /// to Lua as the DB Connection Provider primitive.
     struct DbConnection(Mutex<rusqlite::Connection>);
 
+    /// Extract params from a Lua table with `.n` field (table.pack result).
+    /// Handles nil holes correctly by iterating 1..=n explicitly.
+    fn extract_params_from_table(tbl: &LuaTable) -> Result<Vec<LuaValue>, LuaError> {
+        let n: usize = tbl.get::<usize>("n").unwrap_or(0);
+        let mut params = Vec::with_capacity(n);
+        for i in 1..=n {
+            params.push(tbl.get::<LuaValue>(i)?);
+        }
+        Ok(params)
+    }
+
     impl LuaUserData for DbConnection {
         fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
-            // exec: INSERT/UPDATE/DELETE/CREATE — returns affected row count
+            // exec: DDL/DML execution
+            // No params → execute_batch (supports PRAGMA, multi-statement, DDL)
+            // With params → execute (single parameterized DML)
             methods.add_method(
                 "exec",
-                |_lua, this, (sql, params): (String, Option<Vec<LuaValue>>)| {
+                |_lua, this, (sql, params): (String, Option<LuaTable>)| {
                     let conn = this
                         .0
                         .lock()
                         .map_err(|e| LuaError::external(e.to_string()))?;
-                    let params = lua_values_to_rusqlite(&params.unwrap_or_default())?;
-                    let affected = conn
-                        .execute(&sql, rusqlite::params_from_iter(params.iter()))
-                        .map_err(|e| LuaError::external(e.to_string()))?;
-                    Ok(affected as i64)
+                    let lua_vals = match &params {
+                        Some(tbl) => extract_params_from_table(tbl)?,
+                        None => vec![],
+                    };
+                    if lua_vals.is_empty() {
+                        conn.execute_batch(&sql)
+                            .map_err(|e| LuaError::external(e.to_string()))?;
+                        Ok(0i64)
+                    } else {
+                        let params = lua_values_to_rusqlite(&lua_vals)?;
+                        let affected = conn
+                            .execute(&sql, rusqlite::params_from_iter(params.iter()))
+                            .map_err(|e| LuaError::external(e.to_string()))?;
+                        Ok(affected as i64)
+                    }
                 },
             );
 
             // query: SELECT — returns array of tables
+            // Accepts params as table.pack() result (table with .n field)
             methods.add_method(
                 "query",
-                |lua, this, (sql, params): (String, Option<Vec<LuaValue>>)| {
+                |lua, this, (sql, params): (String, Option<LuaTable>)| {
                     let conn = this
                         .0
                         .lock()
                         .map_err(|e| LuaError::external(e.to_string()))?;
-                    let params = lua_values_to_rusqlite(&params.unwrap_or_default())?;
+                    let lua_vals = match &params {
+                        Some(tbl) => extract_params_from_table(tbl)?,
+                        None => vec![],
+                    };
+                    let params = lua_values_to_rusqlite(&lua_vals)?;
                     let mut stmt = conn
                         .prepare(&sql)
                         .map_err(|e| LuaError::external(e.to_string()))?;
@@ -329,9 +357,10 @@ mod inner {
                 )?;
                 lua.globals().set("db", db_table)?;
 
-                // 6. PNG metadata backend — png.read_chunks(path, keys?) -> table
-                //    Uses pngmetagrep-core for fast tEXt chunk extraction.
-                //    Write is not yet implemented (requires png crate encoder).
+                // 6. PNG metadata primitives (Rust globals)
+                //    png.read_chunks(path, keys?) -> table
+                //    png.write_chunk(path, keyword, text) -> boolean
+                //    png.read_text_raw(path) -> table  (raw strings, no JSON decode)
                 let png_table = lua.create_table()?;
                 png_table.set(
                     "read_chunks",
@@ -346,7 +375,6 @@ mod inner {
                         let result = lua.create_table()?;
                         if let Some(meta) = meta {
                             for (keyword, value) in &meta.chunks {
-                                // Value is serde_json::Value — convert to Lua
                                 let lua_val = json_value_to_lua(lua, value)?;
                                 result.set(keyword.as_str(), lua_val)?;
                             }
@@ -354,7 +382,98 @@ mod inner {
                         Ok(result)
                     })?,
                 )?;
+                png_table.set(
+                    "read_text_raw",
+                    lua.create_function(|lua, path: String| {
+                        let chunks = pngmeta::read_text_chunks(std::path::Path::new(&path))
+                            .map_err(|e| LuaError::external(e.to_string()))?;
+                        let result = lua.create_table()?;
+                        for (keyword, text) in &chunks {
+                            result.set(keyword.as_str(), text.as_str())?;
+                        }
+                        Ok(result)
+                    })?,
+                )?;
+                png_table.set(
+                    "write_chunk",
+                    lua.create_function(|_lua, (path, keyword, text): (String, String, String)| {
+                        pngmeta::write_text_chunk(
+                            std::path::Path::new(&path),
+                            &keyword,
+                            &text,
+                        )
+                        .map_err(|e| LuaError::external(e.to_string()))?;
+                        Ok(true)
+                    })?,
+                )?;
                 lua.globals().set("png", png_table)?;
+
+                // 7. Bridge png primitives → vdsl.runtime.png via set_backend
+                //    DI interface: read_text, inject_text, inject_text_to
+                let png_bridge_code = r#"
+                    local ok, png_mod = pcall(require, "vdsl.runtime.png")
+                    if ok and png_mod and png_mod.set_backend then
+                        local rust_png = png        -- Rust global
+                        local rust_fs  = std.fs     -- for inject_text_to copy
+
+                        png_mod.set_backend({
+                            read_text = function(path)
+                                local ok2, result = pcall(rust_png.read_text_raw, path)
+                                if not ok2 then return nil, tostring(result) end
+                                -- empty table → nil (no chunks found)
+                                if not next(result) then return nil end
+                                return result
+                            end,
+
+                            inject_text = function(path, chunks)
+                                for keyword, text in pairs(chunks) do
+                                    local wok, werr = pcall(rust_png.write_chunk, path, keyword, tostring(text))
+                                    if not wok then return false, tostring(werr) end
+                                end
+                                return true
+                            end,
+
+                            inject_text_to = function(src, dst, chunks)
+                                rust_fs.copy(src, dst)
+                                for keyword, text in pairs(chunks) do
+                                    local wok, werr = pcall(rust_png.write_chunk, dst, keyword, tostring(text))
+                                    if not wok then return false, tostring(werr) end
+                                end
+                                return true
+                            end,
+                        })
+                    end
+                "#;
+                lua.load(png_bridge_code).exec()?;
+
+                // 8. Bridge db global → vdsl.runtime.db via set_backend
+                //    Backend interface: { open(path) -> conn }
+                //    conn: exec(sql, packed_params?), query(sql, packed_params?), close()
+                //    packed_params = table.pack(...) result with .n field
+                let db_bridge_code = r#"
+                    local ok, db_mod = pcall(require, "vdsl.runtime.db")
+                    if ok and db_mod and db_mod.set_backend then
+                        local rust_db = db  -- Rust global
+
+                        db_mod.set_backend({
+                            open = function(path)
+                                local raw = rust_db.open(path)
+                                return {
+                                    exec = function(self, sql, packed_params)
+                                        raw:exec(sql, packed_params)
+                                    end,
+                                    query = function(self, sql, packed_params)
+                                        return raw:query(sql, packed_params)
+                                    end,
+                                    close = function(self)
+                                        raw:close()
+                                    end,
+                                }
+                            end,
+                        })
+                    end
+                "#;
+                lua.load(db_bridge_code).exec()?;
 
                 Ok(())
             })

@@ -961,11 +961,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
-name = "pngmetagrep-core"
-version = "0.1.3"
+name = "pngmeta"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea9333ce3dc0bfc64211396506601ccfadc1d93b542b8da698a5e70ea54ff212"
+checksum = "fd783c04870488800f21ddac790e5e167f8b8612fed528ce873cda976c6476c5"
 dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "pngmetagrep-core"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "372f44a6b4c7065c60f78b5cf560f431b0fa0ee0e4814524fcc560e1c4c1c05a"
+dependencies = [
+ "pngmeta",
+ "regex",
  "serde_json",
 ]
 
@@ -1132,6 +1143,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "regex"
+version = "1.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e10754a14b9137dd7b1e3e5b0493cc9171fdd105e0ab477f51b72e7f3ac0e276"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -1829,6 +1852,7 @@ dependencies = [
  "mlua",
  "mlua-batteries",
  "mlua-isle",
+ "pngmeta",
  "pngmetagrep-core",
  "reqwest",
  "rmcp",
