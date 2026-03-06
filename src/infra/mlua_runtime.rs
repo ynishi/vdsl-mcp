@@ -19,6 +19,7 @@
 //! | 3 | DB | `rusqlite` UserData | `runtime/db.lua` | `open(path) -> conn { exec(sql,params), query(sql,params), close() }` |
 //! | 4 | PNG | `pngmetagrep-core` + `pngmeta` | `runtime/png.lua` | `read_text(path), inject_text(path,chunks), inject_text_to(src,dst,chunks)` |
 //! | 5 | Registry | `std.http` + `std.json` | `runtime/registry.lua` | `fetch_object_info(url, headers) -> table` |
+//! | 6 | Emit | `std.fs` (via bridge) | `runtime/emit.lua` | `write(name, json_str) -> bool, write_recipe(name, recipe_json)` |
 //!
 //! # VM Initialization Sequence (`MluaRuntime::new`)
 //!
@@ -31,7 +32,8 @@
 //! 7. PNG bridge: globals -> `runtime/png.set_backend()`
 //! 8. DB bridge: globals -> `runtime/db.set_backend()`
 //! 9. Registry bridge: `std.http` + `std.json` -> `runtime/registry.set_backend()`
-//! 10. `os.getenv` wrapper: `_injected_env` table takes priority, falls back to real `os.getenv`
+//! 10. Emit bridge: `std.fs` -> `runtime/emit.set_backend()`
+//! 11. `os.getenv` wrapper: `_injected_env` table takes priority, falls back to real `os.getenv`
 //!
 //! # Environment Variable Injection
 //!
@@ -544,7 +546,69 @@ mod inner {
                 "#;
                 lua.load(registry_bridge_code).exec()?;
 
-                // 10. os.getenv wrapper — injected env vars override real env
+                // 10. Bridge std.fs → vdsl.runtime.emit via set_backend
+                //     Emit backend reuses the already-bridged runtime/fs for file writes.
+                //     The default backend in emit.lua uses os.getenv("VDSL_OUT_DIR") +
+                //     runtime/fs.write, which already goes through the Rust FS backend.
+                //     Explicit bridge ensures the DI chain is initialized in the correct order.
+                let emit_bridge_code = r#"
+                    local ok, emit_mod = pcall(require, "vdsl.runtime.emit")
+                    if ok and emit_mod and emit_mod.set_backend then
+                        local rust_fs = std.fs
+
+                        -- Reject path-traversal characters in name
+                        local function safe_name(name)
+                            if type(name) ~= "string" or name == "" then return nil end
+                            if name:find("%.%.") or name:find("/") or name:find("\\") then
+                                return nil
+                            end
+                            return name
+                        end
+
+                        emit_mod.set_backend({
+                            write = function(name, json_str)
+                                local sname = safe_name(name)
+                                if not sname then
+                                    io.stderr:write("emit.write: invalid name (path traversal rejected)\n")
+                                    return false
+                                end
+                                local out_dir = os.getenv("VDSL_OUT_DIR")
+                                if not out_dir then return false end
+                                local path = out_dir .. "/" .. sname .. ".json"
+                                local w_ok, w_err = pcall(rust_fs.write, path, json_str)
+                                if not w_ok then
+                                    io.stderr:write(string.format(
+                                        "emit.write: cannot write '%s': %s\n",
+                                        path, tostring(w_err)))
+                                    return false
+                                end
+                                return true
+                            end,
+
+                            write_recipe = function(name, recipe_json)
+                                local sname = safe_name(name)
+                                if not sname then
+                                    io.stderr:write("emit.write_recipe: invalid name (path traversal rejected)\n")
+                                    return false
+                                end
+                                local out_dir = os.getenv("VDSL_OUT_DIR")
+                                if not out_dir then return false end
+                                local rpath = out_dir .. "/_recipe_" .. sname .. ".json"
+                                local w_ok, w_err = pcall(rust_fs.write, rpath, recipe_json)
+                                if not w_ok then
+                                    io.stderr:write(string.format(
+                                        "emit.write_recipe: cannot write '%s': %s\n",
+                                        rpath, tostring(w_err)))
+                                    return false
+                                end
+                                return true
+                            end,
+                        })
+                    end
+                "#;
+                lua.load(emit_bridge_code).exec()?;
+
+                // 11. os.getenv wrapper — injected env vars override real env
                 //    _injected_env is populated by exec_code_with_env preamble
                 let getenv_wrapper = r#"
                     _injected_env = {}

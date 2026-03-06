@@ -155,7 +155,7 @@ impl VdslMcpServer {
                 match guard.as_deref() {
                     Some(url) => Ok(url.to_string()),
                     None => Err(McpError::invalid_params(
-                        "No ComfyUI connection. Use vdsl_pod_setup or vdsl_connect first.\n\n\
+                        "No ComfyUI connection. Use vdsl_connect first, or pass url/pod_id explicitly.\n\n\
                          Alternatively, these tools work WITHOUT a connection:\n\
                          • vdsl_run (compile_only=true) — compile & validate workflows locally\n\
                          • vdsl_image_search (source=\"local\") — search local PNG metadata\n\
@@ -880,6 +880,7 @@ pub enum LuaBackend {
     Mlua,
 }
 
+#[allow(clippy::derivable_impls)] // cfg(feature) conditional default — not derivable
 impl Default for LuaBackend {
     fn default() -> Self {
         #[cfg(feature = "mlua-backend")]
@@ -2827,7 +2828,7 @@ impl VdslMcpServer {
         );
 
         if let Some(mt) = req.model_type {
-            url.push_str(&format!("&types={}", mt.to_civitai_type()));
+            url.push_str(&format!("&type={}", mt.to_civitai_type()));
         }
         if let Some(sort) = req.sort {
             url.push_str(&format!(
@@ -3756,7 +3757,7 @@ impl VdslMcpServer {
                         ));
                         log.push(
                             "(No ComfyUI connection — showing required models only. \
-                             Use vdsl_connect first to enable server check.)"
+                             Use vdsl_connect or pass url/pod_id to enable server-side verification.)"
                                 .to_string(),
                         );
                     }
@@ -3773,8 +3774,9 @@ impl VdslMcpServer {
                     format!(
                         "Compilation succeeded ({} workflow(s)), but no ComfyUI connection for generation.\n\
                          Options:\n\
-                         • vdsl_pod_setup — start a pod and generate\n\
-                         • vdsl_connect — connect to an existing ComfyUI\n\
+                         • vdsl_connect — connect to an existing ComfyUI instance\n\
+                         • Pass url or pod_id parameter explicitly to this tool\n\
+                         • vdsl_pod_setup — start a new pod and generate\n\
                          • compile_only=true — compile without generating (already compiled {} workflow(s))",
                         workflow_files.len(),
                         workflow_files.len(),

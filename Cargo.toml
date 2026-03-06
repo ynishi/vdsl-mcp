@@ -35,7 +35,7 @@ pngmeta = { version = "0.1.4", optional = true }
 pngmetagrep-core = { version = "0.1.4", optional = true }
 
 [features]
-default = []
+default = ["mlua-backend"]
 mlua-backend = ["dep:mlua", "dep:mlua-batteries", "dep:mlua-isle", "dep:pngmeta", "dep:pngmetagrep-core", "dep:rusqlite"]
 
 [dev-dependencies]
