@@ -3657,6 +3657,18 @@ impl VdslMcpServer {
             envs.push(("VDSL_JUDGE_RESULT", json_str.as_str()));
         }
 
+        // Inject ComfyUI connection info for Lua-side registry/preflight
+        let comfy_url_str = self
+            .resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())
+            .ok();
+        let comfy_token_str = Self::comfyui_token();
+        if let Some(ref url) = comfy_url_str {
+            envs.push(("VDSL_COMFY_URL", url.as_str()));
+        }
+        if let Some(ref token) = comfy_token_str {
+            envs.push(("VDSL_COMFY_TOKEN", token.as_str()));
+        }
+
         let lua_result = exec_lua(&lua_args, &work_dir, timeout, &envs, &req.backend).await?;
 
         // Collect script output for reporting

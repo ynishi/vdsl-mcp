@@ -475,7 +475,31 @@ mod inner {
                 "#;
                 lua.load(db_bridge_code).exec()?;
 
-                // 9. os.getenv wrapper — injected env vars override real env
+                // 9. Bridge std.http → vdsl.runtime.registry via set_backend
+                //    Provides fetch_object_info(url, headers) -> table
+                //    Uses std.http + std.json (transport bridge layer)
+                let registry_bridge_code = r#"
+                    local ok, registry_mod = pcall(require, "vdsl.runtime.registry")
+                    if ok and registry_mod and registry_mod.set_backend then
+                        local rust_http = std.http
+                        local json_mod = std.json
+
+                        registry_mod.set_backend({
+                            fetch_object_info = function(url, headers)
+                                local opts = { method = "GET", url = url .. "/object_info" }
+                                if headers then opts.headers = headers end
+                                local resp = rust_http.request(opts)
+                                if resp.status >= 400 then
+                                    error("HTTP GET /object_info failed (status " .. resp.status .. ")", 2)
+                                end
+                                return json_mod.decode(resp.body)
+                            end,
+                        })
+                    end
+                "#;
+                lua.load(registry_bridge_code).exec()?;
+
+                // 10. os.getenv wrapper — injected env vars override real env
                 //    _injected_env is populated by exec_code_with_env preamble
                 let getenv_wrapper = r#"
                     _injected_env = {}
