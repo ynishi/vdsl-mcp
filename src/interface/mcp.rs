@@ -19,18 +19,15 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::application::pod_service::{resolve_api_key, PodService};
 use crate::domain::models::{format_model_catalog_with_limit, parse_model_catalog};
 use crate::domain::pod::{format_pod_list, format_volume_list};
-use crate::domain::repository::{Generation, GenerationFilter, QueryOpts, Repository, StatRow};
 use crate::infra::comfyui_client::{proxy_url, ComfyUiClient};
 #[cfg(feature = "mlua-backend")]
 use crate::infra::mlua_runtime::MluaRuntime;
 use crate::infra::runpod_cli::RunPodCli;
-use crate::infra::sqlite::SqliteRepository;
 
 // =============================================================================
 // Public entry point
@@ -62,8 +59,6 @@ struct VdslMcpServer {
     /// Whether the current session is an ephemeral pod (no network volume).
     /// When true, tools warn if images are not downloaded locally.
     ephemeral: Arc<Mutex<bool>>,
-    /// Lazy-initialized repository keyed by working_dir path.
-    repos: Arc<Mutex<std::collections::HashMap<PathBuf, Arc<SqliteRepository>>>>,
 }
 
 impl VdslMcpServer {
@@ -73,27 +68,7 @@ impl VdslMcpServer {
             last_url: Arc::new(Mutex::new(None)),
             last_pod_id: Arc::new(Mutex::new(None)),
             ephemeral: Arc::new(Mutex::new(false)),
-            repos: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
-    }
-
-    /// Get or create a SqliteRepository for the given working directory.
-    fn get_repo(&self, work_dir: &std::path::Path) -> Result<Arc<SqliteRepository>, McpError> {
-        let mut repos = self
-            .repos
-            .lock()
-            .map_err(|e| McpError::internal_error(format!("repo lock failed: {e}"), None))?;
-
-        if let Some(repo) = repos.get(work_dir) {
-            return Ok(Arc::clone(repo));
-        }
-
-        let repo = SqliteRepository::open(work_dir).map_err(|e| {
-            McpError::internal_error(format!("failed to open repository: {e}"), None)
-        })?;
-        let repo = Arc::new(repo);
-        repos.insert(work_dir.to_path_buf(), Arc::clone(&repo));
-        Ok(repo)
     }
 
     /// Create a PodService from environment API key.
@@ -185,9 +160,6 @@ impl VdslMcpServer {
                          • vdsl_run (compile_only=true) — compile & validate workflows locally\n\
                          • vdsl_image_search (source=\"local\") — search local PNG metadata\n\
                          • vdsl_catalogs — list available VDSL catalogs\n\
-                         • vdsl_repo_query / vdsl_repo_stats — query generation DB\n\
-                         • vdsl_repo_meta_get / vdsl_repo_meta_set — read/write generation metadata\n\
-                         • vdsl_repo_reindex — rebuild DB from local PNGs\n\
                          • vdsl_model_search — search models on CivitAI\n\
                          • vdsl_pod_list / vdsl_volume_list — list RunPod resources",
                         None,
@@ -1351,72 +1323,6 @@ pub struct VdslImageSearchRequest {
     /// SSH key path for pod access.
     /// Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
     pub ssh_key: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct VdslRepoQueryRequest {
-    /// VDSL working directory (must contain lua/).
-    pub working_dir: String,
-
-    /// Filter by model filename.
-    pub model: Option<String>,
-
-    /// Filter by script filename.
-    pub script: Option<String>,
-
-    /// Filter by workspace name.
-    pub workspace: Option<String>,
-
-    /// Filter: created_at >= date_from (ISO 8601).
-    pub date_from: Option<String>,
-
-    /// Filter: created_at <= date_to (ISO 8601).
-    pub date_to: Option<String>,
-
-    /// Maximum results (default: 50).
-    pub limit: Option<u32>,
-
-    /// Offset for pagination.
-    pub offset: Option<u32>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct VdslRepoStatsRequest {
-    /// VDSL working directory (must contain lua/).
-    pub working_dir: String,
-
-    /// Group by: "model", "script", "workspace", or "date".
-    pub group_by: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct VdslRepoMetaGetRequest {
-    /// VDSL working directory (must contain lua/).
-    pub working_dir: String,
-
-    /// Generation ID to read metadata from.
-    pub generation_id: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct VdslRepoMetaSetRequest {
-    /// VDSL working directory (must contain lua/).
-    pub working_dir: String,
-
-    /// Generation ID to write metadata to.
-    pub generation_id: String,
-
-    /// Metadata JSON string to store (replaces existing).
-    pub meta: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct VdslRepoReindexRequest {
-    /// VDSL working directory (must contain lua/).
-    pub working_dir: String,
-
-    /// Directory to scan for PNGs (default: "output/").
-    pub scan_dir: Option<String>,
 }
 
 // =============================================================================
@@ -3910,42 +3816,6 @@ impl VdslMcpServer {
             )
             .await;
 
-            // --- Repository persistence (pipeline mode) ---
-            // Pipeline workflows are not available as TaggedWorkflow here,
-            // so we pass an empty slice (no per-workflow model/seed/recipe).
-            // Recipe sidecar files from out_dir are still loaded if available.
-            let pipe_tagged: Vec<TaggedWorkflow> = scan_json_dir(&out_dir.path().to_string_lossy())
-                .await
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|p| {
-                    let path = std::path::Path::new(p);
-                    let label = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if label.starts_with('_') {
-                        return None;
-                    }
-                    let data = std::fs::read_to_string(path).ok()?;
-                    let workflow: serde_json::Value = serde_json::from_str(&data).ok()?;
-                    Some(TaggedWorkflow { label, workflow })
-                })
-                .collect();
-            persist_to_repo(
-                &PersistParams {
-                    server: self,
-                    work_dir: &work_dir,
-                    script_label: &script_label,
-                    saved_paths: &pipe_result.saved_paths,
-                    tagged_workflows: &pipe_tagged,
-                    out_dir: Some(out_dir.path()),
-                    labeled_paths: &[],
-                },
-                &mut log,
-            );
-
             if !pipe_result.download_log.is_empty() {
                 log.push(format!(
                     "\ndownloads:\n{}",
@@ -4003,7 +3873,7 @@ impl VdslMcpServer {
             .await;
 
             // Download images (labeled: each path knows its workflow label)
-            let (download_log, saved_paths, labeled_paths) = if let Some(ref dir) = req.save_dir {
+            let (download_log, saved_paths, _labeled_paths) = if let Some(ref dir) = req.save_dir {
                 let dl =
                     download_batch_images_labeled(&client, &results, std::path::Path::new(dir))
                         .await;
@@ -4021,20 +3891,6 @@ impl VdslMcpServer {
                 &mut log,
             )
             .await;
-
-            // --- Repository persistence ---
-            persist_to_repo(
-                &PersistParams {
-                    server: self,
-                    work_dir: &work_dir,
-                    script_label: &script_label,
-                    saved_paths: &saved_paths,
-                    tagged_workflows: &tagged,
-                    out_dir: Some(out_dir.path()),
-                    labeled_paths: &labeled_paths,
-                },
-                &mut log,
-            );
 
             // Summary
             format_batch_summary(&results, &mut log);
@@ -4148,359 +4004,7 @@ impl VdslMcpServer {
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
-
-    // =========================================================================
-    // Repository Query
-    // =========================================================================
-
-    #[tool(
-        name = "vdsl_repo_query",
-        description = "[repo] Query the VDSL generation repository. \
-            Returns generation records with optional filters (model, script, workspace, date range). \
-            working_dir must contain lua/ and .vdsl/generations.db.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn repo_query(
-        &self,
-        Parameters(req): Parameters<VdslRepoQueryRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let work_dir = std::path::PathBuf::from(&req.working_dir);
-        let repo = self.get_repo(&work_dir)?;
-
-        let filter = GenerationFilter {
-            model: req.model,
-            script: req.script,
-            workspace: req.workspace,
-            date_from: req.date_from,
-            date_to: req.date_to,
-        };
-
-        let opts = QueryOpts {
-            limit: Some(req.limit.unwrap_or(50)),
-            offset: req.offset,
-        };
-
-        let rows = repo
-            .query_generations(&filter, &opts)
-            .map_err(|e| McpError::internal_error(format!("query failed: {e}"), None))?;
-
-        let mut output = format!("{} generation(s) found\n", rows.len());
-        for row in &rows {
-            output.push_str(&format!(
-                "\n- {} | ws={} script={} model={} seed={} output={}",
-                &row.gen.id[..8],
-                row.workspace_name.as_deref().unwrap_or("-"),
-                row.script.as_deref().unwrap_or("-"),
-                row.gen.model.as_deref().unwrap_or("-"),
-                row.gen
-                    .seed
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "-".into()),
-                row.gen.output.as_deref().unwrap_or("-"),
-            ));
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
-    // =========================================================================
-    // Repository Stats
-    // =========================================================================
-
-    #[tool(
-        name = "vdsl_repo_stats",
-        description = "[repo] Get statistics from the VDSL generation repository. \
-            Groups by: model, script, workspace, or date. \
-            working_dir must contain lua/ and .vdsl/generations.db.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn repo_stats(
-        &self,
-        Parameters(req): Parameters<VdslRepoStatsRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let work_dir = std::path::PathBuf::from(&req.working_dir);
-        let repo = self.get_repo(&work_dir)?;
-
-        let stats: Vec<StatRow> = repo
-            .stats(&req.group_by)
-            .map_err(|e| McpError::internal_error(format!("stats failed: {e}"), None))?;
-
-        let mut output = format!("Stats by {}\n", req.group_by);
-        for row in &stats {
-            output.push_str(&format!("  {}: {}\n", row.group, row.count));
-        }
-        if stats.is_empty() {
-            output.push_str("  (no data)\n");
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
-    // =========================================================================
-    // Repository Meta Get
-    // =========================================================================
-
-    #[tool(
-        name = "vdsl_repo_meta_get",
-        description = "[repo] Get metadata JSON for a specific generation. \
-            Returns the meta field (arbitrary JSON) stored with the generation record.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn repo_meta_get(
-        &self,
-        Parameters(req): Parameters<VdslRepoMetaGetRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let work_dir = std::path::PathBuf::from(&req.working_dir);
-        let repo = self.get_repo(&work_dir)?;
-
-        let meta = repo
-            .get_meta(&req.generation_id)
-            .map_err(|e| McpError::internal_error(format!("get_meta failed: {e}"), None))?;
-
-        match meta {
-            Some(json) => Ok(CallToolResult::success(vec![Content::text(json)])),
-            None => Ok(CallToolResult::success(vec![Content::text(
-                "null (no metadata or generation not found)",
-            )])),
-        }
-    }
-
-    // =========================================================================
-    // Repository Meta Set
-    // =========================================================================
-
-    #[tool(
-        name = "vdsl_repo_meta_set",
-        description = "[repo] Set metadata JSON for a specific generation. \
-            Replaces any existing meta field. The value must be valid JSON.",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn repo_meta_set(
-        &self,
-        Parameters(req): Parameters<VdslRepoMetaSetRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        // Validate JSON
-        serde_json::from_str::<serde_json::Value>(&req.meta)
-            .map_err(|e| McpError::invalid_params(format!("meta is not valid JSON: {e}"), None))?;
-
-        let work_dir = std::path::PathBuf::from(&req.working_dir);
-        let repo = self.get_repo(&work_dir)?;
-
-        repo.set_meta(&req.generation_id, &req.meta)
-            .map_err(|e| McpError::internal_error(format!("set_meta failed: {e}"), None))?;
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "meta updated for generation {}",
-            &req.generation_id
-        ))]))
-    }
-
-    // =========================================================================
-    // Repository Reindex
-    // =========================================================================
-
-    #[tool(
-        name = "vdsl_repo_reindex",
-        description = "[repo] Rebuild the generation DB by scanning PNGs for embedded VDSL metadata. \
-            Reads 'vdsl' and 'vdsl_meta' tEXt chunks from each PNG. \
-            Skips PNGs without VDSL chunks or already in DB. \
-            scan_dir defaults to 'output/' relative to working_dir.",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn repo_reindex(
-        &self,
-        Parameters(req): Parameters<VdslRepoReindexRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let work_dir = std::path::PathBuf::from(&req.working_dir);
-        let scan_dir = req.scan_dir.unwrap_or_else(|| "output/".to_string());
-        let scan_path = work_dir.join(&scan_dir);
-
-        if !scan_path.is_dir() {
-            return Err(McpError::invalid_params(
-                format!("scan_dir does not exist: {}", scan_path.display()),
-                None,
-            ));
-        }
-
-        let repo = self.get_repo(&work_dir)?;
-
-        // Run Lua scanner to extract VDSL metadata from PNGs (NDJSON output)
-        let lua_path = work_dir.join("lua");
-        let output = tokio::process::Command::new("lua")
-            .arg("-e")
-            .arg(VDSL_REINDEX_LUA)
-            .env("VDSL_SCAN_DIR", &scan_path)
-            .env(
-                "LUA_PATH",
-                format!(
-                    "{}/?.lua;{}/?/init.lua",
-                    lua_path.display(),
-                    lua_path.display()
-                ),
-            )
-            .current_dir(&work_dir)
-            .output()
-            .await
-            .map_err(|e| McpError::internal_error(format!("lua spawn failed: {e}"), None))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(McpError::internal_error(
-                format!("reindex lua failed: {stderr}"),
-                None,
-            ));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut indexed = 0u32;
-        let mut skipped = 0u32;
-        let mut errors = 0u32;
-
-        for line in stdout.lines() {
-            let record: serde_json::Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(_) => {
-                    errors += 1;
-                    continue;
-                }
-            };
-
-            let gen_id = match record["gen_id"].as_str() {
-                Some(id) => id.to_string(),
-                None => {
-                    skipped += 1;
-                    continue;
-                }
-            };
-
-            // Skip if already in DB
-            if let Ok(Some(_)) = repo.find_generation(&gen_id) {
-                skipped += 1;
-                continue;
-            }
-
-            let filepath = record["filepath"].as_str().unwrap_or("").to_string();
-            let recipe_json = record["recipe"].as_str().map(|s| s.to_string());
-            let meta_json = record["meta"].as_str().map(|s| s.to_string());
-            let seed = record["seed"].as_i64();
-            let model = record["model"].as_str().map(|s| s.to_string());
-            let script = record["script"].as_str().map(|s| s.to_string());
-            let ts = record["ts"].as_str().unwrap_or("").to_string();
-            let run_id = record["run_id"]
-                .as_str()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-            // Ensure workspace
-            let ws_name = script
-                .as_deref()
-                .map(derive_workspace_name)
-                .unwrap_or_else(|| "unknown".to_string());
-            let ws = match repo.ensure_workspace(&ws_name) {
-                Ok(ws) => ws,
-                Err(_) => {
-                    errors += 1;
-                    continue;
-                }
-            };
-
-            // Ensure run
-            if repo.find_generation(&run_id).is_err() {
-                let _ = repo.create_run(&ws.id, script.as_deref());
-            }
-
-            let created_at = if ts.is_empty() {
-                chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
-            } else {
-                ts
-            };
-
-            let gen = Generation {
-                id: gen_id.clone(),
-                run_id: run_id.clone(),
-                seed,
-                model,
-                output: Some(filepath),
-                created_at,
-                recipe: recipe_json,
-                meta: meta_json.clone(),
-            };
-
-            match repo.save_generation(&gen) {
-                Ok(()) => {
-                    // Also set meta if present
-                    if let Some(ref meta) = meta_json {
-                        let _ = repo.set_meta(&gen_id, meta);
-                    }
-                    indexed += 1;
-                }
-                Err(_) => errors += 1,
-            }
-        }
-
-        let scanned: u32 = indexed + skipped + errors;
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "reindex complete: scanned={scanned} indexed={indexed} skipped={skipped} errors={errors}"
-        ))]))
-    }
 }
-
-/// Lua script for reindex: scans PNGs, outputs NDJSON with vdsl metadata.
-const VDSL_REINDEX_LUA: &str = r#"
-local png = require("vdsl.util.png")
-local json = require("vdsl.util.json")
-
-local scan_dir = os.getenv("VDSL_SCAN_DIR")
-if not scan_dir then
-    io.stderr:write("VDSL_SCAN_DIR not set\n")
-    os.exit(1)
-end
-
-local handle = io.popen('find "' .. scan_dir .. '" -name "*.png" -type f 2>/dev/null')
-if not handle then os.exit(0) end
-
-for filepath in handle:lines() do
-    local ok_read, chunks = pcall(png.read_text, filepath)
-    if ok_read and chunks and chunks["vdsl"] then
-        local ok_dec, recipe = pcall(json.decode, chunks["vdsl"])
-        if ok_dec and type(recipe) == "table" and recipe.gen_id then
-            local record = {
-                filepath = filepath,
-                gen_id   = recipe.gen_id,
-                run_id   = recipe.run_id,
-                seed     = recipe.seed,
-                script   = recipe.script,
-                ts       = recipe.ts,
-                model    = recipe.world and recipe.world.model or nil,
-                recipe   = chunks["vdsl"],
-                meta     = chunks["vdsl_meta"],
-            }
-            io.write(json.encode(record) .. "\n")
-        end
-    end
-end
-handle:close()
-"#;
 
 // =============================================================================
 // Image search helpers (pngmetagrep)
@@ -5793,10 +5297,9 @@ async fn inject_metadata_if_needed(
 }
 
 // =============================================================================
-// Repository persistence (shared helper)
-// =============================================================================
 
 /// Derive workspace name from script label: "gravure_klimt_p1.lua" → "gravure_klimt".
+#[allow(dead_code)]
 fn derive_workspace_name(script_label: &str) -> String {
     let base = script_label
         .rsplit('/')
@@ -5813,6 +5316,7 @@ fn derive_workspace_name(script_label: &str) -> String {
 }
 
 /// Extract model name from a ComfyUI workflow JSON.
+#[allow(dead_code)]
 fn extract_model_from_workflow(wf: &serde_json::Value) -> Option<String> {
     // Walk all nodes looking for CheckpointLoaderSimple or similar
     if let Some(obj) = wf.as_object() {
@@ -5830,6 +5334,7 @@ fn extract_model_from_workflow(wf: &serde_json::Value) -> Option<String> {
 }
 
 /// Extract seed from a ComfyUI workflow JSON.
+#[allow(dead_code)]
 fn extract_seed_from_workflow(wf: &serde_json::Value) -> Option<i64> {
     if let Some(obj) = wf.as_object() {
         for (_node_id, node) in obj {
@@ -5847,6 +5352,7 @@ fn extract_seed_from_workflow(wf: &serde_json::Value) -> Option<i64> {
 
 /// Load recipe JSON from VDSL_OUT_DIR sidecar file.
 /// Looks for `_recipe_{label}.json` in the output directory.
+#[allow(dead_code)]
 fn load_recipe(out_dir: &std::path::Path, label: &str) -> Option<String> {
     let recipe_path = out_dir.join(format!("_recipe_{label}.json"));
     std::fs::read_to_string(recipe_path).ok()
@@ -5855,6 +5361,7 @@ fn load_recipe(out_dir: &std::path::Path, label: &str) -> Option<String> {
 /// Match a saved image path to a workflow label.
 /// ComfyUI filenames typically contain the filename_prefix from SaveImage.
 /// We try to find which workflow label best matches the image filename.
+#[allow(dead_code)]
 fn match_workflow_label<'a>(image_path: &std::path::Path, labels: &'a [String]) -> Option<&'a str> {
     let filename = image_path
         .file_name()
@@ -5870,141 +5377,6 @@ fn match_workflow_label<'a>(image_path: &std::path::Path, labels: &'a [String]) 
         }
     }
     best
-}
-
-/// Per-workflow metadata: (model, seed, recipe).
-type WorkflowMeta = (Option<String>, Option<i64>, Option<String>);
-
-/// Parameters for repository persistence after a vdsl_run.
-struct PersistParams<'a> {
-    server: &'a VdslMcpServer,
-    work_dir: &'a std::path::Path,
-    script_label: &'a str,
-    saved_paths: &'a [std::path::PathBuf],
-    tagged_workflows: &'a [TaggedWorkflow],
-    out_dir: Option<&'a std::path::Path>,
-    labeled_paths: &'a [(String, std::path::PathBuf)],
-}
-
-fn persist_to_repo(params: &PersistParams<'_>, log: &mut Vec<String>) {
-    if params.saved_paths.is_empty() {
-        return;
-    }
-
-    let repo = match params.server.get_repo(params.work_dir) {
-        Ok(r) => r,
-        Err(e) => {
-            log.push(format!("repo: skipped — {e}"));
-            return;
-        }
-    };
-
-    let ws_name = derive_workspace_name(params.script_label);
-    let ws = match repo.ensure_workspace(&ws_name) {
-        Ok(ws) => ws,
-        Err(e) => {
-            log.push(format!("repo: workspace failed — {e}"));
-            return;
-        }
-    };
-
-    let script_filename = if params.script_label == "<inline>" {
-        None
-    } else {
-        Some(
-            params
-                .script_label
-                .rsplit('/')
-                .next()
-                .unwrap_or(params.script_label),
-        )
-    };
-
-    let run = match repo.create_run(&ws.id, script_filename) {
-        Ok(r) => r,
-        Err(e) => {
-            log.push(format!("repo: run failed — {e}"));
-            return;
-        }
-    };
-
-    // Build per-workflow metadata index: label → (model, seed, recipe)
-    let wf_labels: Vec<String> = params
-        .tagged_workflows
-        .iter()
-        .map(|tw| tw.label.clone())
-        .collect();
-    let wf_meta: std::collections::HashMap<String, WorkflowMeta> = params
-        .tagged_workflows
-        .iter()
-        .map(|tw| {
-            let model = extract_model_from_workflow(&tw.workflow);
-            let seed = extract_seed_from_workflow(&tw.workflow);
-            let recipe = params.out_dir.and_then(|dir| load_recipe(dir, &tw.label));
-            (tw.label.clone(), (model, seed, recipe))
-        })
-        .collect();
-
-    // Build path → label lookup from deterministic labeled_paths
-    let path_to_label: std::collections::HashMap<&std::path::Path, &str> = params
-        .labeled_paths
-        .iter()
-        .map(|(label, path)| (path.as_path(), label.as_str()))
-        .collect();
-
-    let fallback: WorkflowMeta = wf_meta
-        .values()
-        .next()
-        .cloned()
-        .unwrap_or((None, None, None));
-
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let mut saved_count = 0u32;
-    let mut recipe_count = 0u32;
-
-    for path in params.saved_paths {
-        // 1. Deterministic: use labeled_paths mapping (flat batch)
-        // 2. Heuristic: filename matching (pipeline mode fallback)
-        let label = path_to_label
-            .get(path.as_path())
-            .copied()
-            .or_else(|| match_workflow_label(path, &wf_labels));
-
-        let (model, seed, recipe) = label
-            .and_then(|l| wf_meta.get(l).cloned())
-            .unwrap_or_else(|| fallback.clone());
-
-        if recipe.is_some() {
-            recipe_count += 1;
-        }
-
-        let gen = Generation {
-            id: uuid::Uuid::new_v4().to_string(),
-            run_id: run.id.clone(),
-            seed,
-            model,
-            output: Some(path.to_string_lossy().to_string()),
-            created_at: now.clone(),
-            recipe,
-            meta: None,
-        };
-        match repo.save_generation(&gen) {
-            Ok(()) => saved_count += 1,
-            Err(e) => {
-                log.push(format!("repo: gen save failed — {e}"));
-            }
-        }
-    }
-
-    log.push(format!(
-        "\nrepo: ws={} run={} saved={}/{} recipe={}/{}",
-        ws_name,
-        &run.id[..8],
-        saved_count,
-        params.saved_paths.len(),
-        recipe_count,
-        params.saved_paths.len(),
-    ));
 }
 
 // =============================================================================
