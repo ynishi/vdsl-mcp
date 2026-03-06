@@ -1,8 +1,52 @@
 //! In-process Lua VM backend using mlua-isle.
 //!
-//! Replaces the external `lua` process spawning with a thread-isolated
-//! mlua VM.  mlua-batteries provides `std.fs` which is bridged to
-//! VDSL's `runtime/fs` via `set_backend()`.
+//! # 設計: Thin Host DI パターン
+//!
+//! **Host (Rust)** は Infra プリミティブのみ提供し、**Client (Lua)** が
+//! Domain ロジックを担う。ゲームエンジン / Neovim と同じ業界パターン。
+//!
+//! Lua 側の各 `runtime/` モジュールは `set_backend(table)` で実装を
+//! 差し替え可能。mlua backend では Rust 実装を DI 注入し、
+//! Process backend (lua CLI) では Pure Lua fallback が動く。
+//!
+//! # DI Bridge 一覧
+//!
+//! | # | Bridge | Host 実装 | Client モジュール | Backend Interface |
+//! |---|--------|-----------|-------------------|-------------------|
+//! | 1 | FS | `mlua-batteries std.fs` | `runtime/fs.lua` | `mkdir, cp, read, write, read_binary, write_binary, exists, ls, find, sleep` |
+//! | 2 | HTTP | `mlua-batteries std.http` | `runtime/transport.lua` | `get(url,h), post_json(url,data,h), upload(...), download(url,path,h)` |
+//! | 3 | DB | `rusqlite` UserData | `runtime/db.lua` | `open(path) → conn { exec(sql,params), query(sql,params), close() }` |
+//! | 4 | PNG | `pngmetagrep-core` + `pngmeta` | `runtime/png.lua` | `read_text(path), inject_text(path,chunks), inject_text_to(src,dst,chunks)` |
+//! | 5 | Registry | `std.http` + `std.json` | `runtime/registry.lua` | `fetch_object_info(url, headers) → table` |
+//!
+//! # VM 初期化シーケンス (`MluaRuntime::new`)
+//!
+//! 1. `mlua-batteries` 登録 (`std.fs`, `std.json`, `std.http`)
+//! 2. `package.path` 設定 (VDSL モジュール解決)
+//! 3. FS bridge: `std.fs` → `runtime/fs.set_backend()`
+//! 4. HTTP bridge: `std.http` → `runtime/transport.set_backend()`
+//! 5. DB globals: `db.open(path)` → `rusqlite` UserData
+//! 6. PNG globals: `png.read_chunks`, `png.read_text_raw`, `png.write_chunk`
+//! 7. PNG bridge: globals → `runtime/png.set_backend()`
+//! 8. DB bridge: globals → `runtime/db.set_backend()`
+//! 9. Registry bridge: `std.http` + `std.json` → `runtime/registry.set_backend()`
+//! 10. `os.getenv` wrapper: `_injected_env` テーブル優先、fallback は real `os.getenv`
+//!
+//! # Env 注入の仕組み
+//!
+//! Process backend は `cmd.env(k, v)` で子プロセスに環境変数を渡す。
+//! mlua backend はインプロセスなので `os.getenv()` に直接反映されない。
+//!
+//! 解決: VM 初期化時に `os.getenv` をラップし、`_injected_env` テーブルを
+//! 優先参照するオーバーライドを設置。`exec_code_with_env()` のプリアンブルで
+//! `_injected_env['KEY'] = 'value'` として注入する。
+//!
+//! 現在注入される env 変数:
+//! - `VDSL_OUT_DIR` — workflow JSON 出力先 (`vdsl_run`)
+//! - `VDSL_JUDGE_RESULT` — judge gate 結果 JSON (`vdsl_run`)
+//! - `VDSL_COMFY_URL` — ComfyUI 接続 URL (`vdsl_run`, 接続済み時のみ)
+//! - `VDSL_COMFY_TOKEN` — ComfyUI Bearer token (`vdsl_run`, 設定時のみ)
+//! - `VDSL_CATALOGS` — ユーザー定義カタログディレクトリ (`vdsl_catalogs`)
 
 #[cfg(feature = "mlua-backend")]
 mod inner {
