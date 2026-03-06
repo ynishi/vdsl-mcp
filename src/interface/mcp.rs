@@ -4451,11 +4451,11 @@ async fn exec_lua_mlua(
             envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
         let result = if is_file {
-            // Inject env vars, then dofile
+            // Inject env vars into _injected_env, then dofile
             let mut preamble = String::new();
             for (k, v) in &env_refs {
                 let escaped = v.replace('\\', "\\\\").replace('\'', "\\'");
-                preamble.push_str(&format!("{k} = '{escaped}'\n"));
+                preamble.push_str(&format!("_injected_env['{k}'] = '{escaped}'\n"));
             }
             preamble.push_str(&format!(
                 "dofile('{}')",

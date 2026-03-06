@@ -475,6 +475,19 @@ mod inner {
                 "#;
                 lua.load(db_bridge_code).exec()?;
 
+                // 9. os.getenv wrapper — injected env vars override real env
+                //    _injected_env is populated by exec_code_with_env preamble
+                let getenv_wrapper = r#"
+                    _injected_env = {}
+                    local _real_getenv = os.getenv
+                    os.getenv = function(key)
+                        local v = _injected_env[key]
+                        if v ~= nil then return v end
+                        return _real_getenv(key)
+                    end
+                "#;
+                lua.load(getenv_wrapper).exec()?;
+
                 Ok(())
             })
             .map_err(|e| McpError::internal_error(format!("mlua init failed: {e}"), None))?;
@@ -584,9 +597,8 @@ mod inner {
         ) -> Result<MluaExecResult, McpError> {
             let mut preamble = String::new();
             for (k, v) in envs {
-                // Escape single quotes in values
                 let escaped = v.replace('\\', "\\\\").replace('\'', "\\'");
-                preamble.push_str(&format!("{k} = '{escaped}'\n"));
+                preamble.push_str(&format!("_injected_env['{k}'] = '{escaped}'\n"));
             }
             preamble.push_str(code);
             self.exec_code(&preamble)
