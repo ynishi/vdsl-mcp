@@ -21,6 +21,8 @@ pub struct ModelCatalog {
     pub vaes: Vec<String>,
     pub controlnets: Vec<String>,
     pub upscalers: Vec<String>,
+    /// All available node class_types from `/object_info` top-level keys.
+    pub node_types: Vec<String>,
 }
 
 /// Extract COMBO options from a node's `input.required.<field>[0]` array.
@@ -42,6 +44,8 @@ fn extract_combo(
 }
 
 /// Parse `/object_info` JSON into a structured model catalog.
+///
+/// Top-level keys of `/object_info` are all available node class_types.
 pub fn parse_model_catalog(object_info: &serde_json::Value) -> ModelCatalog {
     let mut checkpoints = Vec::new();
     let mut loras = Vec::new();
@@ -61,12 +65,20 @@ pub fn parse_model_catalog(object_info: &serde_json::Value) -> ModelCatalog {
         }
     }
 
+    // Collect all available node types from top-level keys
+    let mut node_types: Vec<String> = object_info
+        .as_object()
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_default();
+    node_types.sort();
+
     ModelCatalog {
         checkpoints,
         loras,
         vaes,
         controlnets,
         upscalers,
+        node_types,
     }
 }
 
@@ -110,7 +122,7 @@ pub fn format_model_catalog_with_limit(catalog: &ModelCatalog, limit: Option<usi
     out
 }
 
-/// Required models extracted from compiled workflow JSONs.
+/// Required models and node types extracted from compiled workflow JSONs.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RequiredModels {
     pub checkpoints: Vec<String>,
@@ -118,6 +130,8 @@ pub struct RequiredModels {
     pub vaes: Vec<String>,
     pub controlnets: Vec<String>,
     pub upscalers: Vec<String>,
+    /// All class_types used in the compiled workflows.
+    pub node_types: Vec<String>,
 }
 
 impl RequiredModels {
@@ -127,12 +141,14 @@ impl RequiredModels {
             && self.vaes.is_empty()
             && self.controlnets.is_empty()
             && self.upscalers.is_empty()
+            && self.node_types.is_empty()
     }
 }
 
-/// Extract required model names from compiled ComfyUI API-format workflow JSONs.
+/// Extract required model names and node types from compiled ComfyUI API-format workflow JSONs.
 ///
 /// Scans each node's `class_type` + `inputs.<field>` against `RESOURCE_MAP`.
+/// Also collects all unique `class_type` values for node availability checking.
 /// Deduplicates results.
 pub fn extract_required_models(workflows: &[serde_json::Value]) -> RequiredModels {
     use std::collections::HashSet;
@@ -141,6 +157,8 @@ pub fn extract_required_models(workflows: &[serde_json::Value]) -> RequiredModel
         .iter()
         .map(|&(_, _, key)| (key, HashSet::new()))
         .collect();
+
+    let mut node_type_set: HashSet<String> = HashSet::new();
 
     for wf in workflows {
         let nodes = match wf.as_object() {
@@ -152,6 +170,9 @@ pub fn extract_required_models(workflows: &[serde_json::Value]) -> RequiredModel
                 Some(ct) => ct,
                 None => continue,
             };
+
+            node_type_set.insert(class_type.to_string());
+
             for &(node_type, field, key) in RESOURCE_MAP {
                 if class_type == node_type {
                     if let Some(val) = node["inputs"][field].as_str() {
@@ -172,16 +193,20 @@ pub fn extract_required_models(workflows: &[serde_json::Value]) -> RequiredModel
         v
     };
 
+    let mut node_types: Vec<String> = node_type_set.into_iter().collect();
+    node_types.sort();
+
     RequiredModels {
         checkpoints: to_sorted_vec("checkpoints"),
         loras: to_sorted_vec("loras"),
         vaes: to_sorted_vec("vaes"),
         controlnets: to_sorted_vec("controlnets"),
         upscalers: to_sorted_vec("upscalers"),
+        node_types,
     }
 }
 
-/// Check required models against available catalog. Returns missing models.
+/// Check required models and node types against available catalog. Returns missing items.
 pub fn check_missing(required: &RequiredModels, available: &ModelCatalog) -> RequiredModels {
     let diff = |req: &[String], avail: &[String]| -> Vec<String> {
         req.iter()
@@ -196,20 +221,22 @@ pub fn check_missing(required: &RequiredModels, available: &ModelCatalog) -> Req
         vaes: diff(&required.vaes, &available.vaes),
         controlnets: diff(&required.controlnets, &available.controlnets),
         upscalers: diff(&required.upscalers, &available.upscalers),
+        node_types: diff(&required.node_types, &available.node_types),
     }
 }
 
-/// Format a preflight report from required and missing models.
+/// Format a preflight report from required and missing models/nodes.
 pub fn format_preflight_report(required: &RequiredModels, missing: &RequiredModels) -> String {
     let mut out = String::new();
 
     let ok = missing.is_empty();
     if ok {
-        out.push_str("Preflight OK: all models available.\n\n");
+        out.push_str("Preflight OK: all models and nodes available.\n\n");
     } else {
-        out.push_str("Preflight FAILED: missing models detected.\n\n");
+        out.push_str("Preflight FAILED: missing items detected.\n\n");
     }
 
+    // Model sections
     let sections: &[(&str, &[String], &[String])] = &[
         ("Checkpoints", &required.checkpoints, &missing.checkpoints),
         ("LoRAs", &required.loras, &missing.loras),
@@ -226,6 +253,18 @@ pub fn format_preflight_report(required: &RequiredModels, missing: &RequiredMode
         for r in req {
             let marker = if miss.contains(r) { "MISSING" } else { "ok" };
             out.push_str(&format!("  [{marker}] {r}\n"));
+        }
+        out.push('\n');
+    }
+
+    // Custom nodes section (only show missing to avoid noise)
+    if !missing.node_types.is_empty() {
+        out.push_str(&format!(
+            "# Custom Nodes ({} missing)\n",
+            missing.node_types.len()
+        ));
+        for ct in &missing.node_types {
+            out.push_str(&format!("  [MISSING] {ct}\n"));
         }
         out.push('\n');
     }
@@ -291,6 +330,17 @@ mod tests {
         assert_eq!(catalog.vaes, &["vae-ft-mse.safetensors"]);
         assert!(catalog.controlnets.is_empty());
         assert_eq!(catalog.upscalers, &["RealESRGAN_x4plus.pth"]);
+        // node_types = top-level keys of object_info (sorted)
+        assert_eq!(
+            catalog.node_types,
+            &[
+                "CheckpointLoaderSimple",
+                "ControlNetLoader",
+                "LoraLoader",
+                "UpscaleModelLoader",
+                "VAELoader",
+            ]
+        );
     }
 
     #[test]
@@ -303,6 +353,7 @@ mod tests {
         assert!(catalog.vaes.is_empty());
         assert!(catalog.controlnets.is_empty());
         assert!(catalog.upscalers.is_empty());
+        assert!(catalog.node_types.is_empty());
     }
 
     #[test]
@@ -314,6 +365,70 @@ mod tests {
         });
         let catalog = parse_model_catalog(&info);
         assert!(catalog.checkpoints.is_empty());
+    }
+
+    #[test]
+    fn extract_required_collects_node_types() {
+        let wf = serde_json::json!({
+            "1": { "class_type": "CheckpointLoaderSimple", "inputs": { "ckpt_name": "m.safetensors" } },
+            "2": { "class_type": "KSampler", "inputs": {} },
+            "3": { "class_type": "CLIPTextEncode", "inputs": { "text": "hi" } },
+            "4": { "class_type": "ColorCorrect", "inputs": {} },
+        });
+        let required = extract_required_models(&[wf]);
+        assert_eq!(
+            required.node_types,
+            &[
+                "CLIPTextEncode",
+                "CheckpointLoaderSimple",
+                "ColorCorrect",
+                "KSampler"
+            ]
+        );
+        assert_eq!(required.checkpoints, &["m.safetensors"]);
+    }
+
+    #[test]
+    fn check_missing_detects_missing_nodes() {
+        let required = RequiredModels {
+            node_types: vec![
+                "KSampler".into(),
+                "ColorCorrect".into(),
+                "UltralyticsDetectorProvider".into(),
+            ],
+            ..Default::default()
+        };
+        let available = ModelCatalog {
+            checkpoints: vec![],
+            loras: vec![],
+            vaes: vec![],
+            controlnets: vec![],
+            upscalers: vec![],
+            node_types: vec!["KSampler".into(), "VAEDecode".into()],
+        };
+        let missing = check_missing(&required, &available);
+        assert_eq!(
+            missing.node_types,
+            &["ColorCorrect", "UltralyticsDetectorProvider"]
+        );
+    }
+
+    #[test]
+    fn format_preflight_shows_missing_nodes() {
+        let required = RequiredModels {
+            checkpoints: vec!["m.safetensors".into()],
+            node_types: vec!["KSampler".into(), "ColorCorrect".into()],
+            ..Default::default()
+        };
+        let missing = RequiredModels {
+            node_types: vec!["ColorCorrect".into()],
+            ..Default::default()
+        };
+        let report = format_preflight_report(&required, &missing);
+        assert!(report.contains("FAILED"));
+        assert!(report.contains("Custom Nodes (1 missing)"));
+        assert!(report.contains("[MISSING] ColorCorrect"));
+        assert!(report.contains("[ok] m.safetensors"));
     }
 
     #[test]
