@@ -401,16 +401,29 @@ const SETUP_TIMEOUT_SECS: u64 = 300;
 /// Interval between readiness polls (seconds).
 const SETUP_POLL_INTERVAL_SECS: u64 = 10;
 
-/// Default SSH key path for RunPod pods.
+/// Default SSH key path — matches RunPod's default SSH key location.
 const DEFAULT_SSH_KEY: &str = "~/.ssh/id_ed25519";
-/// Base path for ComfyUI on RunPod pods.
-const COMFYUI_BASE: &str = "/workspace/runpod-slim/ComfyUI";
-/// Base path for ComfyUI models on RunPod pods.
-const COMFYUI_MODELS_BASE: &str = "/workspace/runpod-slim/ComfyUI/models";
-/// Base path for ComfyUI custom nodes on RunPod pods.
-const COMFYUI_CUSTOM_NODES: &str = "/workspace/runpod-slim/ComfyUI/custom_nodes";
-/// Base path for ComfyUI output images on RunPod pods.
-const COMFYUI_OUTPUT_BASE: &str = "/workspace/runpod-slim/ComfyUI/output";
+
+/// Default ComfyUI base path for RunPod pods.
+///
+/// RunPod's official Pod documentation does not specify a canonical ComfyUI
+/// install path. The official Docker image `runpod/comfyui:latest` actually
+/// creates `/workspace/runpod-slim/ComfyUI` on the pod filesystem.
+/// Community/custom templates may use `/workspace/ComfyUI` or other paths.
+/// When using Network Volume, `/workspace` is the persistent mount point.
+///
+/// Override via `VDSL_COMFYUI_BASE` env var to match your template.
+const DEFAULT_COMFYUI_BASE: &str = "/workspace/runpod-slim/ComfyUI";
+
+static COMFYUI_BASE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("VDSL_COMFYUI_BASE").unwrap_or_else(|_| DEFAULT_COMFYUI_BASE.to_string())
+});
+static COMFYUI_MODELS_BASE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{}/models", *COMFYUI_BASE));
+static COMFYUI_CUSTOM_NODES: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{}/custom_nodes", *COMFYUI_BASE));
+static COMFYUI_OUTPUT_BASE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{}/output", *COMFYUI_BASE));
 /// Max wait time for downloads (seconds).
 const DOWNLOAD_TIMEOUT_SECS: u64 = 600;
 /// Interval between download status polls (seconds).
@@ -1561,10 +1574,13 @@ impl VdslMcpServer {
             "Connected to {url}\n\
              \nAll subsequent tools (generate, models, exec, etc.) will reuse this connection — \
              pod_id/url can be omitted.\n\
-             \nComfyUI models path: {COMFYUI_MODELS_BASE}\n\
-             Custom nodes path: {COMFYUI_CUSTOM_NODES}\n\
-             \n{}",
-            serde_json::to_string_pretty(&stats).unwrap_or_else(|_| format!("{stats:?}"))
+             \nComfyUI models path: {models}\n\
+             Custom nodes path: {nodes}\n\
+             \n{stats_json}",
+            models = &*COMFYUI_MODELS_BASE,
+            nodes = &*COMFYUI_CUSTOM_NODES,
+            stats_json =
+                serde_json::to_string_pretty(&stats).unwrap_or_else(|_| format!("{stats:?}"))
         );
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
@@ -2057,7 +2073,10 @@ impl VdslMcpServer {
         let dir_name =
             resolve_model_dir(&req.target).map_err(|e| McpError::invalid_params(e, None))?;
 
-        let dest = format!("{COMFYUI_MODELS_BASE}/{}/{}", dir_name, dl_info.filename);
+        let dest = format!(
+            "{}/{}/{}",
+            &*COMFYUI_MODELS_BASE, dir_name, dl_info.filename
+        );
 
         let mut log = Vec::<String>::new();
         log.push(format!(
@@ -3165,7 +3184,7 @@ impl VdslMcpServer {
         let remote = b2_remote(&bucket, &req.source)?;
         let dir_name =
             resolve_model_dir(&req.target).map_err(|e| McpError::invalid_params(e, None))?;
-        let dest = format!("{COMFYUI_MODELS_BASE}/{dir_name}/");
+        let dest = format!("{}/{dir_name}/", &*COMFYUI_MODELS_BASE);
 
         ensure_rclone(&svc, &req.pod_id, &ssh_key).await?;
 
@@ -3221,8 +3240,8 @@ impl VdslMcpServer {
             resolve_model_dir(&req.source_target).map_err(|e| McpError::invalid_params(e, None))?;
 
         let source = match req.filename {
-            Some(ref f) => format!("{COMFYUI_MODELS_BASE}/{dir_name}/{f}"),
-            None => format!("{COMFYUI_MODELS_BASE}/{dir_name}/"),
+            Some(ref f) => format!("{}/{dir_name}/{f}", &*COMFYUI_MODELS_BASE),
+            None => format!("{}/{dir_name}/", &*COMFYUI_MODELS_BASE),
         };
 
         let dest_path = req.dest_path.as_deref().unwrap_or("").trim_matches('/');
@@ -3291,7 +3310,7 @@ impl VdslMcpServer {
         let dir_name =
             resolve_model_dir(&req.source_target).map_err(|e| McpError::invalid_params(e, None))?;
 
-        let source_path = format!("{COMFYUI_MODELS_BASE}/{dir_name}/{}", req.filename);
+        let source_path = format!("{}/{dir_name}/{}", &*COMFYUI_MODELS_BASE, req.filename);
         let dest_path = req.dest_path.as_deref().unwrap_or("").trim_matches('/');
         let remote_dir = if dest_path.is_empty() {
             format!("models/{dir_name}")
@@ -3548,8 +3567,8 @@ impl VdslMcpServer {
 
         // Build the remote path to list
         let remote_dir = match req.subfolder.as_deref() {
-            Some(sub) if !sub.is_empty() => format!("{COMFYUI_OUTPUT_BASE}/{sub}"),
-            _ => COMFYUI_OUTPUT_BASE.to_string(),
+            Some(sub) if !sub.is_empty() => format!("{}/{sub}", &*COMFYUI_OUTPUT_BASE),
+            _ => COMFYUI_OUTPUT_BASE.clone(),
         };
 
         log.push(format!("Listing images in {remote_dir} ..."));
@@ -4113,8 +4132,8 @@ impl VdslMcpServer {
 
         // Build the search directory
         let search_dir = match req.subfolder.as_deref() {
-            Some(sub) if !sub.is_empty() => format!("{COMFYUI_OUTPUT_BASE}/{sub}"),
-            _ => COMFYUI_OUTPUT_BASE.to_string(),
+            Some(sub) if !sub.is_empty() => format!("{}/{sub}", &*COMFYUI_OUTPUT_BASE),
+            _ => COMFYUI_OUTPUT_BASE.clone(),
         };
 
         // Build pngmetagrep command
@@ -5248,8 +5267,8 @@ async fn execute_transfers(
     for t in transfers {
         // Paths are relative to ComfyUI root
         cp_commands.push(format!(
-            "cp -f {COMFYUI_BASE}/{} {COMFYUI_BASE}/{}",
-            t.from, t.to
+            "cp -f {}/{} {}/{}",
+            &*COMFYUI_BASE, t.from, &*COMFYUI_BASE, t.to
         ));
     }
     let combined = cp_commands.join(" && ");
