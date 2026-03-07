@@ -469,7 +469,7 @@ pub struct VdslDownloadRequest {
     /// Override filename (default: extracted from URL).
     pub filename: Option<String>,
 
-    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519.
     pub ssh_key: Option<String>,
 }
 
@@ -729,7 +729,7 @@ pub struct VdslStorageListRequest {
     /// Path within the bucket (e.g. "models/checkpoints"). Defaults to root.
     pub path: Option<String>,
 
-    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519.
     pub ssh_key: Option<String>,
 
     /// Maximum number of entries to return (default: 50).
@@ -751,7 +751,7 @@ pub struct VdslStoragePullRequest {
     /// Determines the destination directory under ComfyUI models.
     pub target: String,
 
-    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519.
     pub ssh_key: Option<String>,
 }
 
@@ -774,7 +774,7 @@ pub struct VdslStoragePushRequest {
     /// Destination path prefix in B2 (default: "models/<category>").
     pub dest_path: Option<String>,
 
-    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519.
     pub ssh_key: Option<String>,
 }
 
@@ -795,7 +795,7 @@ pub struct VdslStorageArchiveRequest {
     /// Destination path prefix in B2 (default: "models/<category>").
     pub dest_path: Option<String>,
 
-    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519.
     pub ssh_key: Option<String>,
 }
 
@@ -834,7 +834,7 @@ pub struct VdslImageDownloadRequest {
     pub date_prefix: Option<String>,
 
     /// SSH key path (only for source="output_dir").
-    /// Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    /// Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519.
     pub ssh_key: Option<String>,
 }
 
@@ -1079,7 +1079,7 @@ pub struct VdslExecRequest {
     /// RunPod pod ID. If omitted, reuses the last vdsl_connect or vdsl_pod_setup session.
     pub pod_id: Option<String>,
 
-    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519.
     pub ssh_key: Option<String>,
 
     /// Timeout in seconds (default: 30).
@@ -1094,7 +1094,7 @@ pub struct VdslTaskRunRequest {
     /// RunPod pod ID. If omitted, reuses the last vdsl_connect or vdsl_pod_setup session.
     pub pod_id: Option<String>,
 
-    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519.
     pub ssh_key: Option<String>,
 }
 
@@ -1106,7 +1106,7 @@ pub struct VdslTaskStatusRequest {
     /// RunPod pod ID. If omitted, reuses the last vdsl_connect or vdsl_pod_setup session.
     pub pod_id: Option<String>,
 
-    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519.
     pub ssh_key: Option<String>,
 }
 
@@ -1115,7 +1115,7 @@ pub struct VdslTaskListRequest {
     /// RunPod pod ID. If omitted, reuses the last vdsl_connect or vdsl_pod_setup session.
     pub pod_id: Option<String>,
 
-    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519.
     pub ssh_key: Option<String>,
 }
 
@@ -1127,7 +1127,7 @@ pub struct VdslTaskLogRequest {
     /// RunPod pod ID. If omitted, reuses the last vdsl_connect or vdsl_pod_setup session.
     pub pod_id: Option<String>,
 
-    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519.
     pub ssh_key: Option<String>,
 
     /// Number of lines from the end. If omitted, returns full log.
@@ -1357,7 +1357,7 @@ pub struct VdslImageSearchRequest {
     pub subfolder: Option<String>,
 
     /// SSH key path for pod access.
-    /// Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod.
+    /// Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519.
     pub ssh_key: Option<String>,
 }
 
@@ -2911,9 +2911,9 @@ impl VdslMcpServer {
             VDSL_RUNPOD_API_KEY and -o json are injected automatically. \
             Pass subcommand + arguments as an array. \
             Examples: [\"pods\", \"list-pods\"], [\"exec\", \"pod_id\", \"nvidia-smi\"], \
-            [\"download\", \"list\", \"-i\", \"~/.ssh/id_ed25519_runpod\", \"pod_id\"]. \
+            [\"download\", \"list\", \"-i\", \"~/.ssh/id_ed25519\", \"pod_id\"]. \
             For 'exec' subcommand: returns raw text output (not JSON-parsed). \
-            SSH key defaults to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519_runpod if -i is not specified.",
+            SSH key defaults to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519 if -i is not specified.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,

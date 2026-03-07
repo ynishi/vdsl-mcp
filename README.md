@@ -83,12 +83,13 @@ it provides the `lua/` directory containing catalog definitions, compilers, and 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `VDSL_RUNPOD_API_KEY` | For RunPod operations | RunPod API key ([runpod.io/console/user/settings](https://www.runpod.io/console/user/settings)) |
-| `VDSL_SSH_KEY` | For RunPod SSH operations | Path to SSH private key for pod access (e.g. `~/.ssh/id_ed25519_runpod`). Falls back to `~/.ssh/id_ed25519_runpod` if unset |
+| `VDSL_SSH_KEY` | For RunPod SSH operations | Path to SSH private key for pod access (e.g. `~/.ssh/id_ed25519`). Falls back to `~/.ssh/id_ed25519` if unset |
 | `VDSL_COMFYUI_TOKEN` | For authenticated ComfyUI | Bearer token for ComfyUI proxy authentication (RunPod proxy uses this) |
 | `VDSL_CIVITAI_TOKEN` | For CivitAI downloads | CivitAI API token — auto-injected into `cv:` and CivitAI URL downloads |
 | `VDSL_B2_KEY_ID` | For B2 storage | Backblaze B2 application key ID |
 | `VDSL_B2_KEY` | For B2 storage | Backblaze B2 application key |
 | `VDSL_B2_BUCKET` | For B2 storage (optional) | Default B2 bucket name (can also be specified per-call) |
+| `VDSL_COMFYUI_BASE` | Optional | Override ComfyUI install path on pod (default: `/workspace/runpod-slim/ComfyUI`). Community templates may use `/workspace/ComfyUI` etc. |
 | `VDSL_INLINE_HISTORY_DIR` | Optional | Override directory for saving inline Lua code history |
 
 ### MCP Client Configuration
@@ -116,7 +117,7 @@ Then connect with `vdsl_connect(url="http://localhost:8188")`.
       "command": "vdsl-mcp",
       "env": {
         "VDSL_RUNPOD_API_KEY": "rpa_...",
-        "VDSL_SSH_KEY": "~/.ssh/id_ed25519_runpod",
+        "VDSL_SSH_KEY": "~/.ssh/id_ed25519",
         "VDSL_COMFYUI_TOKEN": "your-comfyui-token",
         "VDSL_CIVITAI_TOKEN": "your-civitai-token",
         "VDSL_B2_KEY_ID": "your-b2-key-id",
