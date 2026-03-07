@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
 use crate::application::pod_service::{resolve_api_key, PodService};
+use crate::application::storage_service::{self, StorageService, RCLONE_OP_TIMEOUT_SECS};
 use crate::domain::models::{format_model_catalog_with_limit, parse_model_catalog};
 use crate::domain::pod::{format_pod_list, format_volume_list};
 use crate::infra::comfyui_client::{proxy_url, ComfyUiClient};
@@ -3116,11 +3117,15 @@ impl VdslMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let svc = Self::pod_service()?;
         let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
-        let bucket = resolve_bucket(req.bucket.as_deref())?;
+        let bucket =
+            storage_service::resolve_bucket(req.bucket.as_deref()).map_err(Self::to_mcp_error)?;
         let path = req.path.as_deref().unwrap_or("");
-        let remote = b2_remote(&bucket, path)?;
+        let remote = storage_service::b2_remote(&bucket, path).map_err(Self::to_mcp_error)?;
 
-        ensure_rclone(&svc, &req.pod_id, &ssh_key).await?;
+        StorageService::new(&svc)
+            .ensure_rclone(&req.pod_id, &ssh_key)
+            .await
+            .map_err(Self::to_mcp_error)?;
 
         let result = svc
             .pod_exec(
@@ -3180,13 +3185,18 @@ impl VdslMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let svc = Self::pod_service()?;
         let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
-        let bucket = resolve_bucket(req.bucket.as_deref())?;
-        let remote = b2_remote(&bucket, &req.source)?;
+        let bucket =
+            storage_service::resolve_bucket(req.bucket.as_deref()).map_err(Self::to_mcp_error)?;
+        let remote =
+            storage_service::b2_remote(&bucket, &req.source).map_err(Self::to_mcp_error)?;
         let dir_name =
             resolve_model_dir(&req.target).map_err(|e| McpError::invalid_params(e, None))?;
         let dest = format!("{}/{dir_name}/", &*COMFYUI_MODELS_BASE);
 
-        ensure_rclone(&svc, &req.pod_id, &ssh_key).await?;
+        StorageService::new(&svc)
+            .ensure_rclone(&req.pod_id, &ssh_key)
+            .await
+            .map_err(Self::to_mcp_error)?;
 
         let mut log = Vec::<String>::new();
         log.push(format!("Pulling B2:{bucket}/{} → {dest}", req.source));
@@ -3235,7 +3245,8 @@ impl VdslMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let svc = Self::pod_service()?;
         let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
-        let bucket = resolve_bucket(req.bucket.as_deref())?;
+        let bucket =
+            storage_service::resolve_bucket(req.bucket.as_deref()).map_err(Self::to_mcp_error)?;
         let dir_name =
             resolve_model_dir(&req.source_target).map_err(|e| McpError::invalid_params(e, None))?;
 
@@ -3250,9 +3261,13 @@ impl VdslMcpServer {
         } else {
             dest_path.to_string()
         };
-        let remote = b2_remote(&bucket, &remote_path)?;
+        let remote =
+            storage_service::b2_remote(&bucket, &remote_path).map_err(Self::to_mcp_error)?;
 
-        ensure_rclone(&svc, &req.pod_id, &ssh_key).await?;
+        StorageService::new(&svc)
+            .ensure_rclone(&req.pod_id, &ssh_key)
+            .await
+            .map_err(Self::to_mcp_error)?;
 
         let mut log = Vec::<String>::new();
         log.push(format!("Pushing {source} → B2:{bucket}/{remote_path}"));
@@ -3306,7 +3321,8 @@ impl VdslMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let svc = Self::pod_service()?;
         let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
-        let bucket = resolve_bucket(req.bucket.as_deref())?;
+        let bucket =
+            storage_service::resolve_bucket(req.bucket.as_deref()).map_err(Self::to_mcp_error)?;
         let dir_name =
             resolve_model_dir(&req.source_target).map_err(|e| McpError::invalid_params(e, None))?;
 
@@ -3317,9 +3333,13 @@ impl VdslMcpServer {
         } else {
             dest_path.to_string()
         };
-        let remote = b2_remote(&bucket, &remote_dir)?;
+        let remote =
+            storage_service::b2_remote(&bucket, &remote_dir).map_err(Self::to_mcp_error)?;
 
-        ensure_rclone(&svc, &req.pod_id, &ssh_key).await?;
+        StorageService::new(&svc)
+            .ensure_rclone(&req.pod_id, &ssh_key)
+            .await
+            .map_err(Self::to_mcp_error)?;
 
         let mut log = Vec::<String>::new();
 
@@ -3372,7 +3392,9 @@ impl VdslMcpServer {
             "[2/3] Verifying B2:{bucket}/{remote_dir}/{}...",
             req.filename
         ));
-        let verify_remote = b2_remote(&bucket, &format!("{remote_dir}/{}", req.filename))?;
+        let verify_remote =
+            storage_service::b2_remote(&bucket, &format!("{remote_dir}/{}", req.filename))
+                .map_err(Self::to_mcp_error)?;
         let verify_result = svc
             .pod_exec(
                 &req.pod_id,
@@ -5590,59 +5612,8 @@ fn glob_match_inner(pattern: &[u8], text: &[u8]) -> bool {
 }
 
 // =============================================================================
-// Storage helpers (rclone + B2)
+// Storage helpers
 // =============================================================================
-
-/// Timeout for rclone install (seconds).
-const RCLONE_INSTALL_TIMEOUT_SECS: u64 = 120;
-/// Timeout for rclone operations (seconds).
-const RCLONE_OP_TIMEOUT_SECS: u64 = 600;
-
-/// Ensure rclone is installed on a running pod.
-///
-/// Checks `which rclone`; if absent, installs via the official install script.
-async fn ensure_rclone(svc: &PodService, pod_id: &str, ssh_key: &str) -> Result<(), McpError> {
-    let check = svc
-        .pod_exec(pod_id, &["which", "rclone"], Some(ssh_key), Some(10))
-        .await;
-
-    match check {
-        Ok(ref out) if out.success => return Ok(()),
-        _ => {}
-    }
-
-    let install = svc
-        .pod_exec(
-            pod_id,
-            &[
-                "bash",
-                "-c",
-                "curl -sL https://rclone.org/install.sh | bash",
-            ],
-            Some(ssh_key),
-            Some(RCLONE_INSTALL_TIMEOUT_SECS),
-        )
-        .await
-        .map_err(|e| McpError::internal_error(format!("rclone install failed: {e}"), None))?;
-
-    if !install.success {
-        return Err(McpError::internal_error(
-            format!(
-                "rclone install failed (exit {}): {}{}",
-                install.exit_code,
-                install.stderr.trim(),
-                if install.stdout.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!("\n{}", install.stdout.trim())
-                }
-            ),
-            None,
-        ));
-    }
-
-    Ok(())
-}
 
 /// Resolve SSH key path from request parameter, VDSL_SSH_KEY env var, or hardcoded default.
 ///
@@ -5657,43 +5628,6 @@ fn resolve_ssh_key(param: Option<&str>) -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_SSH_KEY.to_string())
-}
-
-/// Resolve B2 bucket name from request parameter or VDSL_B2_BUCKET env var.
-fn resolve_bucket(bucket: Option<&str>) -> Result<String, McpError> {
-    if let Some(b) = bucket {
-        if !b.is_empty() {
-            return Ok(b.to_string());
-        }
-    }
-    std::env::var("VDSL_B2_BUCKET")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            McpError::invalid_params("bucket not specified and VDSL_B2_BUCKET env not set", None)
-        })
-}
-
-/// Build an rclone B2 connection string using inline credentials.
-///
-/// Requires VDSL_B2_KEY_ID and VDSL_B2_KEY environment variables.
-/// Returns a string like `:b2,account=KEY_ID,key=KEY:bucket/path`.
-fn b2_remote(bucket: &str, path: &str) -> Result<String, McpError> {
-    let key_id = std::env::var("VDSL_B2_KEY_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| McpError::invalid_params("VDSL_B2_KEY_ID env not set", None))?;
-    let key = std::env::var("VDSL_B2_KEY")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| McpError::invalid_params("VDSL_B2_KEY env not set", None))?;
-
-    let path = path.trim_matches('/');
-    if path.is_empty() {
-        Ok(format!(":b2,account={key_id},key={key}:{bucket}"))
-    } else {
-        Ok(format!(":b2,account={key_id},key={key}:{bucket}/{path}"))
-    }
 }
 
 // =============================================================================
@@ -6896,74 +6830,7 @@ mod tests {
         assert!(glob_match("*.*", "file.ext"));
     }
 
-    // --- b2_remote tests ---
-
-    #[test]
-    #[ignore = "set_var poisons parallel tests — run with --ignored --test-threads=1"]
-    fn b2_remote_builds_correct_string() {
-        std::env::set_var("VDSL_B2_KEY_ID", "test_key_id");
-        std::env::set_var("VDSL_B2_KEY", "test_key");
-
-        let result = b2_remote("my-bucket", "models/checkpoints").unwrap();
-        assert_eq!(
-            result,
-            ":b2,account=test_key_id,key=test_key:my-bucket/models/checkpoints"
-        );
-
-        std::env::remove_var("VDSL_B2_KEY_ID");
-        std::env::remove_var("VDSL_B2_KEY");
-    }
-
-    #[test]
-    #[ignore = "set_var poisons parallel tests — run with --ignored --test-threads=1"]
-    fn b2_remote_root_path() {
-        std::env::set_var("VDSL_B2_KEY_ID", "kid");
-        std::env::set_var("VDSL_B2_KEY", "key");
-
-        let result = b2_remote("bucket", "").unwrap();
-        assert_eq!(result, ":b2,account=kid,key=key:bucket");
-
-        let result = b2_remote("bucket", "/").unwrap();
-        assert_eq!(result, ":b2,account=kid,key=key:bucket");
-
-        std::env::remove_var("VDSL_B2_KEY_ID");
-        std::env::remove_var("VDSL_B2_KEY");
-    }
-
-    #[test]
-    #[ignore = "set_var poisons parallel tests — run with --ignored --test-threads=1"]
-    fn b2_remote_missing_credentials() {
-        std::env::remove_var("VDSL_B2_KEY_ID");
-        std::env::remove_var("VDSL_B2_KEY");
-
-        let result = b2_remote("bucket", "path");
-        assert!(result.is_err());
-    }
-
-    // --- resolve_bucket tests ---
-
-    #[test]
-    fn resolve_bucket_from_param() {
-        let result = resolve_bucket(Some("my-bucket")).unwrap();
-        assert_eq!(result, "my-bucket");
-    }
-
-    #[test]
-    fn resolve_bucket_empty_param_falls_through() {
-        // Empty string param should fall through to env var
-        let result = resolve_bucket(Some(""));
-        // Without env var set, this should fail
-        // (env var may or may not be set in test env, so just test non-empty param)
-        assert!(result.is_err() || !result.unwrap().is_empty());
-    }
-
-    #[test]
-    fn resolve_bucket_none_without_env() {
-        // This test is best-effort — if VDSL_B2_BUCKET happens to be set,
-        // it will succeed (which is also valid behavior).
-        let _result = resolve_bucket(None);
-        // Can't assert error without controlling env
-    }
+    // b2_remote / resolve_bucket tests moved to application::storage_service::tests
 
     // --- vdsl_storage_archive tests ---
 
