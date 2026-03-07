@@ -205,8 +205,16 @@ impl ServerHandler for VdslMcpServer {
                  2. vdsl_models — list available checkpoints/LoRAs\n\
                  3. vdsl_generate — create images\n\
                  \n\
+                 VDSL Lua DSL (compile Lua → ComfyUI workflow → generate):\n\
+                 1. Clone VDSL runtime: git clone https://github.com/ynishi/vdsl.git ~/vdsl\n\
+                 2. vdsl_run(script_file, working_dir=\"~/vdsl\") — compile + generate\n\
+                 3. vdsl_catalogs — browse available catalog entries (camera, lighting, figure, etc.)\n\
+                 \n\
                  Infrastructure (RunPod provisioning):\n\
-                 - vdsl_pod_list / vdsl_pod_start / vdsl_pod_stop / vdsl_pod_delete"
+                 - vdsl_pod_list / vdsl_pod_start / vdsl_pod_stop / vdsl_pod_delete\n\
+                 \n\
+                 When working with tool results, write down any important information you might \
+                 need later in your response, as the original tool result may be cleared later."
                     .to_string(),
             ),
         }
