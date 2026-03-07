@@ -65,7 +65,7 @@ impl RunPodCli {
     ///
     /// Equivalent to Lua `M.pods(opts)` in runpod.lua L587-594.
     pub async fn list_pods(&self) -> Result<Vec<serde_json::Value>, DomainError> {
-        let result = self.exec(&["pods", "list-pods"]).await?;
+        let result = self.exec(&["pods", "list-pods", "--includeMachine"]).await?;
         match result {
             serde_json::Value::Array(pods) => Ok(pods),
             // Single pod returned as object — wrap in array

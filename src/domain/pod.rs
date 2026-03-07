@@ -16,10 +16,20 @@ pub fn format_pod_list(pods: &[serde_json::Value]) -> String {
             .as_str()
             .or_else(|| pod["status"].as_str())
             .unwrap_or("unknown");
-        let gpu = pod["machine"]["gpuTypeId"]
+        let gpu_name = pod["machine"]["gpuDisplayName"]
             .as_str()
-            .or_else(|| pod["gpuTypeId"].as_str())
-            .unwrap_or("?");
+            .or_else(|| pod["gpuDisplayName"].as_str())
+            .or_else(|| pod["machine"]["gpuTypeId"].as_str())
+            .or_else(|| pod["gpuTypeId"].as_str());
+
+        // RunPod CLI list-pods often returns empty machine{} — use gpuCount as fallback
+        let gpu_label = match gpu_name {
+            Some(name) => name.to_string(),
+            None => match pod["gpuCount"].as_u64() {
+                Some(n) => format!("GPU x{n}"),
+                None => "?".to_string(),
+            },
+        };
 
         let cost_str = match pod["costPerHr"].as_f64() {
             Some(c) => format!(", ${:.2}/hr", c),
@@ -32,7 +42,7 @@ pub fn format_pod_list(pods: &[serde_json::Value]) -> String {
             id,
             name,
             status,
-            gpu,
+            gpu_label,
             cost_str,
         ));
     }
@@ -86,7 +96,7 @@ mod tests {
             "id": "abc123",
             "name": "comfyui-vdsl",
             "desiredStatus": "RUNNING",
-            "machine": { "gpuTypeId": "NVIDIA A40" },
+            "machine": { "gpuDisplayName": "NVIDIA A40" },
             "costPerHr": 0.39
         })];
         let result = format_pod_list(&pods);
@@ -119,6 +129,37 @@ mod tests {
         assert!(result.contains("1. pod1"));
         assert!(result.contains("2. pod2"));
         assert!(result.contains("EXITED"));
+    }
+
+    #[test]
+    fn format_gpu_display_name_preferred_over_type_id() {
+        let pods = vec![json!({
+            "id": "gpu_test",
+            "name": "gpu-pod",
+            "desiredStatus": "RUNNING",
+            "machine": {
+                "gpuDisplayName": "RTX 4090",
+                "gpuTypeId": "NVIDIA GeForce RTX 4090"
+            }
+        })];
+        let result = format_pod_list(&pods);
+        assert!(result.contains("RTX 4090"));
+        assert!(!result.contains("NVIDIA GeForce RTX 4090"));
+    }
+
+    #[test]
+    fn format_gpu_count_fallback_when_machine_empty() {
+        let pods = vec![json!({
+            "id": "pod_cli",
+            "name": "comfyui-vdsl",
+            "desiredStatus": "RUNNING",
+            "machine": {},
+            "gpuCount": 1,
+            "costPerHr": 0.49
+        })];
+        let result = format_pod_list(&pods);
+        assert!(result.contains("GPU x1"));
+        assert!(!result.contains("?"));
     }
 
     #[test]

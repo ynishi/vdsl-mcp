@@ -288,8 +288,16 @@ impl ComfyUiClient {
             )));
         }
 
-        resp.json()
-            .await
+        // Some ComfyUI endpoints (e.g. /interrupt) return empty body on success.
+        let body = resp.text().await.map_err(|e| {
+            DomainError::ComfyUiConnection(format!("failed to read response from {path}: {e}"))
+        })?;
+
+        if body.trim().is_empty() {
+            return Ok(serde_json::Value::Object(serde_json::Map::new()));
+        }
+
+        serde_json::from_str(&body)
             .map_err(|e| DomainError::ComfyUiConnection(format!("invalid JSON from {path}: {e}")))
     }
 

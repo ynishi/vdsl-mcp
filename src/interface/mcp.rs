@@ -3596,9 +3596,9 @@ impl VdslMcpServer {
         log.push(format!("Listing images in {remote_dir} ..."));
 
         // List image files via SSH
-        let find_cmd = format!(
-            "find {remote_dir} -maxdepth 1 -type f \\( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' \\) -printf '%f\\n' 2>/dev/null | sort"
-        );
+        // Use ls + grep instead of find -printf (not available in BusyBox/Alpine).
+        let find_cmd =
+            format!("ls -1 {remote_dir} 2>/dev/null | grep -iE '\\.(png|jpe?g|webp)$' | sort");
         let output = svc
             .pod_exec(&pod_id, &["sh", "-c", &find_cmd], Some(&ssh_key), Some(30))
             .await
