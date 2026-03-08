@@ -4514,7 +4514,7 @@ async fn exec_lua_mlua(
 
     // Run on blocking thread to avoid blocking the async runtime
     tokio::task::spawn_blocking(move || {
-        let runtime = MluaRuntime::new(&work_dir)?;
+        let runtime = MluaRuntime::new(&work_dir, None)?;
 
         // Reconstruct the code to execute from lua_args.
         // lua_args patterns:
