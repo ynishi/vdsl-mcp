@@ -1,0 +1,42 @@
+[package]
+name = "vdsl-mcp"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "MCP server for VDSL — AI-native image generation platform. RunPod GPU provisioning, ComfyUI orchestration, model management."
+homepage = "https://github.com/ynishi/vdsl-mcp"
+documentation = "https://docs.rs/vdsl-mcp"
+readme = "../../README.md"
+keywords = ["mcp", "comfyui", "runpod", "image-generation", "ai"]
+categories = ["command-line-utilities", "multimedia::images"]
+
+[dependencies]
+vdsl-sync = { workspace = true }
+rmcp = { version = "0.15", features = ["server", "transport-io", "macros"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = "1.2"
+thiserror = { workspace = true }
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "stream"] }
+urlencoding = "2"
+tempfile = { workspace = true }
+chrono = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+uuid = { workspace = true }
+
+# Feature-gated: mlua in-process backend
+mlua = { version = "0.11", features = ["lua54", "vendored"], optional = true }
+mlua-batteries = { version = "0.2", features = ["fs", "json", "http"], optional = true }
+mlua-isle = { version = "0.1", optional = true }
+pngmeta = { version = "0.1.4", optional = true }
+pngmetagrep-core = { version = "0.1.4", optional = true }
+
+[features]
+default = ["mlua-backend"]
+mlua-backend = ["dep:mlua", "dep:mlua-batteries", "dep:mlua-isle", "dep:pngmeta", "dep:pngmetagrep-core", "dep:rusqlite"]
+
+[dev-dependencies]
