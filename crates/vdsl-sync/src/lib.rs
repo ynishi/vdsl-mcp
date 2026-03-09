@@ -29,6 +29,8 @@ pub use domain::entry::SyncEntry;
 pub use domain::error::SyncError;
 pub use domain::file_type::FileType;
 pub use domain::location::{LocationId, LocationState, LocationSummary, SyncSummary};
+pub use domain::route::TransferRoute;
 pub use infra::backend::{RemoteFile, StorageBackend};
 pub use infra::hasher::{ContentHasher, HashResult};
+pub use infra::shell::{LocalShell, RemoteShell, ShellOutput};
 pub use infra::store::{RemoteConfig, SyncStore};

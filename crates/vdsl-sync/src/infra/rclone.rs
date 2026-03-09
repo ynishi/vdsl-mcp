@@ -2,15 +2,17 @@
 //!
 //! Executes `rclone` CLI commands for file transfer to/from cloud storage.
 //! Supports any rclone-compatible remote (B2, S3, GCS, etc.).
+//!
+//! Commands are executed via a [`RemoteShell`],
+//! enabling transfer from different hosts (local machine, GPU pod, etc.).
 
-use std::ffi::OsStr;
 use std::path::Path;
 
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretBox};
-use tokio::process::Command;
 
 use super::backend::{RemoteFile, StorageBackend};
+use super::shell::{LocalShell, RemoteShell};
 use crate::domain::error::SyncError;
 
 /// Rclone CLI storage backend.
@@ -18,18 +20,22 @@ use crate::domain::error::SyncError;
 /// Uses inline credentials via `:backend,key=val:bucket/path` syntax
 /// to avoid requiring global rclone config files.
 ///
-/// The remote string is wrapped in [`Secret`] to prevent accidental
+/// The remote string is wrapped in [`SecretBox`] to prevent accidental
 /// logging of embedded credentials.
 ///
-/// All operations are fully async via `tokio::process::Command`.
+/// Commands are executed via a [`RemoteShell`], defaulting to [`LocalShell`].
 pub struct RcloneBackend {
     /// Rclone remote string, e.g. `:b2,account=KEY_ID,key=KEY:bucket`.
     /// Wrapped in Secret to prevent accidental credential exposure in logs.
     remote: SecretBox<String>,
+    /// Shell for executing rclone commands.
+    shell: Box<dyn RemoteShell>,
 }
 
 impl RcloneBackend {
     /// Create a new RcloneBackend with the given remote string.
+    ///
+    /// Uses [`LocalShell`] for command execution (backward compatible).
     ///
     /// # Example
     /// ```no_run
@@ -39,6 +45,15 @@ impl RcloneBackend {
     pub fn new(remote: impl Into<String>) -> Self {
         Self {
             remote: SecretBox::new(Box::new(remote.into())),
+            shell: Box::new(LocalShell),
+        }
+    }
+
+    /// Create with a custom [`RemoteShell`] (e.g. PodShell for GPU pod execution).
+    pub fn with_shell(remote: impl Into<String>, shell: Box<dyn RemoteShell>) -> Self {
+        Self {
+            remote: SecretBox::new(Box::new(remote.into())),
+            shell,
         }
     }
 
@@ -68,30 +83,22 @@ impl RcloneBackend {
         }
     }
 
-    /// Execute an rclone command asynchronously and return stdout on success.
-    ///
-    /// Accepts `&[&OsStr]` to preserve non-UTF-8 paths (e.g. local file paths)
-    /// without lossy conversion.
-    async fn exec(&self, args: &[&OsStr]) -> Result<String, SyncError> {
-        let output = Command::new("rclone")
-            .args(args)
-            .output()
-            .await
-            .map_err(|e| SyncError::TransferFailed(format!("rclone exec failed: {e}")))?;
+    /// Execute an rclone command via the configured shell.
+    async fn exec_rclone(&self, args: &[&str]) -> Result<String, SyncError> {
+        let mut full_args = vec!["rclone"];
+        full_args.extend_from_slice(args);
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        let output = self.shell.exec(&full_args, None).await?;
+
+        if !output.success {
             return Err(SyncError::TransferFailed(format!(
                 "rclone failed (exit {}): {}",
-                output
-                    .status
-                    .code()
-                    .map_or_else(|| "unknown".to_string(), |c| c.to_string()),
-                stderr.trim()
+                output.exit_code,
+                output.stderr.trim()
             )));
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(output.stdout)
     }
 }
 
@@ -99,12 +106,8 @@ impl RcloneBackend {
 impl StorageBackend for RcloneBackend {
     async fn push(&self, local_path: &Path, remote_path: &str) -> Result<(), SyncError> {
         let dest = self.remote_path(remote_path)?;
-        self.exec(&[
-            OsStr::new("copyto"),
-            local_path.as_os_str(),
-            OsStr::new(&dest),
-        ])
-        .await?;
+        let local_str = local_path.to_string_lossy();
+        self.exec_rclone(&["copyto", &local_str, &dest]).await?;
         Ok(())
     }
 
@@ -114,24 +117,15 @@ impl StorageBackend for RcloneBackend {
         if let Some(parent) = local_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        self.exec(&[
-            OsStr::new("copyto"),
-            OsStr::new(&src),
-            local_path.as_os_str(),
-        ])
-        .await?;
+        let local_str = local_path.to_string_lossy();
+        self.exec_rclone(&["copyto", &src, &local_str]).await?;
         Ok(())
     }
 
     async fn list(&self, remote_path: &str) -> Result<Vec<RemoteFile>, SyncError> {
         let target = self.remote_path(remote_path)?;
         let output = self
-            .exec(&[
-                OsStr::new("lsf"),
-                OsStr::new("--format"),
-                OsStr::new("ps"),
-                OsStr::new(&target),
-            ])
+            .exec_rclone(&["lsf", "--format", "ps", &target])
             .await?;
 
         let mut files = Vec::new();
@@ -164,7 +158,7 @@ impl StorageBackend for RcloneBackend {
     /// "confirmed absent". Use `push`/`pull` for authoritative operations.
     async fn exists(&self, remote_path: &str) -> Result<bool, SyncError> {
         let target = self.remote_path(remote_path)?;
-        let result = self.exec(&[OsStr::new("lsf"), OsStr::new(&target)]).await;
+        let result = self.exec_rclone(&["lsf", &target]).await;
         match result {
             Ok(output) => Ok(!output.trim().is_empty()),
             Err(e) => {

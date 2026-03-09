@@ -1,10 +1,10 @@
 //! E2E test: local <-> pod <-> cloud three-location synchronization.
 //!
-//! Verifies the complete sync lifecycle:
+//! Verifies the complete sync lifecycle with route-based transfer:
 //!
 //! 1. **notify** — register a local file, all remotes become `pending`
-//! 2. **force(pod)** — push to pod, pod becomes `present`
-//! 3. **force(cloud)** — push to cloud, cloud becomes `present`
+//! 2. **force(pod)** — push to pod via local→pod route, pod becomes `present`
+//! 3. **force(cloud)** — push to cloud via local→cloud route, cloud becomes `present`
 //! 4. **status** — verify all three locations show `present`
 //! 5. **file modification** — re-notify marks remotes as `pending` again
 //! 6. **force(None)** — push to ALL remotes in one call
@@ -18,7 +18,6 @@
 //! cargo run --example e2e_three_location_sync --features test-utils
 //! ```
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -26,7 +25,7 @@ use vdsl_sync::infra::backend::memory::InMemoryBackend;
 use vdsl_sync::infra::backend::StorageBackend;
 use vdsl_sync::infra::sqlite::SqliteSyncStore;
 use vdsl_sync::infra::store::RemoteConfig;
-use vdsl_sync::{FileType, LocationId, LocationState, SyncService, SyncStore};
+use vdsl_sync::{FileType, LocationId, LocationState, SyncService, SyncStore, TransferRoute};
 
 /// Wrapper so `Arc<InMemoryBackend>` implements `StorageBackend`.
 struct SharedBackend(Arc<InMemoryBackend>);
@@ -53,7 +52,7 @@ impl StorageBackend for SharedBackend {
     }
 }
 
-/// Build a SyncService with pod + cloud InMemoryBackends.
+/// Build a SyncService with pod + cloud routes using InMemoryBackends.
 async fn build_service(
     local_root: &Path,
 ) -> (SyncService, Arc<InMemoryBackend>, Arc<InMemoryBackend>) {
@@ -79,17 +78,25 @@ async fn build_service(
             .unwrap();
     }
 
-    let mut backends: HashMap<LocationId, Box<dyn StorageBackend>> = HashMap::new();
-    backends.insert(
-        LocationId::new("pod").unwrap(),
-        Box::new(SharedBackend(Arc::clone(&pod_backend))),
-    );
-    backends.insert(
-        LocationId::new("cloud").unwrap(),
-        Box::new(SharedBackend(Arc::clone(&cloud_backend))),
-    );
+    // Route-based: local → pod, local → cloud
+    let routes = vec![
+        TransferRoute::new(
+            LocationId::local(),
+            LocationId::new("pod").unwrap(),
+            local_root.to_path_buf(),
+            "workspace/comfyui/output".into(),
+            Box::new(SharedBackend(Arc::clone(&pod_backend))),
+        ),
+        TransferRoute::new(
+            LocationId::local(),
+            LocationId::new("cloud").unwrap(),
+            local_root.to_path_buf(),
+            "vdsl/output".into(),
+            Box::new(SharedBackend(Arc::clone(&cloud_backend))),
+        ),
+    ];
 
-    let service = SyncService::new(local_root.to_path_buf(), Box::new(store), backends);
+    let service = SyncService::new(local_root.to_path_buf(), Box::new(store), routes);
     (service, pod_backend, cloud_backend)
 }
 

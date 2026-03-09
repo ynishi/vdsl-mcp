@@ -4559,10 +4559,9 @@ async fn exec_lua_mlua(
 /// Callers fall back to MOCK sync backend when `None`.
 #[cfg(feature = "mlua-backend")]
 async fn build_sync_service(work_dir: &std::path::Path) -> Option<Arc<vdsl_sync::SyncService>> {
-    use std::collections::HashMap;
     use vdsl_sync::infra::rclone::RcloneBackend;
     use vdsl_sync::infra::sqlite::SqliteSyncStore;
-    use vdsl_sync::{LocationId, StorageBackend, SyncService, SyncStore};
+    use vdsl_sync::{LocationId, SyncService, SyncStore, TransferRoute};
 
     // Resolve B2 credentials
     let key_id = std::env::var("VDSL_B2_KEY_ID")
@@ -4594,7 +4593,6 @@ async fn build_sync_service(work_dir: &std::path::Path) -> Option<Arc<vdsl_sync:
 
     // Build RcloneBackend for cloud (B2)
     let rclone_remote = format!(":b2,account={key_id},key={key}:{bucket}");
-    let cloud_backend = RcloneBackend::new(rclone_remote);
 
     let cloud_id = LocationId::new("cloud").ok()?;
 
@@ -4611,10 +4609,16 @@ async fn build_sync_service(work_dir: &std::path::Path) -> Option<Arc<vdsl_sync:
         let _ = e;
     }
 
-    let mut backends: HashMap<LocationId, Box<dyn StorageBackend>> = HashMap::new();
-    backends.insert(cloud_id, Box::new(cloud_backend));
+    // Route: local → cloud (push via rclone)
+    let routes = vec![TransferRoute::new(
+        LocationId::local(),
+        cloud_id,
+        work_dir.to_path_buf(),
+        "vdsl/output".into(),
+        Box::new(RcloneBackend::new(rclone_remote)),
+    )];
 
-    let service = SyncService::new(work_dir.to_path_buf(), Box::new(store), backends);
+    let service = SyncService::new(work_dir.to_path_buf(), Box::new(store), routes);
     eprintln!(
         "[INFO] sync: SyncService initialized (cloud=B2, db={})",
         db_path.display()
