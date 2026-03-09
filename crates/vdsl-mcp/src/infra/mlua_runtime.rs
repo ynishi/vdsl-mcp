@@ -56,7 +56,7 @@
 #[cfg(feature = "mlua-backend")]
 mod inner {
     use mlua::prelude::*;
-    use mlua_isle::{Isle, IsleError};
+    use mlua_isle::{AsyncIsle, AsyncIsleDriver, IsleError};
     use rmcp::ErrorData as McpError;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
@@ -236,11 +236,16 @@ mod inner {
 
     /// Thread-isolated Lua VM with mlua-batteries pre-loaded.
     ///
-    /// Each `MluaRuntime` owns one `Isle` (one dedicated thread + one Lua VM).
-    /// The VM has `std.fs`, `std.json` registered via mlua-batteries,
-    /// and `package.path` configured for VDSL module resolution.
+    /// Each `MluaRuntime` owns one `AsyncIsle` handle + `AsyncIsleDriver`
+    /// (one dedicated thread + one Lua VM). The VM has `std.fs`, `std.json`
+    /// registered via mlua-batteries, and `package.path` configured for
+    /// VDSL module resolution.
+    ///
+    /// `AsyncIsle` communicates via tokio mpsc channel, so `exec`/`eval`
+    /// calls are `.await`-able and do not block the tokio runtime.
     pub struct MluaRuntime {
-        isle: Isle,
+        isle: AsyncIsle,
+        driver: Option<AsyncIsleDriver>,
         work_dir: Arc<PathBuf>,
     }
 
@@ -265,14 +270,14 @@ mod inner {
         ///
         /// - `sync_service`: Optional `Arc<SyncService>` for sync store bridge.
         ///   When `None`, `runtime/sync` uses its default (error) backend.
-        pub fn new(
+        pub async fn new(
             work_dir: &Path,
             sync_service: Option<Arc<SyncService>>,
         ) -> Result<Self, McpError> {
             let work_dir = Arc::new(work_dir.to_path_buf());
             let wd = Arc::clone(&work_dir);
 
-            let isle = Isle::spawn(move |lua| {
+            let (isle, driver) = AsyncIsle::spawn(move |lua| {
                 // 1. Register mlua-batteries (std.fs, std.json)
                 mlua_batteries::register_all(lua, "std")?;
 
@@ -840,19 +845,25 @@ mod inner {
 
                 Ok(())
             })
+            .await
             .map_err(|e| McpError::internal_error(format!("mlua init failed: {e}"), None))?;
 
-            Ok(Self { isle, work_dir })
+            Ok(Self {
+                isle,
+                driver: Some(driver),
+                work_dir,
+            })
         }
 
         /// Execute Lua code and capture stdout/stderr via `print()` override.
         ///
         /// The code is run inside the existing VM with stdout/stderr captured
         /// by temporarily overriding `print` and `io.stderr:write`.
-        pub fn exec_code(&self, code: &str) -> Result<MluaExecResult, McpError> {
+        pub async fn exec_code(&self, code: &str) -> Result<MluaExecResult, McpError> {
             let code = code.to_string();
 
-            self.isle
+            let json_str = self
+                .isle
                 .exec(move |lua| {
                     // Wrap execution with stdout/stderr capture
                     let wrapper = format!(
@@ -915,32 +926,32 @@ mod inner {
                     })
                     .to_string())
                 })
-                .map(|json_str| {
-                    let v: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_default();
-                    MluaExecResult {
-                        exit_code: v["exit_code"].as_i64().unwrap_or(1) as i32,
-                        stdout: v["stdout"].as_str().unwrap_or("").to_string(),
-                        stderr: v["stderr"].as_str().unwrap_or("").to_string(),
-                    }
-                })
-                .map_err(|e| McpError::internal_error(format!("mlua exec failed: {e}"), None))
+                .await
+                .map_err(|e| McpError::internal_error(format!("mlua exec failed: {e}"), None))?;
+
+            let v: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_default();
+            Ok(MluaExecResult {
+                exit_code: v["exit_code"].as_i64().unwrap_or(1) as i32,
+                stdout: v["stdout"].as_str().unwrap_or("").to_string(),
+                stderr: v["stderr"].as_str().unwrap_or("").to_string(),
+            })
         }
 
         /// Execute a Lua script file.
-        pub fn exec_file(&self, script_path: &Path) -> Result<MluaExecResult, McpError> {
+        pub async fn exec_file(&self, script_path: &Path) -> Result<MluaExecResult, McpError> {
             let code = std::fs::read_to_string(script_path).map_err(|e| {
                 McpError::internal_error(
                     format!("failed to read script {}: {e}", script_path.display()),
                     None,
                 )
             })?;
-            self.exec_code(&code)
+            self.exec_code(&code).await
         }
 
         /// Execute with environment variables injected as Lua globals.
         ///
         /// Each `(key, value)` pair is set as a global string before execution.
-        pub fn exec_code_with_env(
+        pub async fn exec_code_with_env(
             &self,
             code: &str,
             envs: &[(&str, &str)],
@@ -951,14 +962,19 @@ mod inner {
                 preamble.push_str(&format!("_injected_env['{k}'] = '{escaped}'\n"));
             }
             preamble.push_str(code);
-            self.exec_code(&preamble)
+            self.exec_code(&preamble).await
         }
 
         /// Shut down the Lua VM thread.
-        pub fn shutdown(self) -> Result<(), McpError> {
-            self.isle
-                .shutdown()
-                .map_err(|e| McpError::internal_error(format!("mlua shutdown failed: {e}"), None))
+        pub async fn shutdown(mut self) -> Result<(), McpError> {
+            if let Some(driver) = self.driver.take() {
+                driver
+                    .shutdown()
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("mlua shutdown failed: {e}"), None))
+            } else {
+                Ok(())
+            }
         }
 
         /// Get the working directory.

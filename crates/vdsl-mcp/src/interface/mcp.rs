@@ -4499,60 +4499,50 @@ async fn exec_lua(
 }
 
 /// Execute Lua via mlua-isle in-process VM.
+///
+/// AsyncIsle communicates with the Lua thread via tokio mpsc channel,
+/// so exec/eval calls are `.await`-able without blocking the tokio runtime.
 #[cfg(feature = "mlua-backend")]
 async fn exec_lua_mlua(
     lua_args: &[String],
     work_dir: &std::path::Path,
     envs: &[(&str, &str)],
 ) -> Result<LuaExecResult, McpError> {
-    let work_dir = work_dir.to_path_buf();
-    let envs: Vec<(String, String)> = envs
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    let lua_args = lua_args.to_vec();
+    let runtime = MluaRuntime::new(work_dir, None).await?;
 
-    // Run on blocking thread to avoid blocking the async runtime
-    tokio::task::spawn_blocking(move || {
-        let runtime = MluaRuntime::new(&work_dir, None)?;
+    // Reconstruct the code to execute from lua_args.
+    // lua_args patterns:
+    //   ["-e", "<code>"]           — inline code
+    //   ["<script_path>"]          — script file
+    //   ["-e", "<code>", ...]      — code with extra args
+    let (code, is_file) = parse_lua_args_to_code(lua_args)?;
 
-        // Reconstruct the code to execute from lua_args.
-        // lua_args patterns:
-        //   ["-e", "<code>"]           — inline code
-        //   ["<script_path>"]          — script file
-        //   ["-e", "<code>", ...]      — code with extra args
-        let (code, is_file) = parse_lua_args_to_code(&lua_args)?;
+    let env_refs: Vec<(&str, &str)> = envs.to_vec();
 
-        let env_refs: Vec<(&str, &str)> =
-            envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let result = if is_file {
+        // Inject env vars into _injected_env, then dofile
+        let mut preamble = String::new();
+        for (k, v) in &env_refs {
+            let escaped = v.replace('\\', "\\\\").replace('\'', "\\'");
+            preamble.push_str(&format!("_injected_env['{k}'] = '{escaped}'\n"));
+        }
+        preamble.push_str(&format!(
+            "dofile('{}')",
+            code.replace('\\', "\\\\").replace('\'', "\\'")
+        ));
+        runtime.exec_code(&preamble).await?
+    } else {
+        runtime.exec_code_with_env(&code, &env_refs).await?
+    };
 
-        let result = if is_file {
-            // Inject env vars into _injected_env, then dofile
-            let mut preamble = String::new();
-            for (k, v) in &env_refs {
-                let escaped = v.replace('\\', "\\\\").replace('\'', "\\'");
-                preamble.push_str(&format!("_injected_env['{k}'] = '{escaped}'\n"));
-            }
-            preamble.push_str(&format!(
-                "dofile('{}')",
-                code.replace('\\', "\\\\").replace('\'', "\\'")
-            ));
-            runtime.exec_code(&preamble)?
-        } else {
-            runtime.exec_code_with_env(&code, &env_refs)?
-        };
+    // Shutdown the VM
+    let _ = runtime.shutdown().await;
 
-        // Shutdown the VM
-        let _ = runtime.shutdown();
-
-        Ok(LuaExecResult {
-            exit_code: result.exit_code,
-            stdout: result.stdout,
-            stderr: result.stderr,
-        })
+    Ok(LuaExecResult {
+        exit_code: result.exit_code,
+        stdout: result.stdout,
+        stderr: result.stderr,
     })
-    .await
-    .map_err(|e| McpError::internal_error(format!("mlua task join failed: {e}"), None))?
 }
 
 /// Parse lua CLI args into code string for mlua execution.

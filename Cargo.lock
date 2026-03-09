@@ -885,12 +885,13 @@ dependencies = [
 
 [[package]]
 name = "mlua-isle"
-version = "0.1.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f5854b265e8644091d3e1dd1e6334e203ba622b678b4515f190064de8eb43ee"
+checksum = "6722d100e4fbbd9a61af861abb339364d86081330bb48c57c1a356f54a894ea6"
 dependencies = [
  "mlua",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
