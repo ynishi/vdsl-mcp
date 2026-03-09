@@ -277,6 +277,12 @@ mod inner {
             let work_dir = Arc::new(work_dir.to_path_buf());
             let wd = Arc::clone(&work_dir);
 
+            // Capture tokio Handle before AsyncIsle::spawn (the Isle thread
+            // is a plain std::thread with no tokio context). The handle is
+            // needed for sync bridge functions that call async SyncService
+            // methods via block_on() from the non-tokio Isle thread.
+            let tokio_handle = tokio::runtime::Handle::try_current().ok();
+
             let (isle, driver) = AsyncIsle::spawn(move |lua| {
                 // 1. Register mlua-batteries (std.fs, std.json)
                 mlua_batteries::register_all(lua, "std")?;
@@ -644,7 +650,9 @@ mod inner {
                 //     tokio Handle::block_on() to call async methods from
                 //     the dedicated Isle thread (non-tokio thread).
                 if let Some(svc) = sync_service {
-                    let rt_handle = tokio::runtime::Handle::current();
+                    let rt_handle = tokio_handle
+                        .clone()
+                        .expect("SyncService requires tokio runtime");
 
                     let sync_table = lua.create_table()?;
 
@@ -752,15 +760,21 @@ mod inner {
                         )?;
                     }
 
-                    // get(relative_path) -> table | nil
+                    // get(absolute_path) -> table | nil
+                    // Bridge converts absolute path → relative path via
+                    // SyncService::to_relative() so Lua callers use the same
+                    // absolute paths as notify/register_generation.
                     {
                         let svc = Arc::clone(&svc);
                         let handle = rt_handle.clone();
                         sync_table.set(
                             "get",
                             lua.create_function(move |lua, path: String| {
+                                let relative = svc
+                                    .to_relative(std::path::Path::new(&path))
+                                    .map_err(|e| LuaError::external(e.to_string()))?;
                                 let entry = handle
-                                    .block_on(svc.get(&path))
+                                    .block_on(svc.get(&relative))
                                     .map_err(|e| LuaError::external(e.to_string()))?;
                                 match entry {
                                     Some(e) => {
@@ -831,7 +845,9 @@ mod inner {
                         )?;
                     }
 
-                    // Inject via set_backend()
+                    // Inject via set_backend().
+                    // _sync_bridge remains in globals so Lua code can
+                    // restore it after DI tests (set_backend(nil) → set_backend(_sync_bridge)).
                     let sync_bridge_code = r#"
                         local ok, sync_mod = pcall(require, "vdsl.runtime.sync")
                         if ok and sync_mod and sync_mod.set_backend then
@@ -840,7 +856,6 @@ mod inner {
                     "#;
                     lua.globals().set("_sync_bridge", sync_table)?;
                     lua.load(sync_bridge_code).exec()?;
-                    lua.globals().set("_sync_bridge", LuaValue::Nil)?;
                 }
 
                 Ok(())
@@ -968,10 +983,9 @@ mod inner {
         /// Shut down the Lua VM thread.
         pub async fn shutdown(mut self) -> Result<(), McpError> {
             if let Some(driver) = self.driver.take() {
-                driver
-                    .shutdown()
-                    .await
-                    .map_err(|e| McpError::internal_error(format!("mlua shutdown failed: {e}"), None))
+                driver.shutdown().await.map_err(|e| {
+                    McpError::internal_error(format!("mlua shutdown failed: {e}"), None)
+                })
             } else {
                 Ok(())
             }

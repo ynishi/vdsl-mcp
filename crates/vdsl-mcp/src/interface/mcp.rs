@@ -4508,7 +4508,12 @@ async fn exec_lua_mlua(
     work_dir: &std::path::Path,
     envs: &[(&str, &str)],
 ) -> Result<LuaExecResult, McpError> {
-    let runtime = MluaRuntime::new(work_dir, None).await?;
+    // Build SyncService if B2 credentials are available (best-effort).
+    // When env vars are missing, sync_service remains None and
+    // runtime/sync.lua falls back to its MOCK backend.
+    let sync_service = build_sync_service(work_dir).await;
+
+    let runtime = MluaRuntime::new(work_dir, sync_service).await?;
 
     // Reconstruct the code to execute from lua_args.
     // lua_args patterns:
@@ -4543,6 +4548,79 @@ async fn exec_lua_mlua(
         stdout: result.stdout,
         stderr: result.stderr,
     })
+}
+
+/// Build a [`SyncService`] from environment variables (best-effort).
+///
+/// Returns `Some(Arc<SyncService>)` when all required env vars are set:
+/// - `VDSL_B2_KEY_ID`, `VDSL_B2_KEY`, `VDSL_B2_BUCKET`
+///
+/// Returns `None` on any error (missing env, DB open failure, etc.).
+/// Callers fall back to MOCK sync backend when `None`.
+#[cfg(feature = "mlua-backend")]
+async fn build_sync_service(work_dir: &std::path::Path) -> Option<Arc<vdsl_sync::SyncService>> {
+    use std::collections::HashMap;
+    use vdsl_sync::infra::rclone::RcloneBackend;
+    use vdsl_sync::infra::sqlite::SqliteSyncStore;
+    use vdsl_sync::{LocationId, StorageBackend, SyncService, SyncStore};
+
+    // Resolve B2 credentials
+    let key_id = std::env::var("VDSL_B2_KEY_ID")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    let key = std::env::var("VDSL_B2_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    let bucket = std::env::var("VDSL_B2_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+
+    // Sync DB path: work_dir/.vdsl/sync.db
+    let db_dir = work_dir.join(".vdsl");
+    if let Err(e) = tokio::fs::create_dir_all(&db_dir).await {
+        eprintln!("[WARN] sync: failed to create .vdsl dir: {e}");
+        return None;
+    }
+    let db_path = db_dir.join("sync.db");
+
+    // Open SQLite store
+    let store = match SqliteSyncStore::open(&db_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[WARN] sync: failed to open sync DB: {e}");
+            return None;
+        }
+    };
+
+    // Build RcloneBackend for cloud (B2)
+    let rclone_remote = format!(":b2,account={key_id},key={key}:{bucket}");
+    let cloud_backend = RcloneBackend::new(rclone_remote);
+
+    let cloud_id = LocationId::new("cloud").ok()?;
+
+    // Register cloud remote in store (idempotent)
+    let remote_cfg = vdsl_sync::infra::store::RemoteConfig {
+        location_id: cloud_id.clone(),
+        backend: "rclone".into(),
+        remote_root: "vdsl/output".into(),
+        config: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+    if let Err(e) = store.register_remote(&remote_cfg).await {
+        // Ignore "already exists" errors (idempotent)
+        let _ = e;
+    }
+
+    let mut backends: HashMap<LocationId, Box<dyn StorageBackend>> = HashMap::new();
+    backends.insert(cloud_id, Box::new(cloud_backend));
+
+    let service = SyncService::new(work_dir.to_path_buf(), Box::new(store), backends);
+    eprintln!(
+        "[INFO] sync: SyncService initialized (cloud=B2, db={})",
+        db_path.display()
+    );
+
+    Some(Arc::new(service))
 }
 
 /// Parse lua CLI args into code string for mlua execution.
