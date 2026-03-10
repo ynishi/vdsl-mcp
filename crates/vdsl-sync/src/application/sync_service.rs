@@ -111,18 +111,18 @@ impl SyncService {
             .ok_or_else(|| SyncError::OutsideSyncRoot {
                 path: absolute_path.display().to_string(),
             })?;
-        let relative = absolute_path
-            .strip_prefix(local_root)
-            .map_err(|_| SyncError::OutsideSyncRoot {
-                path: absolute_path.display().to_string(),
-            })?;
-        relative
-            .to_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| SyncError::TransferFailed(format!(
+        let relative =
+            absolute_path
+                .strip_prefix(local_root)
+                .map_err(|_| SyncError::OutsideSyncRoot {
+                    path: absolute_path.display().to_string(),
+                })?;
+        relative.to_str().map(|s| s.to_string()).ok_or_else(|| {
+            SyncError::TransferFailed(format!(
                 "relative path is not valid UTF-8: {}",
                 relative.to_string_lossy()
-            )))
+            ))
+        })
     }
 
     // =========================================================================

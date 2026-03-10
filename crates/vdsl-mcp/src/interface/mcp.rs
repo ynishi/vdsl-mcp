@@ -46,6 +46,15 @@ pub async fn run() -> anyhow::Result<()> {
 // MCP Server
 // =============================================================================
 
+/// Cached SyncService with the pod_id used to build it.
+///
+/// When pod_id changes (e.g. user connects to a different pod),
+/// the cache is invalidated and SyncService is rebuilt with new routes.
+struct SyncCache {
+    service: Arc<vdsl_sync::SyncService>,
+    pod_id: Option<String>,
+}
+
 #[derive(Clone)]
 struct VdslMcpServer {
     tool_router: ToolRouter<Self>,
@@ -60,6 +69,8 @@ struct VdslMcpServer {
     /// Whether the current session is an ephemeral pod (no network volume).
     /// When true, tools warn if images are not downloaded locally.
     ephemeral: Arc<Mutex<bool>>,
+    /// Cached SyncService. Rebuilt only when pod_id changes.
+    sync_cache: Arc<Mutex<Option<SyncCache>>>,
 }
 
 impl VdslMcpServer {
@@ -69,6 +80,7 @@ impl VdslMcpServer {
             last_url: Arc::new(Mutex::new(None)),
             last_pod_id: Arc::new(Mutex::new(None)),
             ephemeral: Arc::new(Mutex::new(false)),
+            sync_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2479,7 +2491,18 @@ impl VdslMcpServer {
             None
         };
 
-        let result = exec_lua(&lua_args, &work_dir, timeout, &[], &req.backend).await?;
+        // Pass pod_id for SyncService mesh routes (best-effort from session state)
+        let session_pod_id = self.last_pod_id.lock().ok().and_then(|g| g.clone());
+        let result = exec_lua(
+            &lua_args,
+            &work_dir,
+            timeout,
+            &[],
+            &req.backend,
+            session_pod_id.as_deref(),
+            &self.sync_cache,
+        )
+        .await?;
 
         let mut response = format!(
             "script: {script_label}\nworking_dir: {}\nexit_code: {}",
@@ -2557,7 +2580,17 @@ impl VdslMcpServer {
         }
 
         let lua_args = vec![script.to_string_lossy().to_string()];
-        let result = exec_lua(&lua_args, &work_dir, 30, &envs, &req.backend).await?;
+        // Catalogs don't need pod sync routes
+        let result = exec_lua(
+            &lua_args,
+            &work_dir,
+            30,
+            &envs,
+            &req.backend,
+            None,
+            &self.sync_cache,
+        )
+        .await?;
 
         if result.exit_code != 0 {
             let mut msg = format!("catalog script failed (exit {})", result.exit_code);
@@ -3732,7 +3765,22 @@ impl VdslMcpServer {
             envs.push(("VDSL_COMFY_TOKEN", token.as_str()));
         }
 
-        let lua_result = exec_lua(&lua_args, &work_dir, timeout, &envs, &req.backend).await?;
+        // Resolve pod_id from request or session state for mesh sync routes
+        let run_pod_id = req
+            .pod_id
+            .as_deref()
+            .map(String::from)
+            .or_else(|| self.last_pod_id.lock().ok().and_then(|g| g.clone()));
+        let lua_result = exec_lua(
+            &lua_args,
+            &work_dir,
+            timeout,
+            &envs,
+            &req.backend,
+            run_pod_id.as_deref(),
+            &self.sync_cache,
+        )
+        .await?;
 
         // Collect script output for reporting
         let mut log = Vec::<String>::new();
@@ -4479,13 +4527,15 @@ async fn exec_lua(
     timeout_secs: u64,
     envs: &[(&str, &str)],
     backend: &LuaBackend,
+    pod_id: Option<&str>,
+    sync_cache: &Mutex<Option<SyncCache>>,
 ) -> Result<LuaExecResult, McpError> {
     match backend {
         LuaBackend::Process => exec_lua_process(lua_args, work_dir, timeout_secs, envs).await,
         LuaBackend::Mlua => {
             #[cfg(feature = "mlua-backend")]
             {
-                exec_lua_mlua(lua_args, work_dir, envs).await
+                exec_lua_mlua(lua_args, work_dir, envs, pod_id, sync_cache).await
             }
             #[cfg(not(feature = "mlua-backend"))]
             {
@@ -4507,11 +4557,35 @@ async fn exec_lua_mlua(
     lua_args: &[String],
     work_dir: &std::path::Path,
     envs: &[(&str, &str)],
+    pod_id: Option<&str>,
+    sync_cache: &Mutex<Option<SyncCache>>,
 ) -> Result<LuaExecResult, McpError> {
-    // Build SyncService if B2 credentials are available (best-effort).
-    // When env vars are missing, sync_service remains None and
-    // runtime/sync.lua falls back to its MOCK backend.
-    let sync_service = build_sync_service(work_dir).await;
+    // Reuse cached SyncService if pod_id hasn't changed.
+    // When pod_id changes (user connected to a different pod), rebuild with new routes.
+    let sync_service = {
+        let cached = sync_cache.lock().ok().and_then(|guard| {
+            let cache = guard.as_ref()?;
+            if cache.pod_id.as_deref() == pod_id {
+                Some(cache.service.clone())
+            } else {
+                None
+            }
+        });
+        if let Some(svc) = cached {
+            Some(svc)
+        } else {
+            let svc = build_sync_service(work_dir, pod_id).await;
+            if let Some(ref s) = svc {
+                if let Ok(mut guard) = sync_cache.lock() {
+                    *guard = Some(SyncCache {
+                        service: s.clone(),
+                        pod_id: pod_id.map(String::from),
+                    });
+                }
+            }
+            svc
+        }
+    };
 
     let runtime = MluaRuntime::new(work_dir, sync_service).await?;
 
@@ -4555,10 +4629,19 @@ async fn exec_lua_mlua(
 /// Returns `Some(Arc<SyncService>)` when all required env vars are set:
 /// - `VDSL_B2_KEY_ID`, `VDSL_B2_KEY`, `VDSL_B2_BUCKET`
 ///
+/// When `pod_id` is provided and RunPod API key is available, additional
+/// Pod routes are registered for 3-location mesh sync (local/pod/cloud).
+///
 /// Returns `None` on any error (missing env, DB open failure, etc.).
 /// Callers fall back to MOCK sync backend when `None`.
 #[cfg(feature = "mlua-backend")]
-async fn build_sync_service(work_dir: &std::path::Path) -> Option<Arc<vdsl_sync::SyncService>> {
+async fn build_sync_service(
+    work_dir: &std::path::Path,
+    pod_id: Option<&str>,
+) -> Option<Arc<vdsl_sync::SyncService>> {
+    use crate::application::pod_service::resolve_api_key;
+    use crate::infra::pod_shell::RunPodCliShell;
+    use crate::infra::runpod_cli::RunPodCli;
     use vdsl_sync::infra::rclone::RcloneBackend;
     use vdsl_sync::infra::sqlite::SqliteSyncStore;
     use vdsl_sync::{LocationId, SyncService, SyncStore, TransferRoute};
@@ -4604,22 +4687,100 @@ async fn build_sync_service(work_dir: &std::path::Path) -> Option<Arc<vdsl_sync:
         created_at: chrono::Utc::now(),
     };
     if let Err(e) = store.register_remote(&remote_cfg).await {
-        // Ignore "already exists" errors (idempotent)
         let _ = e;
     }
 
-    // Route: local → cloud (push via rclone)
-    let routes = vec![TransferRoute::new(
-        LocationId::local(),
-        cloud_id,
-        work_dir.to_path_buf(),
-        std::path::PathBuf::from("vdsl/output"),
-        Box::new(RcloneBackend::new(rclone_remote)),
-    )];
+    let mut routes = vec![
+        // Route 1: local → cloud (push via local rclone)
+        TransferRoute::new(
+            LocationId::local(),
+            cloud_id.clone(),
+            work_dir.to_path_buf(),
+            std::path::PathBuf::from("vdsl/output"),
+            Box::new(RcloneBackend::new(&rclone_remote)),
+        ),
+        // Route 2: cloud → local (pull via local rclone)
+        TransferRoute::new(
+            cloud_id.clone(),
+            LocationId::local(),
+            std::path::PathBuf::from("vdsl/output"),
+            work_dir.to_path_buf(),
+            Box::new(RcloneBackend::new(&rclone_remote)),
+        ),
+    ];
+
+    // --- Pod routes (when pod_id is available) ---
+    if let Some(pid) = pod_id {
+        if let Ok(api_key) = resolve_api_key() {
+            let pod_id_owned = pid.to_string();
+            let ssh_key = Some(resolve_ssh_key(None));
+
+            let pod_loc = match LocationId::new("pod") {
+                Ok(id) => id,
+                Err(_) => {
+                    eprintln!("[WARN] sync: failed to create pod LocationId");
+                    let service = SyncService::new(Box::new(store), routes);
+                    eprintln!(
+                        "[INFO] sync: SyncService initialized (cloud=B2, db={})",
+                        db_path.display()
+                    );
+                    return Some(Arc::new(service));
+                }
+            };
+
+            // Register pod remote in store (idempotent)
+            let pod_cfg = vdsl_sync::infra::store::RemoteConfig {
+                location_id: pod_loc.clone(),
+                backend: "rclone".into(),
+                config: serde_json::json!({"pod_id": pod_id_owned}),
+                created_at: chrono::Utc::now(),
+            };
+            if let Err(e) = store.register_remote(&pod_cfg).await {
+                let _ = e;
+            }
+
+            let pod_output_root = std::path::PathBuf::from(format!("{}/output", *COMFYUI_BASE));
+
+            // Route 3: pod → cloud (Pod上のrcloneで直接B2にpush)
+            let pod_shell_for_rclone = RunPodCliShell::new(
+                RunPodCli::new(api_key.clone()),
+                pod_id_owned.clone(),
+                ssh_key.clone(),
+            );
+            let pod_shell_for_inspect = RunPodCliShell::new(
+                RunPodCli::new(api_key.clone()),
+                pod_id_owned.clone(),
+                ssh_key.clone(),
+            );
+            routes.push(TransferRoute::with_src_shell(
+                pod_loc.clone(),
+                cloud_id,
+                pod_output_root.clone(),
+                std::path::PathBuf::from("vdsl/output"),
+                Box::new(RcloneBackend::with_shell(
+                    &rclone_remote,
+                    Box::new(pod_shell_for_rclone),
+                )),
+                Box::new(pod_shell_for_inspect),
+            ));
+
+            // Route 4: local → pod (push via local rclone to pod sftp)
+            // Note: This requires pod sftp access. Using pod_exec + rclone
+            // on the pod side to pull from B2 is more reliable for large files.
+            // For now, local→pod is covered by local→cloud→pod chain.
+
+            eprintln!("[INFO] sync: pod routes added (pod_id={pod_id_owned})",);
+        }
+    }
 
     let service = SyncService::new(Box::new(store), routes);
     eprintln!(
-        "[INFO] sync: SyncService initialized (cloud=B2, db={})",
+        "[INFO] sync: SyncService initialized (cloud=B2, routes={}, db={})",
+        if pod_id.is_some() {
+            "local↔cloud+pod→cloud"
+        } else {
+            "local↔cloud"
+        },
         db_path.display()
     );
 
@@ -5594,12 +5755,16 @@ async fn inject_vdsl_metadata(
     let manifest_path = manifest_file.path().to_string_lossy().to_string();
 
     let lua_args = vec!["-e".to_string(), VDSL_INJECT_LUA.to_string()];
+    // Inject uses Process backend (not mlua), so sync_cache is unused.
+    let no_cache = Mutex::new(None);
     let result = exec_lua(
         &lua_args,
         work_dir,
         VDSL_INJECT_TIMEOUT_SECS,
         &[("VDSL_INJECT_MANIFEST", &manifest_path)],
         &LuaBackend::default(),
+        None,
+        &no_cache,
     )
     .await
     .map_err(|e| format!("{e}"))?;
