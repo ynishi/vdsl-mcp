@@ -18,7 +18,7 @@
 //! cargo run --example e2e_three_location_sync --features test-utils
 //! ```
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use vdsl_sync::infra::backend::memory::InMemoryBackend;
@@ -62,15 +62,11 @@ async fn build_service(
     let cloud_backend = Arc::new(InMemoryBackend::default());
 
     // Register remotes in store
-    for (id, root) in &[
-        ("pod", "workspace/comfyui/output"),
-        ("cloud", "vdsl/output"),
-    ] {
+    for id in &["pod", "cloud"] {
         store
             .register_remote(&RemoteConfig {
                 location_id: LocationId::new(*id).unwrap(),
                 backend: "memory".into(),
-                remote_root: root.to_string(),
                 config: serde_json::json!({}),
                 created_at: chrono::Utc::now(),
             })
@@ -84,19 +80,19 @@ async fn build_service(
             LocationId::local(),
             LocationId::new("pod").unwrap(),
             local_root.to_path_buf(),
-            "workspace/comfyui/output".into(),
+            PathBuf::from("workspace/comfyui/output"),
             Box::new(SharedBackend(Arc::clone(&pod_backend))),
         ),
         TransferRoute::new(
             LocationId::local(),
             LocationId::new("cloud").unwrap(),
             local_root.to_path_buf(),
-            "vdsl/output".into(),
+            PathBuf::from("vdsl/output"),
             Box::new(SharedBackend(Arc::clone(&cloud_backend))),
         ),
     ];
 
-    let service = SyncService::new(local_root.to_path_buf(), Box::new(store), routes);
+    let service = SyncService::new(Box::new(store), routes);
     (service, pod_backend, cloud_backend)
 }
 

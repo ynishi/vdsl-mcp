@@ -3,7 +3,7 @@
 //! Encapsulates "how to move a file from src to dest", including
 //! path resolution for both ends and backend delegation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::domain::error::SyncError;
 use crate::domain::location::LocationId;
@@ -16,12 +16,12 @@ use crate::infra::shell::RemoteShell;
 ///
 /// - `src_file_root`: base directory on the src location's host.
 ///   For local: `/Users/.../output`. For pod: `/workspace/comfyui/output`.
-/// - `dest_remote_root`: prefix on the dest location.
-///   For cloud: `"vdsl/output"`. For pod: `"workspace/comfyui/output"`.
+/// - `dest_file_root`: base directory on the dest location's host.
+///   For cloud: `"vdsl/output"`. For local: `/Users/.../output`.
 ///
 /// Full paths:
 /// - src:  `src_file_root / relative_path`
-/// - dest: `dest_remote_root / relative_path`
+/// - dest: `dest_file_root / relative_path`
 ///
 /// # Source shell
 ///
@@ -38,7 +38,7 @@ pub struct TransferRoute {
     src: LocationId,
     dest: LocationId,
     src_file_root: PathBuf,
-    dest_remote_root: String,
+    dest_file_root: PathBuf,
     backend: Box<dyn StorageBackend>,
     /// Shell for source-side file operations (existence check, hash).
     /// `None` when src is local (use filesystem directly).
@@ -51,14 +51,14 @@ impl TransferRoute {
         src: LocationId,
         dest: LocationId,
         src_file_root: PathBuf,
-        dest_remote_root: String,
+        dest_file_root: PathBuf,
         backend: Box<dyn StorageBackend>,
     ) -> Self {
         Self {
             src,
             dest,
             src_file_root,
-            dest_remote_root,
+            dest_file_root,
             backend,
             src_shell: None,
         }
@@ -72,7 +72,7 @@ impl TransferRoute {
         src: LocationId,
         dest: LocationId,
         src_file_root: PathBuf,
-        dest_remote_root: String,
+        dest_file_root: PathBuf,
         backend: Box<dyn StorageBackend>,
         src_shell: Box<dyn RemoteShell>,
     ) -> Self {
@@ -80,7 +80,7 @@ impl TransferRoute {
             src,
             dest,
             src_file_root,
-            dest_remote_root,
+            dest_file_root,
             backend,
             src_shell: Some(src_shell),
         }
@@ -98,8 +98,8 @@ impl TransferRoute {
         &self.src_file_root
     }
 
-    pub fn dest_remote_root(&self) -> &str {
-        &self.dest_remote_root
+    pub fn dest_file_root(&self) -> &Path {
+        &self.dest_file_root
     }
 
     /// Transfer a file along this route.
@@ -110,9 +110,11 @@ impl TransferRoute {
         Self::validate_relative_path(relative_path)?;
 
         let src_path = self.src_file_root.join(relative_path);
-        let dest_path = Self::join_remote(&self.dest_remote_root, relative_path);
+        let dest_path = Self::safe_join(&self.dest_file_root, relative_path);
 
-        self.backend.push(&src_path, &dest_path).await
+        self.backend
+            .push(&src_path, &dest_path.to_string_lossy())
+            .await
     }
 
     /// The backend held by this route (for list/exists/pull operations).
@@ -232,17 +234,12 @@ impl TransferRoute {
         Ok(())
     }
 
-    /// Join a remote root with a relative path.
+    /// Safely join a root path with a relative path.
     ///
-    /// Public for use by pull_file() in Phase 1.
-    pub fn join_remote(root: &str, relative: &str) -> String {
-        let root = root.trim_end_matches('/');
-        let rel = relative.trim_start_matches('/');
-        if root.is_empty() {
-            rel.to_string()
-        } else {
-            format!("{root}/{rel}")
-        }
+    /// Trims leading `/` from the relative part to prevent `PathBuf::join`
+    /// from replacing the root entirely (Unix absolute path behaviour).
+    pub(crate) fn safe_join(root: &Path, relative: &str) -> PathBuf {
+        root.join(relative.trim_start_matches('/'))
     }
 }
 
@@ -251,39 +248,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn join_remote_normal() {
+    fn safe_join_normal() {
         assert_eq!(
-            TransferRoute::join_remote("vdsl/output", "images/001.png"),
-            "vdsl/output/images/001.png"
+            TransferRoute::safe_join(Path::new("vdsl/output"), "images/001.png"),
+            PathBuf::from("vdsl/output/images/001.png")
         );
     }
 
     #[test]
-    fn join_remote_trailing_slash() {
+    fn safe_join_trailing_slash() {
         assert_eq!(
-            TransferRoute::join_remote("root/", "file.png"),
-            "root/file.png"
+            TransferRoute::safe_join(Path::new("root/"), "file.png"),
+            PathBuf::from("root/file.png")
         );
     }
 
     #[test]
-    fn join_remote_leading_slash() {
+    fn safe_join_leading_slash() {
         assert_eq!(
-            TransferRoute::join_remote("root", "/file.png"),
-            "root/file.png"
+            TransferRoute::safe_join(Path::new("root"), "/file.png"),
+            PathBuf::from("root/file.png")
         );
     }
 
     #[test]
-    fn join_remote_empty_root() {
-        assert_eq!(TransferRoute::join_remote("", "file.png"), "file.png");
+    fn safe_join_empty_root() {
+        assert_eq!(
+            TransferRoute::safe_join(Path::new(""), "file.png"),
+            PathBuf::from("file.png")
+        );
     }
 
     #[test]
-    fn join_remote_both_slashes() {
+    fn safe_join_both_slashes() {
         assert_eq!(
-            TransferRoute::join_remote("root/", "/file.png"),
-            "root/file.png"
+            TransferRoute::safe_join(Path::new("root/"), "/file.png"),
+            PathBuf::from("root/file.png")
         );
     }
 

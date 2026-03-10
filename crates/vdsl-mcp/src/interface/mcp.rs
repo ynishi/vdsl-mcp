@@ -4600,7 +4600,6 @@ async fn build_sync_service(work_dir: &std::path::Path) -> Option<Arc<vdsl_sync:
     let remote_cfg = vdsl_sync::infra::store::RemoteConfig {
         location_id: cloud_id.clone(),
         backend: "rclone".into(),
-        remote_root: "vdsl/output".into(),
         config: serde_json::json!({}),
         created_at: chrono::Utc::now(),
     };
@@ -4614,11 +4613,11 @@ async fn build_sync_service(work_dir: &std::path::Path) -> Option<Arc<vdsl_sync:
         LocationId::local(),
         cloud_id,
         work_dir.to_path_buf(),
-        "vdsl/output".into(),
+        std::path::PathBuf::from("vdsl/output"),
         Box::new(RcloneBackend::new(rclone_remote)),
     )];
 
-    let service = SyncService::new(work_dir.to_path_buf(), Box::new(store), routes);
+    let service = SyncService::new(Box::new(store), routes);
     eprintln!(
         "[INFO] sync: SyncService initialized (cloud=B2, db={})",
         db_path.display()

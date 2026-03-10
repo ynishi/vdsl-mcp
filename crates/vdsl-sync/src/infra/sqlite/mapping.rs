@@ -195,23 +195,18 @@ pub(crate) fn query_entries(
 }
 
 /// Extract raw remote row fields from a rusqlite row.
+///
+/// SELECT order: location_id, backend, config, created_at
 pub(crate) fn row_to_remote_tuple(
     row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<(String, String, String, String, String)> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-    ))
+) -> rusqlite::Result<(String, String, String, String)> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
 }
 
 /// Build a `RemoteConfig` from raw SQLite row tuple.
 pub(crate) fn tuple_to_remote_config(
     loc_str: String,
     backend: String,
-    remote_root: String,
     config_str: String,
     created_at_str: String,
 ) -> Result<RemoteConfig, SyncError> {
@@ -227,7 +222,6 @@ pub(crate) fn tuple_to_remote_config(
     Ok(RemoteConfig {
         location_id: loc_id,
         backend,
-        remote_root,
         config,
         created_at,
     })

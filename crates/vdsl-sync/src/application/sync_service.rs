@@ -5,20 +5,20 @@
 //!
 //! # Path model
 //!
-//! All entries are stored with **relative paths** from `local_file_root`.
+//! All entries are stored with **relative paths**.
 //! Each route encapsulates src/dest path resolution via `TransferRoute`.
 //!
-//! # Route-based architecture (Phase 1)
+//! # Route-based architecture
 //!
 //! Transfer operations use `Vec<TransferRoute>` instead of
 //! `HashMap<LocationId, StorageBackend>`. Each route is a directed edge
 //! (src → dest) with its own backend and path roots.
 //!
-//! `notify()` remains Local-only in Phase 1 (`local_file_root` based).
-//! Phase 2 will add RemoteShell-based hash computation for non-local notify.
+//! `notify()` resolves the local file root from a route whose src is `local`.
+//! `notify_remote()` uses the route's `src_shell` for remote hash computation.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
@@ -72,17 +72,13 @@ pub struct BatchResult {
 ///
 /// Coordinates store (persistence) + routes (transfer) + hasher (identity).
 ///
-/// `local_file_root` is the base directory for local file operations
-/// (notify, inspect, to_relative). Phase 1 only — Phase 2 will remove
-/// this field when RemoteShell-based hash computation is implemented.
+/// The local file root is derived from routes whose `src` is `local`.
+/// No dedicated field — all path resolution goes through routes.
 pub struct SyncService {
     store: Box<dyn SyncStore>,
     routes: Vec<TransferRoute>,
     hasher: Arc<dyn ContentHasher>,
     force_concurrency: usize,
-    /// Local file root for notify/inspect operations (Phase 1).
-    /// Phase 2 で廃止予定 — RemoteShell 経由のハッシュ計算に移行後。
-    local_file_root: PathBuf,
 }
 
 impl SyncService {
@@ -90,16 +86,11 @@ impl SyncService {
     const DEFAULT_FORCE_CONCURRENCY: usize = 8;
 
     /// Create a new SyncService.
-    ///
-    /// `local_file_root` is required for Phase 1 notify/inspect operations.
-    /// Phase 2 will remove this parameter.
     pub fn new(
-        local_file_root: PathBuf,
         store: Box<dyn SyncStore>,
         routes: Vec<TransferRoute>,
     ) -> Self {
         Self {
-            local_file_root,
             store,
             routes,
             hasher: Arc::new(Djb2Hasher),
@@ -109,13 +100,11 @@ impl SyncService {
 
     /// Create with a custom content hasher.
     pub fn with_hasher(
-        local_file_root: PathBuf,
         store: Box<dyn SyncStore>,
         routes: Vec<TransferRoute>,
         hasher: Arc<dyn ContentHasher>,
     ) -> Self {
         Self {
-            local_file_root,
             store,
             routes,
             hasher,
@@ -140,21 +129,31 @@ impl SyncService {
         self.routes.retain(|r| r.dest() != dest);
     }
 
-    /// The local file root (Phase 1 — for notify/inspect).
-    pub fn local_file_root(&self) -> &Path {
-        &self.local_file_root
+    /// Resolve the local file root from routes.
+    ///
+    /// Finds the first route whose src is `local` and returns its `src_file_root`.
+    /// Returns `None` if no local-source route is registered.
+    pub fn local_root(&self) -> Option<&Path> {
+        self.routes
+            .iter()
+            .find(|r| r.src().is_local())
+            .map(|r| r.src_file_root().as_path())
     }
 
     // =========================================================================
     // Path helpers
     // =========================================================================
 
-    /// Convert an absolute local path to a relative path from `local_file_root`.
+    /// Convert an absolute local path to a relative path from the local file root.
     ///
-    /// Returns `Err(OutsideSyncRoot)` if the path is not under `local_file_root`.
+    /// Returns `Err(OutsideSyncRoot)` if the path is not under the local root,
+    /// or if no local-source route is registered.
     pub fn to_relative(&self, absolute_path: &Path) -> Result<String, SyncError> {
+        let local_root = self.local_root().ok_or_else(|| SyncError::OutsideSyncRoot {
+            path: absolute_path.display().to_string(),
+        })?;
         absolute_path
-            .strip_prefix(&self.local_file_root)
+            .strip_prefix(local_root)
             .map(|p| p.to_string_lossy().to_string())
             .map_err(|_| SyncError::OutsideSyncRoot {
                 path: absolute_path.display().to_string(),
@@ -436,26 +435,6 @@ impl SyncService {
                 let route = match route {
                     Some(r) => r,
                     None => {
-                        // No Present src with a matching route.
-                        // Phase 1 fallback: check if local file was deleted.
-                        let local_path = self.local_file_root.join(&entry.relative_path);
-                        if !local_path.exists() {
-                            if let Err(e) = self
-                                .store
-                                .set_location_state(
-                                    &entry.id,
-                                    &LocationId::local(),
-                                    LocationState::Absent,
-                                )
-                                .await
-                            {
-                                tracing::error!(
-                                    entry_id = %entry.id,
-                                    error = %e,
-                                    "failed to mark local as absent"
-                                );
-                            }
-                        }
                         return Err((
                             entry.relative_path,
                             format!("no route available to {target}"),
@@ -615,33 +594,40 @@ impl SyncService {
 
     /// Pull a file from a remote location to local.
     ///
-    /// Phase 1: uses backend.pull() directly (not route.transfer()).
-    /// Finds a route from src to local and uses its backend.
+    /// Requires a route registered from `src` → `local`.
+    /// The route's `src_file_root` is used as the remote path root.
+    ///
+    /// # Route registration for pull
+    ///
+    /// ```ignore
+    /// // Push route: local → cloud
+    /// TransferRoute::new(local, cloud, local_dir, "vdsl/output", backend)
+    /// // Pull route: cloud → local (explicit reverse)
+    /// TransferRoute::new(cloud, local, "vdsl/output", "", backend)
+    /// ```
     pub async fn pull_file(&self, src: &LocationId, relative_path: &str) -> Result<(), SyncError> {
         let local = LocationId::local();
 
-        // Find route from src to local, or fallback to src's outbound route
-        // to get the backend (Phase 1 compatibility).
         let route = self
             .find_route(src, &local)
-            .or_else(|| {
-                // Fallback: find any route where src is the source
-                // (use its backend for pull operation)
-                self.routes.iter().find(|r| r.src() == src)
-            })
             .ok_or_else(|| SyncError::NoRouteAvailable {
                 dest: local.to_string(),
                 path: relative_path.to_string(),
             })?;
 
-        // Resolve remote path using route's dest_remote_root or src's remote root
-        let remote_path = TransferRoute::join_remote(
-            route.dest_remote_root(),
-            relative_path,
-        );
-        let local_path = self.local_file_root.join(relative_path);
+        // remote_path = src_file_root / relative_path
+        let remote_path = TransferRoute::safe_join(route.src_file_root(), relative_path);
+        let local_path = TransferRoute::safe_join(route.dest_file_root(), relative_path);
 
-        route.backend().pull(&remote_path, &local_path).await?;
+        // Ensure parent directory exists
+        if let Some(parent) = local_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        route
+            .backend()
+            .pull(&remote_path.to_string_lossy(), &local_path)
+            .await?;
 
         // Auto-register if not tracked, or update state if already tracked
         match self.store.get_by_path(relative_path).await? {
@@ -788,6 +774,7 @@ mod tests {
     use super::*;
     use crate::infra::backend::memory::InMemoryBackend;
     use crate::infra::backend::StorageBackend;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     #[cfg(feature = "sqlite")]
@@ -821,12 +808,11 @@ mod tests {
         let store = SqliteSyncStore::open_in_memory().await.unwrap();
         let cloud_backend = Arc::new(InMemoryBackend::default());
 
-        // Register "cloud" as a remote with a remote_root
+        // Register "cloud" as a remote
         store
             .register_remote(&RemoteConfig {
                 location_id: LocationId::new("cloud").unwrap(),
                 backend: "memory".into(),
-                remote_root: "remote/output".into(),
                 config: serde_json::json!({}),
                 created_at: chrono::Utc::now(),
             })
@@ -838,11 +824,11 @@ mod tests {
             LocationId::local(),
             LocationId::new("cloud").unwrap(),
             dir.to_path_buf(),
-            "remote/output".into(),
+            PathBuf::from("remote/output"),
             Box::new(Arc::clone(&cloud_backend)),
         )];
 
-        let service = SyncService::new(dir.to_path_buf(), Box::new(store), routes);
+        let service = SyncService::new(Box::new(store), routes);
         (service, cloud_backend)
     }
 
@@ -923,7 +909,7 @@ mod tests {
         assert_eq!(batch.pushed, 1);
         assert_eq!(batch.failed, 0);
 
-        // Verify backend received the remote_root-prefixed path
+        // Verify backend received the dest_file_root-prefixed path
         let log = backend.log.lock().await;
         assert_eq!(log.len(), 1);
         match &log[0] {
@@ -1035,7 +1021,7 @@ mod tests {
         let rel = service.to_relative(&abs).unwrap();
         assert_eq!(rel, "sub/dir/file.png");
 
-        let back = service.local_file_root().join(&rel);
+        let back = service.local_root().unwrap().join(&rel);
         assert_eq!(back, abs);
     }
 
@@ -1161,6 +1147,114 @@ mod tests {
         assert!(route.unwrap().src().is_local());
     }
 
+    /// Build a service with local→cloud (push) + cloud→local (pull) routes.
+    #[cfg(feature = "sqlite")]
+    async fn test_service_with_pull_route(
+        dir: &Path,
+    ) -> (SyncService, Arc<InMemoryBackend>) {
+        let store = SqliteSyncStore::open_in_memory().await.unwrap();
+        let cloud_backend = Arc::new(InMemoryBackend::default());
+
+        store
+            .register_remote(&RemoteConfig {
+                location_id: LocationId::new("cloud").unwrap(),
+                backend: "memory".into(),
+                config: serde_json::json!({}),
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let routes = vec![
+            // Push: local → cloud
+            TransferRoute::new(
+                LocationId::local(),
+                LocationId::new("cloud").unwrap(),
+                dir.to_path_buf(),
+                PathBuf::from("remote/output"),
+                Box::new(Arc::clone(&cloud_backend)),
+            ),
+            // Pull: cloud → local (reverse route)
+            TransferRoute::new(
+                LocationId::new("cloud").unwrap(),
+                LocationId::local(),
+                PathBuf::from("remote/output"),
+                dir.to_path_buf(),
+                Box::new(Arc::clone(&cloud_backend)),
+            ),
+        ];
+
+        let service = SyncService::new(Box::new(store), routes);
+        (service, cloud_backend)
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn pull_file_uses_reverse_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, backend) = test_service_with_pull_route(dir.path()).await;
+
+        // Pre-register the file as existing on cloud, pending on local
+        let cloud = LocationId::new("cloud").unwrap();
+        let mut locations = HashMap::new();
+        locations.insert(cloud.clone(), LocationState::Present);
+        locations.insert(LocationId::local(), LocationState::Pending);
+
+        let opts = RegisterOpts {
+            file_hash: "hash_pull".into(),
+            content_hash: None,
+            file_size: Some(512),
+            gen_id: None,
+            initial_locations: locations,
+        };
+        service
+            .register("pull-me.json", FileType::Asset, opts)
+            .await
+            .unwrap();
+
+        // Pull from cloud to local
+        let result = service.pull_file(&cloud, "pull-me.json").await;
+        assert!(result.is_ok(), "pull_file should succeed: {result:?}");
+
+        // Verify backend received correct remote path
+        let log = backend.log.lock().await;
+        let pull_ops: Vec<_> = log
+            .iter()
+            .filter(|op| matches!(op, crate::infra::backend::memory::Op::Pull { .. }))
+            .collect();
+        assert_eq!(pull_ops.len(), 1);
+        match pull_ops[0] {
+            crate::infra::backend::memory::Op::Pull { remote, local } => {
+                assert_eq!(remote, "remote/output/pull-me.json");
+                assert!(
+                    local.ends_with("pull-me.json"),
+                    "local path should end with filename: {local}"
+                );
+            }
+            _ => panic!("expected Pull op"),
+        }
+
+        // Both locations should be Present
+        let entry = service.get("pull-me.json").await.unwrap().unwrap();
+        assert_eq!(entry.location_state(&cloud), LocationState::Present);
+        assert_eq!(
+            entry.location_state(&LocationId::local()),
+            LocationState::Present
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn pull_file_no_route_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, _) = test_service_with_dir(dir.path()).await;
+
+        // test_service_with_dir only has local→cloud, no cloud→local
+        let cloud = LocationId::new("cloud").unwrap();
+        let result = service.pull_file(&cloud, "no-route.json").await;
+        assert!(matches!(result, Err(SyncError::NoRouteAvailable { .. })));
+    }
+
     /// Build a service with pod→cloud route (remote source).
     #[cfg(feature = "sqlite")]
     async fn test_service_with_remote_source(
@@ -1171,12 +1265,11 @@ mod tests {
         let cloud_backend = Arc::new(InMemoryBackend::default());
 
         // Register remotes
-        for (id, root) in &[("pod", "/workspace/output"), ("cloud", "vdsl/output")] {
+        for id in &["pod", "cloud"] {
             store
                 .register_remote(&RemoteConfig {
                     location_id: LocationId::new(*id).unwrap(),
                     backend: "memory".into(),
-                    remote_root: root.to_string(),
                     config: serde_json::json!({}),
                     created_at: chrono::Utc::now(),
                 })
@@ -1189,12 +1282,12 @@ mod tests {
             LocationId::new("pod").unwrap(),
             LocationId::new("cloud").unwrap(),
             PathBuf::from("/workspace/output"),
-            "vdsl/output".into(),
+            PathBuf::from("vdsl/output"),
             Box::new(Arc::clone(&cloud_backend)),
             mock_shell,
         )];
 
-        let service = SyncService::new(dir.to_path_buf(), Box::new(store), routes);
+        let service = SyncService::new(Box::new(store), routes);
         (service, cloud_backend)
     }
 

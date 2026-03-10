@@ -432,13 +432,12 @@ impl SyncStore for SqliteSyncStore {
                     .map_err(|e| SyncError::Store(format!("config serialize: {e}")))?;
                 let created_at_str = ts_to_string(remote.created_at);
                 conn.execute(
-                    "INSERT INTO sync_remotes (location_id, backend, remote_root, config, created_at)
-                     VALUES (?, ?, ?, ?, ?)
-                     ON CONFLICT (location_id) DO UPDATE SET backend = excluded.backend, remote_root = excluded.remote_root, config = excluded.config",
+                    "INSERT INTO sync_remotes (location_id, backend, config, created_at)
+                     VALUES (?, ?, ?, ?)
+                     ON CONFLICT (location_id) DO UPDATE SET backend = excluded.backend, config = excluded.config",
                     params![
                         remote.location_id.as_str(),
                         remote.backend,
-                        remote.remote_root,
                         config_json,
                         created_at_str,
                     ],
@@ -459,7 +458,7 @@ impl SyncStore for SqliteSyncStore {
             .call(move |conn| {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT location_id, backend, remote_root, config, created_at
+                        "SELECT location_id, backend, config, created_at
                          FROM sync_remotes WHERE location_id = ?",
                     )
                     .map_err(|e| SyncError::Store(format!("{e}")))?;
@@ -468,12 +467,11 @@ impl SyncStore for SqliteSyncStore {
                     .map_err(|e| SyncError::Store(format!("{e}")))?;
                 match rows.next() {
                     Some(row) => {
-                        let (loc, backend, remote_root, config_str, created_at_str) =
+                        let (loc, backend, config_str, created_at_str) =
                             row.map_err(|e| SyncError::Store(format!("{e}")))?;
                         Ok(Some(tuple_to_remote_config(
                             loc,
                             backend,
-                            remote_root,
                             config_str,
                             created_at_str,
                         )?))
@@ -489,7 +487,7 @@ impl SyncStore for SqliteSyncStore {
         self.conn
             .call(|conn| {
                 let mut stmt = conn
-                    .prepare("SELECT location_id, backend, remote_root, config, created_at FROM sync_remotes ORDER BY location_id")
+                    .prepare("SELECT location_id, backend, config, created_at FROM sync_remotes ORDER BY location_id")
                     .map_err(|e| SyncError::Store(format!("{e}")))?;
                 let rows = stmt
                     .query_map([], row_to_remote_tuple)
@@ -497,12 +495,11 @@ impl SyncStore for SqliteSyncStore {
 
                 let mut remotes = Vec::new();
                 for row in rows {
-                    let (loc, backend, remote_root, config_str, created_at_str) =
+                    let (loc, backend, config_str, created_at_str) =
                         row.map_err(|e| SyncError::Store(format!("{e}")))?;
                     remotes.push(tuple_to_remote_config(
                         loc,
                         backend,
-                        remote_root,
                         config_str,
                         created_at_str,
                     )?);
@@ -885,7 +882,6 @@ mod tests {
         let remote = RemoteConfig {
             location_id: LocationId::new("cloud").expect("valid"),
             backend: "rclone".into(),
-            remote_root: "vdsl/output".into(),
             config: serde_json::json!({"bucket": "my-bucket"}),
             created_at: chrono::Utc::now(),
         };
