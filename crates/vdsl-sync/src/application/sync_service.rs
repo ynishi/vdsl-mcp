@@ -1,28 +1,16 @@
 //! SyncService — application-layer orchestrator for sync operations.
 //!
-//! Coordinates [`SyncStore`], [`TransferRoute`]s, and [`ContentHasher`]
+//! Coordinates [`SyncStore`], [`TransferEngine`], and [`ContentHasher`]
 //! to provide register/notify/push/pull/force operations.
 //!
-//! # Path model
-//!
-//! All entries are stored with **relative paths**.
-//! Each route encapsulates src/dest path resolution via `TransferRoute`.
-//!
-//! # Route-based architecture
-//!
-//! Transfer operations use `Vec<TransferRoute>` instead of
-//! `HashMap<LocationId, StorageBackend>`. Each route is a directed edge
-//! (src → dest) with its own backend and path roots.
-//!
-//! `notify()` resolves the local file root from a route whose src is `local`.
-//! `notify_remote()` uses the route's `src_shell` for remote hash computation.
+//! Transfer routing and concurrent push logic is delegated to
+//! [`TransferEngine`](super::transfer_engine::TransferEngine).
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use futures::stream::{self, StreamExt};
-
+use super::transfer_engine::{BatchResult, TransferEngine};
 use crate::domain::entry::SyncEntry;
 use crate::domain::error::SyncError;
 use crate::domain::file_type::FileType;
@@ -60,41 +48,24 @@ pub enum RegisterResult {
     },
 }
 
-/// Result of a batch push operation.
-#[derive(Debug, Default)]
-pub struct BatchResult {
-    pub pushed: usize,
-    pub failed: usize,
-    pub errors: Vec<(String, String)>,
-}
-
 /// Sync service — application-layer orchestrator.
 ///
-/// Coordinates store (persistence) + routes (transfer) + hasher (identity).
+/// Coordinates store (persistence) + transfer engine (routing) + hasher (identity).
 ///
-/// The local file root is derived from routes whose `src` is `local`.
-/// No dedicated field — all path resolution goes through routes.
+/// The local file root is derived from routes via [`TransferEngine::local_root`].
 pub struct SyncService {
     store: Box<dyn SyncStore>,
-    routes: Vec<TransferRoute>,
+    engine: TransferEngine,
     hasher: Arc<dyn ContentHasher>,
-    force_concurrency: usize,
 }
 
 impl SyncService {
-    /// Default maximum number of concurrent push operations per target.
-    const DEFAULT_FORCE_CONCURRENCY: usize = 8;
-
     /// Create a new SyncService.
-    pub fn new(
-        store: Box<dyn SyncStore>,
-        routes: Vec<TransferRoute>,
-    ) -> Self {
+    pub fn new(store: Box<dyn SyncStore>, routes: Vec<TransferRoute>) -> Self {
         Self {
             store,
-            routes,
+            engine: TransferEngine::new(routes),
             hasher: Arc::new(Djb2Hasher),
-            force_concurrency: Self::DEFAULT_FORCE_CONCURRENCY,
         }
     }
 
@@ -106,38 +77,24 @@ impl SyncService {
     ) -> Self {
         Self {
             store,
-            routes,
+            engine: TransferEngine::new(routes),
             hasher,
-            force_concurrency: Self::DEFAULT_FORCE_CONCURRENCY,
         }
     }
 
-    /// Set the maximum number of concurrent push operations in `force()`.
-    ///
-    /// Clamped to minimum 1 — `buffer_unordered(0)` would deadlock the stream.
-    pub fn set_force_concurrency(&mut self, n: usize) {
-        self.force_concurrency = n.max(1);
+    /// Access the transfer engine (for route management, concurrency settings, etc.).
+    pub fn engine(&self) -> &TransferEngine {
+        &self.engine
     }
 
-    /// Add a route at runtime.
-    pub fn add_route(&mut self, route: TransferRoute) {
-        self.routes.push(route);
-    }
-
-    /// Remove all routes targeting a specific destination.
-    pub fn remove_routes_for(&mut self, dest: &LocationId) {
-        self.routes.retain(|r| r.dest() != dest);
+    /// Access the transfer engine mutably.
+    pub fn engine_mut(&mut self) -> &mut TransferEngine {
+        &mut self.engine
     }
 
     /// Resolve the local file root from routes.
-    ///
-    /// Finds the first route whose src is `local` and returns its `src_file_root`.
-    /// Returns `None` if no local-source route is registered.
     pub fn local_root(&self) -> Option<&Path> {
-        self.routes
-            .iter()
-            .find(|r| r.src().is_local())
-            .map(|r| r.src_file_root().as_path())
+        self.engine.local_root()
     }
 
     // =========================================================================
@@ -149,71 +106,23 @@ impl SyncService {
     /// Returns `Err(OutsideSyncRoot)` if the path is not under the local root,
     /// or if no local-source route is registered.
     pub fn to_relative(&self, absolute_path: &Path) -> Result<String, SyncError> {
-        let local_root = self.local_root().ok_or_else(|| SyncError::OutsideSyncRoot {
-            path: absolute_path.display().to_string(),
-        })?;
-        absolute_path
+        let local_root = self
+            .local_root()
+            .ok_or_else(|| SyncError::OutsideSyncRoot {
+                path: absolute_path.display().to_string(),
+            })?;
+        let relative = absolute_path
             .strip_prefix(local_root)
-            .map(|p| p.to_string_lossy().to_string())
             .map_err(|_| SyncError::OutsideSyncRoot {
                 path: absolute_path.display().to_string(),
-            })
-    }
-
-    // =========================================================================
-    // Route lookup
-    // =========================================================================
-
-    /// Find a route from src to dest.
-    fn find_route(&self, src: &LocationId, dest: &LocationId) -> Option<&TransferRoute> {
-        self.routes
-            .iter()
-            .find(|r| r.src() == src && r.dest() == dest)
-    }
-
-    /// Find a route for transferring an entry to the given destination.
-    ///
-    /// Searches entry.locations for a src that is Present,
-    /// then finds a matching route (src, dest) in self.routes.
-    ///
-    /// Source selection priority:
-    /// 1. Local (lowest latency, most reliable file existence check)
-    /// 2. Any other Present location with a matching route
-    fn find_route_for_entry(
-        &self,
-        entry: &SyncEntry,
-        dest: &LocationId,
-    ) -> Option<&TransferRoute> {
-        // Priority 1: local → dest
-        if entry.location_state(&LocationId::local()) == LocationState::Present {
-            if let Some(route) = self.find_route(&LocationId::local(), dest) {
-                return Some(route);
-            }
-        }
-
-        // Priority 2: any other Present src → dest
-        for (loc, state) in &entry.locations {
-            if loc.is_local() || *state != LocationState::Present {
-                continue;
-            }
-            if let Some(route) = self.find_route(loc, dest) {
-                return Some(route);
-            }
-        }
-
-        None
-    }
-
-    /// Collect unique destination LocationIds from all registered routes.
-    fn route_destinations(&self) -> Vec<LocationId> {
-        let mut dests: Vec<LocationId> = self
-            .routes
-            .iter()
-            .map(|r| r.dest().clone())
-            .collect();
-        dests.sort();
-        dests.dedup();
-        dests
+            })?;
+        relative
+            .to_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| SyncError::TransferFailed(format!(
+                "relative path is not valid UTF-8: {}",
+                relative.to_string_lossy()
+            )))
     }
 
     // =========================================================================
@@ -309,11 +218,12 @@ impl SyncService {
     ) -> Result<NotifyResult, SyncError> {
         // Find a route from this origin (to get the shell)
         let route = self
-            .routes
-            .iter()
+            .engine
+            .routes()
             .find(|r| r.src() == origin && r.src_shell().is_some())
             .ok_or_else(|| SyncError::NoRouteAvailable {
-                dest: origin.to_string(),
+                src: origin.to_string(),
+                dest: "*".to_string(),
                 path: relative_path.to_string(),
             })?;
 
@@ -346,19 +256,25 @@ impl SyncService {
             });
         }
 
-        // Determine remote locations (all registered remotes except origin)
+        // Determine all sync targets: registered remotes + local (if reachable via route)
         let remotes = self.store.list_remotes().await?;
-        let other_remotes: Vec<LocationId> = remotes
+        let mut pending_targets: Vec<LocationId> = remotes
             .iter()
             .filter(|r| r.location_id != *origin)
             .map(|r| r.location_id.clone())
             .collect();
 
+        // If there's a route from origin → local, local should also be Pending
+        let local = LocationId::local();
+        if *origin != local && self.engine.find_route(origin, &local).is_some() {
+            pending_targets.push(local);
+        }
+
         // Build initial locations: origin=Present, others=Pending
         let mut locations = HashMap::new();
         locations.insert(origin.clone(), LocationState::Present);
-        for remote in &other_remotes {
-            locations.insert(remote.clone(), LocationState::Pending);
+        for target in &pending_targets {
+            locations.insert(target.clone(), LocationState::Pending);
         }
 
         // Update existing or create new
@@ -370,6 +286,16 @@ impl SyncService {
                 file_size,
                 gen_id.map(|s| s.to_string()),
             );
+            // Update locations: origin=Present, others=Pending
+            existing
+                .locations
+                .insert(origin.clone(), LocationState::Present);
+            for target in &pending_targets {
+                existing
+                    .locations
+                    .entry(target.clone())
+                    .or_insert(LocationState::Pending);
+            }
             self.store.update_entry(&existing).await?;
             return Ok(NotifyResult {
                 entry: existing,
@@ -402,120 +328,9 @@ impl SyncService {
 
     /// Force-sync all pending files to a destination (or all route targets if None).
     ///
-    /// Uses route-based source selection: for each pending entry, finds a
-    /// Present source location with a matching route to the destination.
-    ///
-    /// # Source selection priority
-    ///
-    /// 1. Local (lowest latency, TOCTOU-safe file existence check)
-    /// 2. Any other Present location with a matching route
-    ///
-    /// # TOCTOU (Time-of-check to time-of-use)
-    ///
-    /// File existence is checked before transfer via `route.src_file_exists()`.
-    /// Local sources use `tokio::fs::try_exists`, remote sources use
-    /// `RemoteShell` (`test -f`). If the file was deleted, the source
-    /// location is marked as Absent.
+    /// Delegates to [`TransferEngine::force`].
     pub async fn force(&self, dest: Option<&LocationId>) -> Result<BatchResult, SyncError> {
-        let mut result = BatchResult::default();
-
-        let targets: Vec<LocationId> = if let Some(d) = dest {
-            vec![d.clone()]
-        } else {
-            self.route_destinations()
-        };
-
-        for target in &targets {
-            let pending = self.store.pending(target).await?;
-
-            let outcomes: Vec<_> = stream::iter(pending.into_iter().map(|entry| async move {
-                // --- Source selection ---
-                let route = self.find_route_for_entry(&entry, target);
-
-                let route = match route {
-                    Some(r) => r,
-                    None => {
-                        return Err((
-                            entry.relative_path,
-                            format!("no route available to {target}"),
-                        ));
-                    }
-                };
-
-                // --- File existence check on src ---
-                // Local: tokio::fs check. Remote: RemoteShell `test -f`.
-                match route.src_file_exists(&entry.relative_path).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        let _ = self
-                            .store
-                            .set_location_state(
-                                &entry.id,
-                                route.src(),
-                                LocationState::Absent,
-                            )
-                            .await;
-                        return Err((
-                            entry.relative_path,
-                            format!("source file not found on {}", route.src()),
-                        ));
-                    }
-                    Err(e) => {
-                        return Err((entry.relative_path, e.to_string()));
-                    }
-                }
-
-                // --- Transfer ---
-                self.store
-                    .set_location_state(&entry.id, target, LocationState::Syncing)
-                    .await
-                    .map_err(|e| (entry.relative_path.clone(), e.to_string()))?;
-                self.store
-                    .set_error(&entry.relative_path, None)
-                    .await
-                    .map_err(|e| (entry.relative_path.clone(), e.to_string()))?;
-
-                match route.transfer(&entry.relative_path).await {
-                    Ok(()) => {
-                        self.store
-                            .set_location_state(&entry.id, target, LocationState::Present)
-                            .await
-                            .map_err(|e| (entry.relative_path.clone(), e.to_string()))?;
-                        self.store
-                            .set_synced_at(&entry.relative_path, chrono::Utc::now())
-                            .await
-                            .map_err(|e| (entry.relative_path.clone(), e.to_string()))?;
-                        Ok(())
-                    }
-                    Err(e) => {
-                        let _ = self
-                            .store
-                            .set_location_state(&entry.id, target, LocationState::Pending)
-                            .await;
-                        let _ = self
-                            .store
-                            .set_error(&entry.relative_path, Some(&e.to_string()))
-                            .await;
-                        Err((entry.relative_path, e.to_string()))
-                    }
-                }
-            }))
-            .buffer_unordered(self.force_concurrency)
-            .collect()
-            .await;
-
-            for outcome in outcomes {
-                match outcome {
-                    Ok(()) => result.pushed += 1,
-                    Err((path, msg)) => {
-                        result.failed += 1;
-                        result.errors.push((path, msg));
-                    }
-                }
-            }
-        }
-
-        Ok(result)
+        self.engine.force(self.store.as_ref(), dest).await
     }
 
     // =========================================================================
@@ -608,12 +423,14 @@ impl SyncService {
     pub async fn pull_file(&self, src: &LocationId, relative_path: &str) -> Result<(), SyncError> {
         let local = LocationId::local();
 
-        let route = self
-            .find_route(src, &local)
-            .ok_or_else(|| SyncError::NoRouteAvailable {
-                dest: local.to_string(),
-                path: relative_path.to_string(),
-            })?;
+        let route =
+            self.engine
+                .find_route(src, &local)
+                .ok_or_else(|| SyncError::NoRouteAvailable {
+                    src: src.to_string(),
+                    dest: local.to_string(),
+                    path: relative_path.to_string(),
+                })?;
 
         // remote_path = src_file_root / relative_path
         let remote_path = TransferRoute::safe_join(route.src_file_root(), relative_path);
@@ -624,10 +441,14 @@ impl SyncService {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        route
-            .backend()
-            .pull(&remote_path.to_string_lossy(), &local_path)
-            .await?;
+        let remote_str = remote_path.to_str().ok_or_else(|| {
+            SyncError::TransferFailed(format!(
+                "remote path contains non-UTF-8: {}",
+                remote_path.to_string_lossy()
+            ))
+        })?;
+
+        route.backend().pull(remote_str, &local_path).await?;
 
         // Auto-register if not tracked, or update state if already tracked
         match self.store.get_by_path(relative_path).await? {
@@ -711,57 +532,13 @@ impl SyncService {
     /// Remove a remote endpoint from the store and all associated routes.
     pub async fn remove_remote(&mut self, location: &LocationId) -> Result<(), SyncError> {
         self.store.remove_remote(location).await?;
-        self.remove_routes_for(location);
+        self.engine.remove_routes_for(location);
         Ok(())
     }
 
     /// List registered remotes.
     pub async fn list_remotes(&self) -> Result<Vec<RemoteConfig>, SyncError> {
         self.store.list_remotes().await
-    }
-
-    /// Register a generation's output files (by absolute paths).
-    pub async fn register_generation(
-        &self,
-        gen_id: &str,
-        output: &str,
-        recipe: Option<&str>,
-    ) -> Result<Vec<SyncEntry>, SyncError> {
-        let mut entries = Vec::new();
-
-        match self.assert_file_exists(Path::new(output)).await {
-            Ok(()) => {
-                let result = self.notify(output, FileType::Image, Some(gen_id)).await?;
-                entries.push(result.entry);
-            }
-            Err(SyncError::FileNotFound(_)) => {
-                tracing::warn!(
-                    path = output,
-                    "output file not found, skipping registration"
-                );
-            }
-            Err(e) => return Err(e),
-        }
-
-        if let Some(recipe_path) = recipe {
-            match self.assert_file_exists(Path::new(recipe_path)).await {
-                Ok(()) => {
-                    let result = self
-                        .notify(recipe_path, FileType::Recipe, Some(gen_id))
-                        .await?;
-                    entries.push(result.entry);
-                }
-                Err(SyncError::FileNotFound(_)) => {
-                    tracing::warn!(
-                        path = recipe_path,
-                        "recipe file not found, skipping registration"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        Ok(entries)
     }
 }
 
@@ -1033,7 +810,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let shell = MockShell::with_files(vec![(
             "/workspace/output/gen-pod-001.png",
-            MockFile::new("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890", 2048),
+            MockFile::new(
+                "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+                2048,
+            ),
         )]);
         let (service, _backend) =
             test_service_with_remote_source(dir.path(), Box::new(shell)).await;
@@ -1089,10 +869,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let shell = MockShell::with_files(vec![(
             "/workspace/output/gen-mesh-001.png",
-            MockFile::new("sha256_hash_value_placeholder_0000000000000000000000000000000000", 4096),
+            MockFile::new(
+                "sha256_hash_value_placeholder_0000000000000000000000000000000000",
+                4096,
+            ),
         )]);
-        let (service, backend) =
-            test_service_with_remote_source(dir.path(), Box::new(shell)).await;
+        let (service, backend) = test_service_with_remote_source(dir.path(), Box::new(shell)).await;
 
         let pod = LocationId::new("pod").unwrap();
         let cloud = LocationId::new("cloud").unwrap();
@@ -1142,16 +924,14 @@ mod tests {
         );
 
         let cloud = LocationId::new("cloud").unwrap();
-        let route = service.find_route_for_entry(&entry, &cloud);
+        let route = service.engine().find_route_for_entry(&entry, &cloud);
         assert!(route.is_some());
         assert!(route.unwrap().src().is_local());
     }
 
     /// Build a service with local→cloud (push) + cloud→local (pull) routes.
     #[cfg(feature = "sqlite")]
-    async fn test_service_with_pull_route(
-        dir: &Path,
-    ) -> (SyncService, Arc<InMemoryBackend>) {
+    async fn test_service_with_pull_route(dir: &Path) -> (SyncService, Arc<InMemoryBackend>) {
         let store = SqliteSyncStore::open_in_memory().await.unwrap();
         let cloud_backend = Arc::new(InMemoryBackend::default());
 
@@ -1258,7 +1038,7 @@ mod tests {
     /// Build a service with pod→cloud route (remote source).
     #[cfg(feature = "sqlite")]
     async fn test_service_with_remote_source(
-        dir: &Path,
+        _dir: &Path,
         mock_shell: Box<dyn crate::infra::shell::RemoteShell>,
     ) -> (SyncService, Arc<InMemoryBackend>) {
         let store = SqliteSyncStore::open_in_memory().await.unwrap();
@@ -1299,8 +1079,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Mock: file exists on pod
         let shell = MockShell::new(vec!["/workspace/output/gen-001.png"]);
-        let (service, backend) =
-            test_service_with_remote_source(dir.path(), Box::new(shell)).await;
+        let (service, backend) = test_service_with_remote_source(dir.path(), Box::new(shell)).await;
 
         // Manually register entry with pod=Present, cloud=Pending
         let mut locations = HashMap::new();
@@ -1404,7 +1183,7 @@ mod tests {
         );
 
         let cloud = LocationId::new("cloud").unwrap();
-        let route = service.find_route_for_entry(&entry, &cloud);
+        let route = service.engine().find_route_for_entry(&entry, &cloud);
         assert!(route.is_none());
     }
 }

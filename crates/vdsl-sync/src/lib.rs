@@ -22,9 +22,8 @@ pub mod fmt;
 pub mod infra;
 
 // Re-exports for convenience
-pub use application::sync_service::{
-    BatchResult, NotifyResult, RegisterOpts, RegisterResult, SyncService,
-};
+pub use application::sync_service::{NotifyResult, RegisterOpts, RegisterResult, SyncService};
+pub use application::transfer_engine::{BatchResult, TransferEngine};
 pub use domain::entry::SyncEntry;
 pub use domain::error::SyncError;
 pub use domain::file_type::FileType;

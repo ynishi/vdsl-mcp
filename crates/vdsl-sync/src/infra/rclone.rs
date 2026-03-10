@@ -93,7 +93,9 @@ impl RcloneBackend {
         if !output.success {
             return Err(SyncError::TransferFailed(format!(
                 "rclone failed (exit {}): {}",
-                output.exit_code,
+                output
+                    .exit_code
+                    .map_or("signal".to_string(), |c| c.to_string()),
                 output.stderr.trim()
             )));
         }
@@ -106,8 +108,13 @@ impl RcloneBackend {
 impl StorageBackend for RcloneBackend {
     async fn push(&self, local_path: &Path, remote_path: &str) -> Result<(), SyncError> {
         let dest = self.remote_path(remote_path)?;
-        let local_str = local_path.to_string_lossy();
-        self.exec_rclone(&["copyto", &local_str, &dest]).await?;
+        let local_str = local_path.to_str().ok_or_else(|| {
+            SyncError::TransferFailed(format!(
+                "local path is not valid UTF-8: {}",
+                local_path.to_string_lossy()
+            ))
+        })?;
+        self.exec_rclone(&["copyto", local_str, &dest]).await?;
         Ok(())
     }
 
@@ -117,8 +124,13 @@ impl StorageBackend for RcloneBackend {
         if let Some(parent) = local_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let local_str = local_path.to_string_lossy();
-        self.exec_rclone(&["copyto", &src, &local_str]).await?;
+        let local_str = local_path.to_str().ok_or_else(|| {
+            SyncError::TransferFailed(format!(
+                "local path is not valid UTF-8: {}",
+                local_path.to_string_lossy()
+            ))
+        })?;
+        self.exec_rclone(&["copyto", &src, local_str]).await?;
         Ok(())
     }
 

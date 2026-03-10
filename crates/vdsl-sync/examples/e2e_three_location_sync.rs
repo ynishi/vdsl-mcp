@@ -9,7 +9,7 @@
 //! 5. **file modification** — re-notify marks remotes as `pending` again
 //! 6. **force(None)** — push to ALL remotes in one call
 //! 7. **duplicate detection** — same content at different path is detected
-//! 8. **register_generation** — output + recipe registered together
+//! 8. **notify output + recipe** — generation registration pattern
 //! 9. **error recovery** — backend failure → state rollback + retry succeeds
 //!
 //! Uses InMemoryBackend (no real network). Runs entirely in-process.
@@ -269,28 +269,35 @@ async fn main() {
     eprintln!("[PASS] 7. duplicate detection — same content identified");
 
     // =========================================================================
-    // 8. register_generation — output + recipe
+    // 8. notify output + recipe (generation registration pattern)
     // =========================================================================
     let gen_output = dir.path().join("output/gen-002.png");
     let gen_recipe = dir.path().join("output/gen-002_recipe.json");
     std::fs::write(&gen_output, build_test_png(b"GEN002_PIXELS", &[])).unwrap();
     std::fs::write(&gen_recipe, br#"{"prompt":"test"}"#).unwrap();
 
-    let entries = service
-        .register_generation(
-            "gen-002",
+    let output_result = service
+        .notify(
             gen_output.to_str().unwrap(),
-            Some(gen_recipe.to_str().unwrap()),
+            FileType::Image,
+            Some("gen-002"),
+        )
+        .await
+        .unwrap();
+    let recipe_result = service
+        .notify(
+            gen_recipe.to_str().unwrap(),
+            FileType::Recipe,
+            Some("gen-002"),
         )
         .await
         .unwrap();
 
-    assert_eq!(entries.len(), 2, "should register output + recipe");
-    assert_eq!(entries[0].file_type, FileType::Image);
-    assert_eq!(entries[1].file_type, FileType::Recipe);
-    assert_eq!(entries[0].gen_id.as_deref(), Some("gen-002"));
-    assert_eq!(entries[1].gen_id.as_deref(), Some("gen-002"));
-    eprintln!("[PASS] 8. register_generation — output + recipe registered");
+    assert_eq!(output_result.entry.file_type, FileType::Image);
+    assert_eq!(recipe_result.entry.file_type, FileType::Recipe);
+    assert_eq!(output_result.entry.gen_id.as_deref(), Some("gen-002"));
+    assert_eq!(recipe_result.entry.gen_id.as_deref(), Some("gen-002"));
+    eprintln!("[PASS] 8. notify output + recipe registered");
 
     // =========================================================================
     // 9. error recovery — backend failure + retry

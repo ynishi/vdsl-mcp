@@ -6438,6 +6438,7 @@ mod tests {
 
     /// Helper to parse exec args the same way `runpod_cli_exec` does.
     /// Returns (ssh_key, timeout, pod_id, command_parts) or error description.
+    #[allow(clippy::type_complexity)]
     fn parse_exec_args<'a>(
         args: &'a [&'a str],
     ) -> Result<(Option<&'a str>, Option<u64>, &'a str, Vec<&'a str>), &'static str> {
@@ -6536,7 +6537,7 @@ mod tests {
 
     #[test]
     fn exec_is_detected_as_first_arg() {
-        let args = vec![
+        let args = [
             "exec".to_string(),
             "pod_abc".to_string(),
             "--".to_string(),
@@ -6547,7 +6548,7 @@ mod tests {
 
     #[test]
     fn non_exec_is_not_detected() {
-        let args = vec!["pods".to_string(), "list-pods".to_string()];
+        let args = ["pods".to_string(), "list-pods".to_string()];
         assert_ne!(args.first().map(String::as_str), Some("exec"));
     }
 

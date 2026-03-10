@@ -107,4 +107,3 @@ pub trait SyncStore: Send + Sync {
     /// Remove a remote endpoint. Returns true if it existed.
     async fn remove_remote(&self, location_id: &LocationId) -> Result<bool, SyncError>;
 }
-

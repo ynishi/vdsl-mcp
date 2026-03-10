@@ -29,8 +29,12 @@ pub enum SyncError {
     #[error("backend not configured for location: {0}")]
     NoBackend(String),
 
-    #[error("no route available: dest={dest}, path={path}")]
-    NoRouteAvailable { dest: String, path: String },
+    #[error("no route available: {src} → {dest}, path={path}")]
+    NoRouteAvailable {
+        src: String,
+        dest: String,
+        path: String,
+    },
 
     #[error("transfer failed: {0}")]
     TransferFailed(String),

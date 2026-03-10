@@ -94,7 +94,7 @@ impl TransferRoute {
         &self.dest
     }
 
-    pub fn src_file_root(&self) -> &PathBuf {
+    pub fn src_file_root(&self) -> &Path {
         &self.src_file_root
     }
 
@@ -112,9 +112,14 @@ impl TransferRoute {
         let src_path = self.src_file_root.join(relative_path);
         let dest_path = Self::safe_join(&self.dest_file_root, relative_path);
 
-        self.backend
-            .push(&src_path, &dest_path.to_string_lossy())
-            .await
+        let dest_str = dest_path.to_str().ok_or_else(|| {
+            SyncError::TransferFailed(format!(
+                "dest path is not valid UTF-8: {}",
+                dest_path.to_string_lossy()
+            ))
+        })?;
+
+        self.backend.push(&src_path, dest_str).await
     }
 
     /// The backend held by this route (for list/exists/pull operations).
@@ -146,10 +151,13 @@ impl TransferRoute {
             }
             Some(shell) => {
                 // Remote source: `test -f <path>` via shell
-                let path_str = full_path.to_string_lossy();
-                let output = shell
-                    .exec(&["test", "-f", &path_str], Some(10))
-                    .await?;
+                let path_str = full_path.to_str().ok_or_else(|| {
+                    SyncError::TransferFailed(format!(
+                        "src path is not valid UTF-8: {}",
+                        full_path.to_string_lossy()
+                    ))
+                })?;
+                let output = shell.exec(&["test", "-f", path_str], Some(10)).await?;
                 Ok(output.success)
             }
         }
@@ -158,10 +166,31 @@ impl TransferRoute {
     /// Inspect a source file: compute hash and size via RemoteShell.
     ///
     /// - Local source: delegates to the provided `local_hasher`
-    /// - Remote source: uses `sha256sum` + `stat` via shell
+    /// - Remote source: uses `sha256sum` + `stat --format=%s` (GNU coreutils) via shell
     ///
     /// Returns `(file_hash, file_size)`. `content_hash` is not available
     /// for remote files (would require PNG parsing on remote host).
+    ///
+    /// # Platform assumption
+    ///
+    /// `stat --format=%s` is GNU coreutils syntax (Linux).
+    /// BSD `stat` uses `-f%z` instead. RunPod containers use Linux,
+    /// so this is safe for the current use case. If BSD support is
+    /// needed, detect the platform or use `wc -c < file` as fallback.
+    ///
+    /// # WARNING: Hash algorithm mismatch
+    ///
+    /// Local files are hashed with DJB2 (via `ContentHasher`), while remote
+    /// files use SHA-256 (via `sha256sum`). This means **the same file will
+    /// produce different `file_hash` values** depending on whether it was
+    /// registered locally (`notify()`) or remotely (`notify_remote()`).
+    ///
+    /// Consequence: `find_duplicate()` cannot detect cross-origin duplicates.
+    /// A file notified on pod and the same file notified locally will be
+    /// treated as two distinct entries.
+    ///
+    /// Future fix: unify hash algorithm (e.g. SHA-256 everywhere) or store
+    /// algorithm identifier alongside the hash for cross-comparison.
     pub async fn inspect_src_file(
         &self,
         relative_path: &str,
@@ -174,18 +203,19 @@ impl TransferRoute {
             None => {
                 // Local: use ContentHasher (DJB2 + PNG semantic hash)
                 let result = local_hasher.hash_file(&full_path)?;
-                let size = std::fs::metadata(&full_path)
-                    .map(|m| m.len())
-                    .ok();
+                let size = tokio::fs::metadata(&full_path).await.map(|m| m.len()).ok();
                 Ok((result, size))
             }
             Some(shell) => {
                 // Remote: sha256sum for file_hash, stat for size
-                let path_str = full_path.to_string_lossy();
+                let path_str = full_path.to_str().ok_or_else(|| {
+                    SyncError::TransferFailed(format!(
+                        "src path is not valid UTF-8: {}",
+                        full_path.to_string_lossy()
+                    ))
+                })?;
 
-                let hash_output = shell
-                    .exec(&["sha256sum", &path_str], Some(30))
-                    .await?;
+                let hash_output = shell.exec(&["sha256sum", path_str], Some(30)).await?;
                 if !hash_output.success {
                     return Err(SyncError::Hash(format!(
                         "sha256sum failed on remote: {}",
@@ -196,14 +226,12 @@ impl TransferRoute {
                     .stdout
                     .split_whitespace()
                     .next()
-                    .ok_or_else(|| {
-                        SyncError::Hash("sha256sum returned empty output".into())
-                    })?
+                    .ok_or_else(|| SyncError::Hash("sha256sum returned empty output".into()))?
                     .to_string();
 
                 // stat for file size (GNU format)
                 let stat_output = shell
-                    .exec(&["stat", "--format=%s", &path_str], Some(10))
+                    .exec(&["stat", "--format=%s", path_str], Some(10))
                     .await?;
                 let file_size = if stat_output.success {
                     stat_output.stdout.trim().parse::<u64>().ok()

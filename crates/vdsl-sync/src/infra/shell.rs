@@ -18,7 +18,7 @@ pub struct ShellOutput {
     pub stdout: String,
     pub stderr: String,
     pub success: bool,
-    pub exit_code: i32,
+    pub exit_code: Option<i32>,
 }
 
 /// Abstract shell for executing commands on a location's host.
@@ -67,15 +67,13 @@ impl RemoteShell for LocalShell {
                     args.join(" ")
                 ))
             })?
-            .map_err(|e| {
-                SyncError::TransferFailed(format!("exec failed ({}): {e}", args[0]))
-            })?;
+            .map_err(|e| SyncError::TransferFailed(format!("exec failed ({}): {e}", args[0])))?;
 
         Ok(ShellOutput {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
             success: output.status.success(),
-            exit_code: output.status.code().unwrap_or(-1),
+            exit_code: output.status.code(),
         })
     }
 }
@@ -153,7 +151,7 @@ pub mod mock {
                     stdout: String::new(),
                     stderr: String::new(),
                     success: exists,
-                    exit_code: if exists { 0 } else { 1 },
+                    exit_code: Some(if exists { 0 } else { 1 }),
                 });
             }
 
@@ -166,14 +164,14 @@ pub mod mock {
                         stdout: format!("{}  {}\n", f.sha256, path),
                         stderr: String::new(),
                         success: true,
-                        exit_code: 0,
+                        exit_code: Some(0),
                     });
                 }
                 return Ok(ShellOutput {
                     stdout: String::new(),
                     stderr: format!("sha256sum: {path}: No such file or directory\n"),
                     success: false,
-                    exit_code: 1,
+                    exit_code: Some(1),
                 });
             }
 
@@ -186,14 +184,14 @@ pub mod mock {
                         stdout: format!("{}\n", f.size),
                         stderr: String::new(),
                         success: true,
-                        exit_code: 0,
+                        exit_code: Some(0),
                     });
                 }
                 return Ok(ShellOutput {
                     stdout: String::new(),
                     stderr: format!("stat: cannot stat '{path}': No such file or directory\n"),
                     success: false,
-                    exit_code: 1,
+                    exit_code: Some(1),
                 });
             }
 
@@ -202,7 +200,7 @@ pub mod mock {
                 stdout: String::new(),
                 stderr: String::new(),
                 success: true,
-                exit_code: 0,
+                exit_code: Some(0),
             })
         }
     }
@@ -218,7 +216,7 @@ mod tests {
         let output = shell.exec(&["echo", "hello"], None).await.unwrap();
         assert!(output.success);
         assert_eq!(output.stdout.trim(), "hello");
-        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.exit_code, Some(0));
     }
 
     #[tokio::test]
@@ -231,9 +229,7 @@ mod tests {
     #[tokio::test]
     async fn local_shell_nonexistent_command() {
         let shell = LocalShell;
-        let result = shell
-            .exec(&["__nonexistent_command_12345__"], None)
-            .await;
+        let result = shell.exec(&["__nonexistent_command_12345__"], None).await;
         assert!(result.is_err());
     }
 
@@ -242,6 +238,6 @@ mod tests {
         let shell = LocalShell;
         let output = shell.exec(&["false"], None).await.unwrap();
         assert!(!output.success);
-        assert_ne!(output.exit_code, 0);
+        assert_ne!(output.exit_code, Some(0));
     }
 }

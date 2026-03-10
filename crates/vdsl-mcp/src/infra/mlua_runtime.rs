@@ -824,11 +824,14 @@ mod inner {
                                     Option<String>,
                                 )| {
                                     let entries = handle
-                                        .block_on(svc.register_generation(
-                                            &gen_id,
-                                            &output,
-                                            recipe.as_deref(),
-                                        ))
+                                        .block_on(
+                                            crate::infra::generation::register_generation(
+                                                &svc,
+                                                &gen_id,
+                                                &output,
+                                                recipe.as_deref(),
+                                            ),
+                                        )
                                         .map_err(|e| {
                                             LuaError::external(e.to_string())
                                         })?;

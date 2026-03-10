@@ -62,20 +62,21 @@ impl RemoteShell for RunPodCliShell {
 
         let result = self
             .cli
-            .pod_exec(
-                &self.pod_id,
-                args,
-                self.ssh_key.as_deref(),
-                timeout_secs,
-            )
+            .pod_exec(&self.pod_id, args, self.ssh_key.as_deref(), timeout_secs)
             .await
-            .map_err(|e| SyncError::TransferFailed(format!("pod exec failed: {e}")))?;
+            .map_err(|e| {
+                SyncError::TransferFailed(format!(
+                    "pod exec failed on pod={}, cmd={}: {e}",
+                    self.pod_id,
+                    args.join(" ")
+                ))
+            })?;
 
         Ok(ShellOutput {
             stdout: result.stdout,
             stderr: result.stderr,
             success: result.success,
-            exit_code: result.exit_code,
+            exit_code: Some(result.exit_code),
         })
     }
 }
@@ -99,11 +100,7 @@ mod tests {
 
     #[test]
     fn debug_without_ssh_key() {
-        let shell = RunPodCliShell::new(
-            RunPodCli::new("test-key".into()),
-            "pod-456".into(),
-            None,
-        );
+        let shell = RunPodCliShell::new(RunPodCli::new("test-key".into()), "pod-456".into(), None);
         let debug = format!("{:?}", shell);
         assert!(debug.contains("pod-456"));
         assert!(debug.contains("None"));
@@ -111,11 +108,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_args_returns_error() {
-        let shell = RunPodCliShell::new(
-            RunPodCli::new("test-key".into()),
-            "pod-789".into(),
-            None,
-        );
+        let shell = RunPodCliShell::new(RunPodCli::new("test-key".into()), "pod-789".into(), None);
         let result = shell.exec(&[], None).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
