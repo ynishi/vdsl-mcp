@@ -80,6 +80,134 @@ impl RemoteShell for LocalShell {
     }
 }
 
+/// Mock shell for testing — returns configurable responses.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod mock {
+    use super::*;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+
+    /// Mock file entry with optional hash and size.
+    #[derive(Clone)]
+    pub struct MockFile {
+        pub sha256: String,
+        pub size: u64,
+    }
+
+    impl MockFile {
+        pub fn new(sha256: impl Into<String>, size: u64) -> Self {
+            Self {
+                sha256: sha256.into(),
+                size,
+            }
+        }
+    }
+
+    /// A mock RemoteShell that simulates file operations on a remote host.
+    ///
+    /// Supports:
+    /// - `test -f <path>` — file existence check
+    /// - `sha256sum <path>` — returns configured hash
+    /// - `stat --format=%s <path>` — returns configured size
+    ///
+    /// - `exec_log`: records all commands executed (for assertions)
+    pub struct MockShell {
+        files: Mutex<HashMap<String, MockFile>>,
+        pub exec_log: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl MockShell {
+        /// Create with a set of files (path → MockFile).
+        pub fn with_files(files: impl IntoIterator<Item = (impl Into<String>, MockFile)>) -> Self {
+            Self {
+                files: Mutex::new(files.into_iter().map(|(k, v)| (k.into(), v)).collect()),
+                exec_log: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Create with paths only (existence checks only, no hash/size).
+        pub fn new(existing: impl IntoIterator<Item = impl Into<String>>) -> Self {
+            Self::with_files(
+                existing
+                    .into_iter()
+                    .map(|p| (p, MockFile::new("0000000000000000", 0))),
+            )
+        }
+    }
+
+    #[async_trait]
+    impl RemoteShell for MockShell {
+        async fn exec(
+            &self,
+            args: &[&str],
+            _timeout_secs: Option<u64>,
+        ) -> Result<ShellOutput, SyncError> {
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            self.exec_log.lock().await.push(owned);
+
+            // Simulate `test -f <path>`
+            if args.len() >= 3 && args[0] == "test" && args[1] == "-f" {
+                let path = args[2];
+                let exists = self.files.lock().await.contains_key(path);
+                return Ok(ShellOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    success: exists,
+                    exit_code: if exists { 0 } else { 1 },
+                });
+            }
+
+            // Simulate `sha256sum <path>`
+            if args.len() >= 2 && args[0] == "sha256sum" {
+                let path = args[1];
+                let files = self.files.lock().await;
+                if let Some(f) = files.get(path) {
+                    return Ok(ShellOutput {
+                        stdout: format!("{}  {}\n", f.sha256, path),
+                        stderr: String::new(),
+                        success: true,
+                        exit_code: 0,
+                    });
+                }
+                return Ok(ShellOutput {
+                    stdout: String::new(),
+                    stderr: format!("sha256sum: {path}: No such file or directory\n"),
+                    success: false,
+                    exit_code: 1,
+                });
+            }
+
+            // Simulate `stat --format=%s <path>` (GNU) or `stat -f%z <path>` (BSD)
+            if args.len() >= 3 && args[0] == "stat" {
+                let path = args.last().expect("args is non-empty");
+                let files = self.files.lock().await;
+                if let Some(f) = files.get(*path) {
+                    return Ok(ShellOutput {
+                        stdout: format!("{}\n", f.size),
+                        stderr: String::new(),
+                        success: true,
+                        exit_code: 0,
+                    });
+                }
+                return Ok(ShellOutput {
+                    stdout: String::new(),
+                    stderr: format!("stat: cannot stat '{path}': No such file or directory\n"),
+                    success: false,
+                    exit_code: 1,
+                });
+            }
+
+            // Default: success with empty output
+            Ok(ShellOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                success: true,
+                exit_code: 0,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

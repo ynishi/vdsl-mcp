@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use crate::domain::error::SyncError;
 use crate::domain::location::LocationId;
 use crate::infra::backend::StorageBackend;
+use crate::infra::shell::RemoteShell;
 
 /// A directed transfer route between two locations.
 ///
@@ -22,6 +23,12 @@ use crate::infra::backend::StorageBackend;
 /// - src:  `src_file_root / relative_path`
 /// - dest: `dest_remote_root / relative_path`
 ///
+/// # Source shell
+///
+/// `src_shell` enables operations on the source host: file existence checks,
+/// hash computation, etc. For local sources this is `None` (use filesystem).
+/// For remote sources (pod, NAS), provide a `RemoteShell` implementation.
+///
 /// # Backend responsibility
 ///
 /// `backend.push(src_full_path, dest_full_path)` is called.
@@ -33,9 +40,13 @@ pub struct TransferRoute {
     src_file_root: PathBuf,
     dest_remote_root: String,
     backend: Box<dyn StorageBackend>,
+    /// Shell for source-side file operations (existence check, hash).
+    /// `None` when src is local (use filesystem directly).
+    src_shell: Option<Box<dyn RemoteShell>>,
 }
 
 impl TransferRoute {
+    /// Create a route with no source shell (local source).
     pub fn new(
         src: LocationId,
         dest: LocationId,
@@ -49,6 +60,29 @@ impl TransferRoute {
             src_file_root,
             dest_remote_root,
             backend,
+            src_shell: None,
+        }
+    }
+
+    /// Create a route with a source shell for remote source operations.
+    ///
+    /// The `src_shell` enables file existence checks and hash computation
+    /// on the source host (e.g., a GPU pod via SSH).
+    pub fn with_src_shell(
+        src: LocationId,
+        dest: LocationId,
+        src_file_root: PathBuf,
+        dest_remote_root: String,
+        backend: Box<dyn StorageBackend>,
+        src_shell: Box<dyn RemoteShell>,
+    ) -> Self {
+        Self {
+            src,
+            dest,
+            src_file_root,
+            dest_remote_root,
+            backend,
+            src_shell: Some(src_shell),
         }
     }
 
@@ -84,6 +118,106 @@ impl TransferRoute {
     /// The backend held by this route (for list/exists/pull operations).
     pub fn backend(&self) -> &dyn StorageBackend {
         self.backend.as_ref()
+    }
+
+    /// The source shell, if this route has a remote source.
+    pub fn src_shell(&self) -> Option<&dyn RemoteShell> {
+        self.src_shell.as_deref()
+    }
+
+    /// Check whether the source file exists for this route.
+    ///
+    /// - Local source: uses `tokio::fs::try_exists`
+    /// - Remote source: uses `src_shell` to run `test -f <path>`
+    ///
+    /// Returns `Ok(true)` if file exists, `Ok(false)` if not.
+    pub async fn src_file_exists(&self, relative_path: &str) -> Result<bool, SyncError> {
+        Self::validate_relative_path(relative_path)?;
+        let full_path = self.src_file_root.join(relative_path);
+
+        match &self.src_shell {
+            None => {
+                // Local source: filesystem check
+                tokio::fs::try_exists(&full_path)
+                    .await
+                    .map_err(SyncError::Io)
+            }
+            Some(shell) => {
+                // Remote source: `test -f <path>` via shell
+                let path_str = full_path.to_string_lossy();
+                let output = shell
+                    .exec(&["test", "-f", &path_str], Some(10))
+                    .await?;
+                Ok(output.success)
+            }
+        }
+    }
+
+    /// Inspect a source file: compute hash and size via RemoteShell.
+    ///
+    /// - Local source: delegates to the provided `local_hasher`
+    /// - Remote source: uses `sha256sum` + `stat` via shell
+    ///
+    /// Returns `(file_hash, file_size)`. `content_hash` is not available
+    /// for remote files (would require PNG parsing on remote host).
+    pub async fn inspect_src_file(
+        &self,
+        relative_path: &str,
+        local_hasher: &dyn crate::infra::hasher::ContentHasher,
+    ) -> Result<(crate::infra::hasher::HashResult, Option<u64>), SyncError> {
+        Self::validate_relative_path(relative_path)?;
+        let full_path = self.src_file_root.join(relative_path);
+
+        match &self.src_shell {
+            None => {
+                // Local: use ContentHasher (DJB2 + PNG semantic hash)
+                let result = local_hasher.hash_file(&full_path)?;
+                let size = std::fs::metadata(&full_path)
+                    .map(|m| m.len())
+                    .ok();
+                Ok((result, size))
+            }
+            Some(shell) => {
+                // Remote: sha256sum for file_hash, stat for size
+                let path_str = full_path.to_string_lossy();
+
+                let hash_output = shell
+                    .exec(&["sha256sum", &path_str], Some(30))
+                    .await?;
+                if !hash_output.success {
+                    return Err(SyncError::Hash(format!(
+                        "sha256sum failed on remote: {}",
+                        hash_output.stderr.trim()
+                    )));
+                }
+                let file_hash = hash_output
+                    .stdout
+                    .split_whitespace()
+                    .next()
+                    .ok_or_else(|| {
+                        SyncError::Hash("sha256sum returned empty output".into())
+                    })?
+                    .to_string();
+
+                // stat for file size (GNU format)
+                let stat_output = shell
+                    .exec(&["stat", "--format=%s", &path_str], Some(10))
+                    .await?;
+                let file_size = if stat_output.success {
+                    stat_output.stdout.trim().parse::<u64>().ok()
+                } else {
+                    None
+                };
+
+                Ok((
+                    crate::infra::hasher::HashResult {
+                        file_hash,
+                        content_hash: None, // PNG semantic hash not available remotely
+                    },
+                    file_size,
+                ))
+            }
+        }
     }
 
     // --- internal helpers ---

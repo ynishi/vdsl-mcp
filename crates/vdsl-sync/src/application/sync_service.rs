@@ -293,6 +293,109 @@ impl SyncService {
         })
     }
 
+    /// Notify the service of a file on a remote location.
+    ///
+    /// Computes hash/size via `RemoteShell` (sha256sum + stat), then registers
+    /// the entry with `origin` as Present and all other remotes as Pending.
+    ///
+    /// Requires a route FROM `origin` with a `src_shell` configured.
+    ///
+    /// `relative_path` is relative to the route's `src_file_root`.
+    pub async fn notify_remote(
+        &self,
+        origin: &LocationId,
+        relative_path: &str,
+        file_type: FileType,
+        gen_id: Option<&str>,
+    ) -> Result<NotifyResult, SyncError> {
+        // Find a route from this origin (to get the shell)
+        let route = self
+            .routes
+            .iter()
+            .find(|r| r.src() == origin && r.src_shell().is_some())
+            .ok_or_else(|| SyncError::NoRouteAvailable {
+                dest: origin.to_string(),
+                path: relative_path.to_string(),
+            })?;
+
+        // Verify file exists on remote
+        if !route.src_file_exists(relative_path).await? {
+            return Err(SyncError::FileNotFound(
+                route.src_file_root().join(relative_path),
+            ));
+        }
+
+        // Inspect file via RemoteShell
+        let (hash_result, file_size) = route
+            .inspect_src_file(relative_path, self.hasher.as_ref())
+            .await?;
+
+        // Duplicate check
+        if let Some(existing) = self
+            .store
+            .find_duplicate(
+                &hash_result.file_hash,
+                hash_result.content_hash.as_deref(),
+                relative_path,
+            )
+            .await?
+        {
+            return Ok(NotifyResult {
+                is_duplicate: true,
+                duplicate_of: Some(existing.relative_path.clone()),
+                entry: existing,
+            });
+        }
+
+        // Determine remote locations (all registered remotes except origin)
+        let remotes = self.store.list_remotes().await?;
+        let other_remotes: Vec<LocationId> = remotes
+            .iter()
+            .filter(|r| r.location_id != *origin)
+            .map(|r| r.location_id.clone())
+            .collect();
+
+        // Build initial locations: origin=Present, others=Pending
+        let mut locations = HashMap::new();
+        locations.insert(origin.clone(), LocationState::Present);
+        for remote in &other_remotes {
+            locations.insert(remote.clone(), LocationState::Pending);
+        }
+
+        // Update existing or create new
+        if let Some(mut existing) = self.store.get_by_path(relative_path).await? {
+            existing.update_metadata(
+                file_type,
+                hash_result.file_hash,
+                hash_result.content_hash,
+                file_size,
+                gen_id.map(|s| s.to_string()),
+            );
+            self.store.update_entry(&existing).await?;
+            return Ok(NotifyResult {
+                entry: existing,
+                is_duplicate: false,
+                duplicate_of: None,
+            });
+        }
+
+        let entry = SyncEntry::with_locations(
+            relative_path.to_string(),
+            file_type,
+            hash_result.file_hash,
+            hash_result.content_hash,
+            file_size,
+            gen_id.map(|s| s.to_string()),
+            locations,
+        );
+        self.store.insert_entry(&entry).await?;
+        Ok(NotifyResult {
+            entry,
+            is_duplicate: false,
+            duplicate_of: None,
+        })
+    }
+
     /// Get aggregated sync status.
     pub async fn status(&self) -> Result<SyncSummary, SyncError> {
         self.store.summary().await
@@ -310,9 +413,10 @@ impl SyncService {
     ///
     /// # TOCTOU (Time-of-check to time-of-use)
     ///
-    /// When src is local, file existence is checked before transfer.
-    /// If the file was deleted, the entry is marked as Absent.
-    /// Phase 2 will add RemoteShell-based existence checks for non-local sources.
+    /// File existence is checked before transfer via `route.src_file_exists()`.
+    /// Local sources use `tokio::fs::try_exists`, remote sources use
+    /// `RemoteShell` (`test -f`). If the file was deleted, the source
+    /// location is marked as Absent.
     pub async fn force(&self, dest: Option<&LocationId>) -> Result<BatchResult, SyncError> {
         let mut result = BatchResult::default();
 
@@ -360,29 +464,25 @@ impl SyncService {
                 };
 
                 // --- File existence check on src ---
-                // Phase 1: only local sources get filesystem check.
-                // Phase 2: RemoteShell-based check for non-local sources.
-                if route.src().is_local() {
-                    let src_path = route.src_file_root().join(&entry.relative_path);
-                    match tokio::fs::try_exists(&src_path).await {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            let _ = self
-                                .store
-                                .set_location_state(
-                                    &entry.id,
-                                    &LocationId::local(),
-                                    LocationState::Absent,
-                                )
-                                .await;
-                            return Err((
-                                entry.relative_path,
-                                "source file not found".into(),
-                            ));
-                        }
-                        Err(e) => {
-                            return Err((entry.relative_path, e.to_string()));
-                        }
+                // Local: tokio::fs check. Remote: RemoteShell `test -f`.
+                match route.src_file_exists(&entry.relative_path).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let _ = self
+                            .store
+                            .set_location_state(
+                                &entry.id,
+                                route.src(),
+                                LocationState::Absent,
+                            )
+                            .await;
+                        return Err((
+                            entry.relative_path,
+                            format!("source file not found on {}", route.src()),
+                        ));
+                    }
+                    Err(e) => {
+                        return Err((entry.relative_path, e.to_string()));
                     }
                 }
 
@@ -941,6 +1041,105 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn notify_remote_registers_file() {
+        use crate::infra::shell::mock::{MockFile, MockShell};
+
+        let dir = tempfile::tempdir().unwrap();
+        let shell = MockShell::with_files(vec![(
+            "/workspace/output/gen-pod-001.png",
+            MockFile::new("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890", 2048),
+        )]);
+        let (service, _backend) =
+            test_service_with_remote_source(dir.path(), Box::new(shell)).await;
+
+        let pod = LocationId::new("pod").unwrap();
+        let cloud = LocationId::new("cloud").unwrap();
+
+        let result = service
+            .notify_remote(&pod, "gen-pod-001.png", FileType::Image, Some("gen-pod"))
+            .await
+            .unwrap();
+
+        assert!(!result.is_duplicate);
+        assert_eq!(result.entry.relative_path, "gen-pod-001.png");
+        assert_eq!(result.entry.file_type, FileType::Image);
+        assert_eq!(result.entry.gen_id.as_deref(), Some("gen-pod"));
+        // Pod should be Present (origin)
+        assert_eq!(result.entry.location_state(&pod), LocationState::Present);
+        // Cloud should be Pending
+        assert_eq!(result.entry.location_state(&cloud), LocationState::Pending);
+        // file_hash should be sha256
+        assert_eq!(
+            result.entry.file_hash,
+            "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+        );
+        assert_eq!(result.entry.file_size, Some(2048));
+        // content_hash should be None (remote can't compute PNG semantic hash)
+        assert!(result.entry.content_hash.is_none());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn notify_remote_file_not_found() {
+        use crate::infra::shell::mock::MockShell;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shell = MockShell::new(Vec::<String>::new());
+        let (service, _) = test_service_with_remote_source(dir.path(), Box::new(shell)).await;
+
+        let pod = LocationId::new("pod").unwrap();
+        let result = service
+            .notify_remote(&pod, "nonexistent.png", FileType::Image, None)
+            .await;
+
+        assert!(matches!(result, Err(SyncError::FileNotFound(_))));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn notify_remote_then_force_to_cloud() {
+        use crate::infra::shell::mock::{MockFile, MockShell};
+
+        let dir = tempfile::tempdir().unwrap();
+        let shell = MockShell::with_files(vec![(
+            "/workspace/output/gen-mesh-001.png",
+            MockFile::new("sha256_hash_value_placeholder_0000000000000000000000000000000000", 4096),
+        )]);
+        let (service, backend) =
+            test_service_with_remote_source(dir.path(), Box::new(shell)).await;
+
+        let pod = LocationId::new("pod").unwrap();
+        let cloud = LocationId::new("cloud").unwrap();
+
+        // Step 1: notify on pod
+        service
+            .notify_remote(&pod, "gen-mesh-001.png", FileType::Image, Some("gen-mesh"))
+            .await
+            .unwrap();
+
+        // Step 2: force to cloud (uses pod→cloud route)
+        let batch = service.force(Some(&cloud)).await.unwrap();
+        assert_eq!(batch.pushed, 1);
+        assert_eq!(batch.failed, 0);
+
+        // Verify backend received correct paths
+        let log = backend.log.lock().await;
+        assert_eq!(log.len(), 1);
+        match &log[0] {
+            crate::infra::backend::memory::Op::Push { remote, .. } => {
+                assert_eq!(remote, "vdsl/output/gen-mesh-001.png");
+            }
+            _ => panic!("expected Push op"),
+        }
+
+        // Both locations should be Present
+        let entry = service.get("gen-mesh-001.png").await.unwrap().unwrap();
+        assert_eq!(entry.location_state(&pod), LocationState::Present);
+        assert_eq!(entry.location_state(&cloud), LocationState::Present);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn find_route_prefers_local() {
         let dir = tempfile::tempdir().unwrap();
         let (service, _) = test_service_with_dir(dir.path()).await;
@@ -960,6 +1159,135 @@ mod tests {
         let route = service.find_route_for_entry(&entry, &cloud);
         assert!(route.is_some());
         assert!(route.unwrap().src().is_local());
+    }
+
+    /// Build a service with pod→cloud route (remote source).
+    #[cfg(feature = "sqlite")]
+    async fn test_service_with_remote_source(
+        dir: &Path,
+        mock_shell: Box<dyn crate::infra::shell::RemoteShell>,
+    ) -> (SyncService, Arc<InMemoryBackend>) {
+        let store = SqliteSyncStore::open_in_memory().await.unwrap();
+        let cloud_backend = Arc::new(InMemoryBackend::default());
+
+        // Register remotes
+        for (id, root) in &[("pod", "/workspace/output"), ("cloud", "vdsl/output")] {
+            store
+                .register_remote(&RemoteConfig {
+                    location_id: LocationId::new(*id).unwrap(),
+                    backend: "memory".into(),
+                    remote_root: root.to_string(),
+                    config: serde_json::json!({}),
+                    created_at: chrono::Utc::now(),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Route: pod → cloud (remote source with shell)
+        let routes = vec![TransferRoute::with_src_shell(
+            LocationId::new("pod").unwrap(),
+            LocationId::new("cloud").unwrap(),
+            PathBuf::from("/workspace/output"),
+            "vdsl/output".into(),
+            Box::new(Arc::clone(&cloud_backend)),
+            mock_shell,
+        )];
+
+        let service = SyncService::new(dir.to_path_buf(), Box::new(store), routes);
+        (service, cloud_backend)
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn force_remote_source_success() {
+        use crate::infra::shell::mock::MockShell;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Mock: file exists on pod
+        let shell = MockShell::new(vec!["/workspace/output/gen-001.png"]);
+        let (service, backend) =
+            test_service_with_remote_source(dir.path(), Box::new(shell)).await;
+
+        // Manually register entry with pod=Present, cloud=Pending
+        let mut locations = HashMap::new();
+        locations.insert(LocationId::new("pod").unwrap(), LocationState::Present);
+        locations.insert(LocationId::new("cloud").unwrap(), LocationState::Pending);
+
+        let opts = RegisterOpts {
+            file_hash: "hash_remote".into(),
+            content_hash: None,
+            file_size: Some(1024),
+            gen_id: None,
+            initial_locations: locations,
+        };
+        service
+            .register("gen-001.png", FileType::Image, opts)
+            .await
+            .unwrap();
+
+        // Force push to cloud — should use pod→cloud route
+        let cloud = LocationId::new("cloud").unwrap();
+        let batch = service.force(Some(&cloud)).await.unwrap();
+        assert_eq!(batch.pushed, 1);
+        assert_eq!(batch.failed, 0);
+
+        // Verify backend received push
+        let log = backend.log.lock().await;
+        assert_eq!(log.len(), 1);
+        match &log[0] {
+            crate::infra::backend::memory::Op::Push { remote, .. } => {
+                assert_eq!(remote, "vdsl/output/gen-001.png");
+            }
+            _ => panic!("expected Push op"),
+        }
+
+        // Verify state
+        let entry = service.get("gen-001.png").await.unwrap().unwrap();
+        assert_eq!(entry.location_state(&cloud), LocationState::Present);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn force_remote_source_file_not_found() {
+        use crate::infra::shell::mock::MockShell;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Mock: file does NOT exist on pod
+        let shell = MockShell::new(Vec::<String>::new());
+        let (service, _backend) =
+            test_service_with_remote_source(dir.path(), Box::new(shell)).await;
+
+        // Register entry with pod=Present, cloud=Pending
+        let mut locations = HashMap::new();
+        locations.insert(LocationId::new("pod").unwrap(), LocationState::Present);
+        locations.insert(LocationId::new("cloud").unwrap(), LocationState::Pending);
+
+        let opts = RegisterOpts {
+            file_hash: "hash_missing".into(),
+            content_hash: None,
+            file_size: Some(512),
+            gen_id: None,
+            initial_locations: locations,
+        };
+        service
+            .register("missing.png", FileType::Image, opts)
+            .await
+            .unwrap();
+
+        // Force push — file not found on pod, should fail
+        let cloud = LocationId::new("cloud").unwrap();
+        let batch = service.force(Some(&cloud)).await.unwrap();
+        assert_eq!(batch.pushed, 0);
+        assert_eq!(batch.failed, 1);
+        assert!(batch.errors[0].1.contains("source file not found"));
+
+        // Pod should be marked Absent
+        let entry = service.get("missing.png").await.unwrap().unwrap();
+        assert_eq!(
+            entry.location_state(&LocationId::new("pod").unwrap()),
+            LocationState::Absent
+        );
     }
 
     #[cfg(feature = "sqlite")]
