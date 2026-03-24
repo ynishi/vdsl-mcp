@@ -6,26 +6,80 @@
 //! # 状態遷移
 //!
 //! ```text
-//! Queued → InFlight → Completed
-//!                   → Failed → (retry()で新Transferを生成)
+//! Blocked → Queued → InFlight → Completed
+//!                              → Failed → (retry()で新Transferを生成)
+//!                                       → Completed (resolve(): 事後条件が既に満たされている場合)
+//!                              → Cancelled (プロセス中断。終端状態。再実行されない)
 //! ```
 //!
-//! Failedからの復帰は既存Transferの状態変更ではなく、
-//! `retry()` で新しいTransfer (attempt +1) を生成する。
+//! Failedからの復帰は通常 `retry()` で新しいTransfer (attempt +1) を生成する。
 //! 失敗した記録は不変のまま履歴に残る。
+//!
+//! 例外: Delete転送で対象ファイルが既にdestに存在しない場合、
+//! 事後条件（ファイル不在）が満たされているため `resolve()` で
+//! Failed → Completed に直接遷移できる。
+//!
+//! Cancelled: プロセスkill等でInFlightのまま残った転送を正式に終了させる。
+//! 終端状態であり、retry対象にならない。sync開始時のorphaned InFlight処理で使用。
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-use super::error::SyncError;
+use super::error::DomainError;
 use super::location::LocationId;
 use super::retry::{RetryPolicy, TransferErrorKind};
+
+/// 配送の種類。
+///
+/// - `Sync` — ファイルをsrcからdestへ転送する（既存の動作）。
+/// - `Delete` — dest上のファイルを削除する（削除伝播）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferKind {
+    /// ファイル転送（追加/更新）。
+    #[default]
+    Sync,
+    /// ファイル削除（削除伝播）。
+    Delete,
+}
+
+impl TransferKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+impl fmt::Display for TransferKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TransferKind {
+    type Err = DomainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "sync" => Ok(Self::Sync),
+            "delete" => Ok(Self::Delete),
+            other => Err(DomainError::Validation {
+                field: "transfer_kind".into(),
+                reason: format!("unknown transfer kind: {other}"),
+            }),
+        }
+    }
+}
 
 /// 配送の状態。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferState {
+    /// 依存先Transferの完了待ち。depends_onが全てCompletedになるまで実行不可。
+    Blocked,
     /// 転送待ち。配送指示が作成されたがまだ実行されていない。
     Queued,
     /// 転送中。バックエンドがファイルを送信している。
@@ -34,21 +88,33 @@ pub enum TransferState {
     Completed,
     /// 転送失敗。エラー理由が`error`フィールドに記録される。
     Failed,
+    /// プロセス中断により転送が不完全に終了。終端状態。再実行されない。
+    ///
+    /// sync開始時にorphaned InFlight transfersを検出した場合に遷移する。
+    /// retry対象外。必要であれば新しいTransferを作成すること。
+    Cancelled,
 }
 
 impl TransferState {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Blocked => "blocked",
             Self::Queued => "queued",
             Self::InFlight => "in_flight",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
         }
     }
 
     /// まだ配送が必要な状態か。
     pub fn is_actionable(&self) -> bool {
         matches!(self, Self::Queued)
+    }
+
+    /// 終端状態か（Completed, Failed, Cancelled）。
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
 }
 
@@ -59,15 +125,17 @@ impl fmt::Display for TransferState {
 }
 
 impl std::str::FromStr for TransferState {
-    type Err = SyncError;
+    type Err = DomainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "blocked" => Ok(Self::Blocked),
             "queued" => Ok(Self::Queued),
             "in_flight" => Ok(Self::InFlight),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
-            other => Err(SyncError::InvalidTransferState(other.to_string())),
+            "cancelled" => Ok(Self::Cancelled),
+            other => Err(DomainError::InvalidTransferState(other.to_string())),
         }
     }
 }
@@ -80,14 +148,17 @@ impl std::str::FromStr for TransferState {
 /// # 不変条件
 ///
 /// - `src != dest` (自己転送は無意味)
-/// - 状態遷移は `Queued → InFlight → Completed|Failed` の一方向のみ
+/// - 状態遷移は `Blocked → Queued → InFlight → Completed|Failed|Cancelled` の一方向のみ
 /// - Failedからの復帰は `retry()` で新Transferを生成する
+/// - Cancelledは終端状態。プロセス中断によるorphaned InFlightの正式な終了
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transfer {
     id: String,
     file_id: String,
     src: LocationId,
     dest: LocationId,
+    #[serde(default)]
+    kind: TransferKind,
     state: TransferState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -99,6 +170,9 @@ pub struct Transfer {
     started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     finished_at: Option<DateTime<Utc>>,
+    /// 先行Transfer ID。このTransferはdepends_onが全てCompletedになるまでBlockedのまま。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    depends_on: Option<String>,
 }
 
 impl Transfer {
@@ -112,15 +186,34 @@ impl Transfer {
     ///
     /// - `file_id` が空文字列の場合
     /// - `src == dest` の場合（自己転送は無意味）
-    pub fn new(file_id: String, src: LocationId, dest: LocationId) -> Result<Self, SyncError> {
+    pub fn new(file_id: String, src: LocationId, dest: LocationId) -> Result<Self, DomainError> {
+        Self::with_kind(file_id, src, dest, TransferKind::Sync)
+    }
+
+    /// 削除伝播用の配送指示を作成。state = Queued, kind = Delete。
+    pub fn new_delete(
+        file_id: String,
+        src: LocationId,
+        dest: LocationId,
+    ) -> Result<Self, DomainError> {
+        Self::with_kind(file_id, src, dest, TransferKind::Delete)
+    }
+
+    /// 配送指示を作成（kind指定）。
+    pub fn with_kind(
+        file_id: String,
+        src: LocationId,
+        dest: LocationId,
+        kind: TransferKind,
+    ) -> Result<Self, DomainError> {
         if file_id.is_empty() {
-            return Err(SyncError::Validation {
+            return Err(DomainError::Validation {
                 field: "file_id".into(),
                 reason: "must not be empty".into(),
             });
         }
         if src == dest {
-            return Err(SyncError::Validation {
+            return Err(DomainError::Validation {
                 field: "src/dest".into(),
                 reason: format!("self-transfer is not allowed: {src}"),
             });
@@ -130,6 +223,7 @@ impl Transfer {
             file_id,
             src,
             dest,
+            kind,
             state: TransferState::Queued,
             error: None,
             error_kind: None,
@@ -137,16 +231,58 @@ impl Transfer {
             created_at: Utc::now(),
             started_at: None,
             finished_at: None,
+            depends_on: None,
         })
     }
 
-    /// DB復元用。永続化済みデータからの再構成。
+    /// 依存付きTransferを作成。state = Blocked。
+    ///
+    /// `depends_on_id`のTransferがCompletedになるまでBlockedのまま。
+    pub fn with_dependency(
+        file_id: String,
+        src: LocationId,
+        dest: LocationId,
+        kind: TransferKind,
+        depends_on_id: String,
+    ) -> Result<Self, DomainError> {
+        if file_id.is_empty() {
+            return Err(DomainError::Validation {
+                field: "file_id".into(),
+                reason: "must not be empty".into(),
+            });
+        }
+        if src == dest {
+            return Err(DomainError::Validation {
+                field: "src/dest".into(),
+                reason: format!("self-transfer is not allowed: {src}"),
+            });
+        }
+        Ok(Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            file_id,
+            src,
+            dest,
+            kind,
+            state: TransferState::Blocked,
+            error: None,
+            error_kind: None,
+            attempt: 1,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            depends_on: Some(depends_on_id),
+        })
+    }
+
+    /// テスト用再構成（depends_on=None）。本番はreconstitute_with_dependencyを使用。
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn reconstitute(
         id: String,
         file_id: String,
         src: LocationId,
         dest: LocationId,
+        kind: TransferKind,
         state: TransferState,
         error: Option<String>,
         error_kind: Option<TransferErrorKind>,
@@ -160,6 +296,7 @@ impl Transfer {
             file_id,
             src,
             dest,
+            kind,
             state,
             error,
             error_kind,
@@ -167,6 +304,41 @@ impl Transfer {
             created_at,
             started_at,
             finished_at,
+            depends_on: None,
+        }
+    }
+
+    /// DB復元用（depends_on付き）。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reconstitute_with_dependency(
+        id: String,
+        file_id: String,
+        src: LocationId,
+        dest: LocationId,
+        kind: TransferKind,
+        state: TransferState,
+        error: Option<String>,
+        error_kind: Option<TransferErrorKind>,
+        attempt: u32,
+        created_at: DateTime<Utc>,
+        started_at: Option<DateTime<Utc>>,
+        finished_at: Option<DateTime<Utc>>,
+        depends_on: Option<String>,
+    ) -> Self {
+        Self {
+            id,
+            file_id,
+            src,
+            dest,
+            kind,
+            state,
+            error,
+            error_kind,
+            attempt,
+            created_at,
+            started_at,
+            finished_at,
+            depends_on,
         }
     }
 
@@ -174,12 +346,27 @@ impl Transfer {
     // State transitions
     // =========================================================================
 
+    /// 依存解除。Blocked → Queued。
+    ///
+    /// depends_onの先行Transferが完了した時に呼ばれる。
+    /// Blocked以外の状態から呼ばれた場合はErrを返す。
+    pub fn unblock(&mut self) -> Result<(), DomainError> {
+        if self.state != TransferState::Blocked {
+            return Err(DomainError::InvalidStateTransition {
+                from: self.state.as_str().to_string(),
+                to: "queued (unblock)".to_string(),
+            });
+        }
+        self.state = TransferState::Queued;
+        Ok(())
+    }
+
     /// 転送開始。Queued → InFlight。
     ///
     /// Queued以外の状態から呼ばれた場合はErrを返す。
-    pub fn start(&mut self) -> Result<(), SyncError> {
+    pub fn start(&mut self) -> Result<(), DomainError> {
         if self.state != TransferState::Queued {
-            return Err(SyncError::InvalidStateTransition {
+            return Err(DomainError::InvalidStateTransition {
                 from: self.state.as_str().to_string(),
                 to: "in_flight".to_string(),
             });
@@ -192,9 +379,9 @@ impl Transfer {
     /// 転送完了。InFlight → Completed。
     ///
     /// InFlight以外の状態から呼ばれた場合はErrを返す。
-    pub fn complete(&mut self) -> Result<(), SyncError> {
+    pub fn complete(&mut self) -> Result<(), DomainError> {
         if self.state != TransferState::InFlight {
-            return Err(SyncError::InvalidStateTransition {
+            return Err(DomainError::InvalidStateTransition {
                 from: self.state.as_str().to_string(),
                 to: "completed".to_string(),
             });
@@ -211,9 +398,9 @@ impl Transfer {
     /// - [`Permanent`](TransferErrorKind::Permanent) — リトライ不要
     ///
     /// InFlight以外の状態から呼ばれた場合はErrを返す。
-    pub fn fail(&mut self, error: String, kind: TransferErrorKind) -> Result<(), SyncError> {
+    pub fn fail(&mut self, error: String, kind: TransferErrorKind) -> Result<(), DomainError> {
         if self.state != TransferState::InFlight {
-            return Err(SyncError::InvalidStateTransition {
+            return Err(DomainError::InvalidStateTransition {
                 from: self.state.as_str().to_string(),
                 to: "failed".to_string(),
             });
@@ -225,13 +412,53 @@ impl Transfer {
         Ok(())
     }
 
+    /// 事後条件による解決。Failed → Completed。
+    ///
+    /// 転送自体は失敗したが、転送の目的（事後条件）が既に
+    /// 満たされている場合に使用する。
+    ///
+    /// 典型例: Delete転送が「object not found」で失敗したが、
+    /// destにファイルが存在しない（＝削除の目的が達成済み）。
+    ///
+    /// Failed以外の状態から呼ばれた場合はErrを返す。
+    pub fn resolve(&mut self) -> Result<(), DomainError> {
+        if self.state != TransferState::Failed {
+            return Err(DomainError::InvalidStateTransition {
+                from: self.state.as_str().to_string(),
+                to: "completed (resolve)".to_string(),
+            });
+        }
+        self.state = TransferState::Completed;
+        self.finished_at = Some(Utc::now());
+        Ok(())
+    }
+
+    /// プロセス中断によるキャンセル。InFlight → Cancelled。
+    ///
+    /// sync開始時にorphaned InFlight transfersを検出した場合に使用。
+    /// Cancelledは終端状態 — retry対象にならず、再実行もされない。
+    /// 必要であれば新しいTransferを作成すること。
+    ///
+    /// InFlight以外の状態から呼ばれた場合はErrを返す。
+    pub fn cancel(&mut self) -> Result<(), DomainError> {
+        if self.state != TransferState::InFlight {
+            return Err(DomainError::InvalidStateTransition {
+                from: self.state.as_str().to_string(),
+                to: "cancelled".to_string(),
+            });
+        }
+        self.state = TransferState::Cancelled;
+        self.finished_at = Some(Utc::now());
+        Ok(())
+    }
+
     /// リトライ: この失敗Transferを元に新しいTransferを生成。
     ///
     /// attempt +1。元のTransferは不変のまま履歴に残る。
     /// Failed以外から呼ばれた場合はErrを返す。
-    pub fn retry(&self) -> Result<Self, SyncError> {
+    pub fn retry(&self) -> Result<Self, DomainError> {
         if self.state != TransferState::Failed {
-            return Err(SyncError::InvalidStateTransition {
+            return Err(DomainError::InvalidStateTransition {
                 from: self.state.as_str().to_string(),
                 to: "queued (retry)".to_string(),
             });
@@ -241,6 +468,7 @@ impl Transfer {
             file_id: self.file_id.clone(),
             src: self.src.clone(),
             dest: self.dest.clone(),
+            kind: self.kind,
             state: TransferState::Queued,
             error: None,
             error_kind: None,
@@ -248,6 +476,7 @@ impl Transfer {
             created_at: Utc::now(),
             started_at: None,
             finished_at: None,
+            depends_on: None,
         })
     }
 
@@ -298,6 +527,14 @@ impl Transfer {
         &self.dest
     }
 
+    pub fn kind(&self) -> TransferKind {
+        self.kind
+    }
+
+    pub fn is_delete(&self) -> bool {
+        self.kind == TransferKind::Delete
+    }
+
     pub fn state(&self) -> TransferState {
         self.state
     }
@@ -326,9 +563,13 @@ impl Transfer {
         self.finished_at
     }
 
+    pub fn depends_on(&self) -> Option<&str> {
+        self.depends_on.as_deref()
+    }
+
     /// Serialize to [`serde_json::Value`] for cross-boundary transport.
-    pub fn to_value(&self) -> Result<serde_json::Value, SyncError> {
-        serde_json::to_value(self).map_err(|e| SyncError::Serialization(format!("Transfer: {e}")))
+    pub fn to_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(self)
     }
 }
 
@@ -350,6 +591,7 @@ mod tests {
             "file-1".into(),
             loc("local"),
             loc("cloud"),
+            TransferKind::Sync,
             TransferState::Failed,
             Some("timeout".into()),
             Some(TransferErrorKind::Transient),
@@ -366,6 +608,7 @@ mod tests {
             "file-1".into(),
             loc("local"),
             loc("cloud"),
+            TransferKind::Sync,
             TransferState::Failed,
             Some("file not found".into()),
             Some(TransferErrorKind::Permanent),
@@ -605,5 +848,112 @@ mod tests {
     fn new_rejects_self_transfer() {
         let result = Transfer::new("file-1".into(), loc("local"), loc("local"));
         assert!(result.is_err());
+    }
+
+    // --- Resolve (Failed → Completed) ---
+
+    #[test]
+    fn resolve_transitions_failed_to_completed() {
+        let mut t = failed_transient(3);
+        assert_eq!(t.state(), TransferState::Failed);
+        t.resolve().unwrap();
+        assert_eq!(t.state(), TransferState::Completed);
+        assert!(t.finished_at().is_some());
+    }
+
+    #[test]
+    fn resolve_from_queued_fails() {
+        let mut t = sample_transfer();
+        assert!(
+            t.resolve().is_err(),
+            "Queued → Completed (resolve) is invalid"
+        );
+    }
+
+    #[test]
+    fn resolve_from_inflight_fails() {
+        let mut t = sample_transfer();
+        t.start().unwrap();
+        assert!(
+            t.resolve().is_err(),
+            "InFlight → Completed (resolve) is invalid"
+        );
+    }
+
+    #[test]
+    fn resolve_from_completed_fails() {
+        let mut t = sample_transfer();
+        t.start().unwrap();
+        t.complete().unwrap();
+        assert!(
+            t.resolve().is_err(),
+            "Completed → Completed (resolve) is invalid"
+        );
+    }
+
+    // --- Cancel (InFlight → Cancelled) ---
+
+    #[test]
+    fn cancel_transitions_inflight_to_cancelled() {
+        let mut t = sample_transfer();
+        t.start().unwrap();
+        assert_eq!(t.state(), TransferState::InFlight);
+        t.cancel().unwrap();
+        assert_eq!(t.state(), TransferState::Cancelled);
+        assert!(t.finished_at().is_some());
+    }
+
+    #[test]
+    fn cancel_from_queued_fails() {
+        let mut t = sample_transfer();
+        assert!(t.cancel().is_err(), "Queued → Cancelled is invalid");
+    }
+
+    #[test]
+    fn cancel_from_completed_fails() {
+        let mut t = sample_transfer();
+        t.start().unwrap();
+        t.complete().unwrap();
+        assert!(t.cancel().is_err(), "Completed → Cancelled is invalid");
+    }
+
+    #[test]
+    fn cancel_from_failed_fails() {
+        let t = failed_transient(1);
+        let mut t = t;
+        assert!(t.cancel().is_err(), "Failed → Cancelled is invalid");
+    }
+
+    #[test]
+    fn cancelled_is_terminal() {
+        assert!(TransferState::Cancelled.is_terminal());
+        assert!(TransferState::Completed.is_terminal());
+        assert!(TransferState::Failed.is_terminal());
+        assert!(!TransferState::Queued.is_terminal());
+        assert!(!TransferState::InFlight.is_terminal());
+        assert!(!TransferState::Blocked.is_terminal());
+    }
+
+    #[test]
+    fn cancelled_is_not_actionable() {
+        assert!(!TransferState::Cancelled.is_actionable());
+    }
+
+    #[test]
+    fn cancelled_roundtrip_serde() {
+        let mut t = sample_transfer();
+        t.start().unwrap();
+        t.cancel().unwrap();
+        let json = serde_json::to_value(&t).unwrap();
+        let restored: Transfer = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.state(), TransferState::Cancelled);
+    }
+
+    #[test]
+    fn cancelled_state_str_roundtrip() {
+        let s = TransferState::Cancelled.as_str();
+        assert_eq!(s, "cancelled");
+        let parsed: TransferState = s.parse().unwrap();
+        assert_eq!(parsed, TransferState::Cancelled);
     }
 }

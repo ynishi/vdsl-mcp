@@ -4,13 +4,14 @@
 
 use async_trait::async_trait;
 
-use crate::domain::error::SyncError;
+use crate::application::error::SyncError;
 use crate::domain::location::LocationId;
 use crate::infra::store::RemoteConfig;
 
 /// リモートエンドポイント設定の永続化。
 ///
 /// 実装: [`super::sqlite::SqliteSyncStore`] (feature = "sqlite")
+#[deprecated(note = "use TopologyFileStore — RemoteStore is part of old Store pipeline")]
 #[async_trait]
 pub trait RemoteStore: Send + Sync {
     /// リモートを登録（UPSERT）。

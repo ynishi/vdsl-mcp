@@ -1,16 +1,16 @@
 //! E2E test: local → pod, local → cloud three-location synchronization.
 //!
-//! Verifies the complete sync lifecycle with route-based transfer:
+//! Verifies the complete sync lifecycle with the Store API:
 //!
-//! 1. **notify** — register a local file, remotes become `pending`
-//! 2. **force_route(local, pod)** — push to pod, pod becomes `present`
-//! 3. **force_route(local, cloud)** — push to cloud, cloud becomes `present`
+//! 1. **put** — register a local file, remotes become `pending`
+//! 2. **sync_route(local, pod)** — transfer to pod, pod becomes `present`
+//! 3. **sync_route(local, cloud)** — transfer to cloud, cloud becomes `present`
 //! 4. **status** — verify all three locations show `present`
-//! 5. **file modification** — re-notify marks remotes as `pending` again
-//! 6. **force()** — topology-wide push to ALL remotes
+//! 5. **file modification** — re-put marks remotes as `pending` again
+//! 6. **sync()** — topology-wide transfer to ALL remotes
 //! 7. **duplicate detection** — same content at different path is detected
-//! 8. **notify output + recipe** — generation registration pattern
-//! 9. **error recovery** — backend failure → retry via RetryPolicy
+//! 8. **put output + recipe** — generation registration pattern
+//! 9. **error recovery** — backend failure → retry via sync()
 //!
 //! Uses InMemoryBackend (no real network). Runs entirely in-process.
 //!
@@ -18,47 +18,22 @@
 //! cargo run --example e2e_three_location_sync --features test-utils
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use vdsl_sync::infra::backend::memory::InMemoryBackend;
-use vdsl_sync::infra::backend::StorageBackend;
 use vdsl_sync::infra::remote_store::RemoteStore;
 use vdsl_sync::infra::sqlite::SqliteSyncStore;
 use vdsl_sync::infra::store::RemoteConfig;
 use vdsl_sync::{
-    FileStore, FileType, LocationId, PresenceState, SyncService, TransferRoute, TransferStore,
+    FileStore, FileType, LocationId, PresenceState, PutOptions, Store, StoreBuilder, TransferRoute,
+    TransferStore,
 };
 
-/// Wrapper so `Arc<InMemoryBackend>` implements `StorageBackend`.
-struct SharedBackend(Arc<InMemoryBackend>);
-
-#[async_trait::async_trait]
-impl StorageBackend for SharedBackend {
-    async fn push(&self, local_path: &Path, remote_path: &str) -> Result<(), vdsl_sync::SyncError> {
-        self.0.push(local_path, remote_path).await
-    }
-    async fn pull(&self, remote_path: &str, local_path: &Path) -> Result<(), vdsl_sync::SyncError> {
-        self.0.pull(remote_path, local_path).await
-    }
-    async fn list(
-        &self,
-        remote_path: &str,
-    ) -> Result<Vec<vdsl_sync::RemoteFile>, vdsl_sync::SyncError> {
-        self.0.list(remote_path).await
-    }
-    async fn exists(&self, remote_path: &str) -> Result<bool, vdsl_sync::SyncError> {
-        self.0.exists(remote_path).await
-    }
-    fn backend_type(&self) -> &str {
-        self.0.backend_type()
-    }
-}
-
-/// Build a SyncService with pod + cloud routes using InMemoryBackends.
-async fn build_service(
-    local_root: &Path,
-) -> (SyncService, Arc<InMemoryBackend>, Arc<InMemoryBackend>) {
+/// Build a Store with pod + cloud routes using InMemoryBackends.
+async fn build_store(
+    local_root: &std::path::Path,
+) -> (Store, Arc<InMemoryBackend>, Arc<InMemoryBackend>) {
     let store = SqliteSyncStore::open_in_memory().await.unwrap();
 
     let pod_backend = Arc::new(InMemoryBackend::default());
@@ -79,32 +54,31 @@ async fn build_service(
         .unwrap();
     }
 
-    // Route-based: local → pod, local → cloud
-    let routes = vec![
-        TransferRoute::new(
-            LocationId::local(),
-            LocationId::new("pod").unwrap(),
-            local_root.to_path_buf(),
-            PathBuf::from("workspace/comfyui/output"),
-            Box::new(SharedBackend(Arc::clone(&pod_backend))),
-        ),
-        TransferRoute::new(
-            LocationId::local(),
-            LocationId::new("cloud").unwrap(),
-            local_root.to_path_buf(),
-            PathBuf::from("vdsl/output"),
-            Box::new(SharedBackend(Arc::clone(&cloud_backend))),
-        ),
-    ];
-
     let store = Arc::new(store);
-    let service = SyncService::new(
+    let db = StoreBuilder::new(
         store.clone() as Arc<dyn FileStore>,
         store.clone() as Arc<dyn TransferStore>,
         store.clone() as Arc<dyn RemoteStore>,
-        routes,
-    );
-    (service, pod_backend, cloud_backend)
+    )
+    .route(TransferRoute::new(
+        LocationId::local(),
+        LocationId::new("pod").unwrap(),
+        local_root.to_path_buf(),
+        PathBuf::from("workspace/comfyui/output"),
+        Box::new(Arc::clone(&pod_backend)),
+    ))
+    .route(TransferRoute::new(
+        LocationId::local(),
+        LocationId::new("cloud").unwrap(),
+        local_root.to_path_buf(),
+        PathBuf::from("vdsl/output"),
+        Box::new(Arc::clone(&cloud_backend)),
+    ))
+    .build()
+    .await
+    .unwrap();
+
+    (db, pod_backend, cloud_backend)
 }
 
 /// Build a minimal valid PNG with given IDAT data and optional tEXt chunks.
@@ -157,20 +131,27 @@ fn assert_presence(view: &vdsl_sync::FileView, loc: &str, expected: PresenceStat
 #[tokio::main]
 async fn main() {
     let dir = tempfile::tempdir().unwrap();
-    let (service, pod_backend, _cloud_backend) = build_service(dir.path()).await;
+    let (db, pod_backend, _cloud_backend) = build_store(dir.path()).await;
 
     let pod_id = LocationId::new("pod").unwrap();
     let cloud_id = LocationId::new("cloud").unwrap();
 
     // =========================================================================
-    // 1. notify — register a local file
+    // 1. put — register a local file
     // =========================================================================
     let img_path = dir.path().join("output/gen-001.png");
     std::fs::create_dir_all(img_path.parent().unwrap()).unwrap();
     std::fs::write(&img_path, build_test_png(b"PIXEL_DATA_V1", &[])).unwrap();
 
-    let result = service
-        .notify(img_path.to_str().unwrap(), FileType::Image, Some("gen-001"))
+    let result = db
+        .put(
+            "output/gen-001.png",
+            FileType::Image,
+            PutOptions {
+                embedded_id: Some("gen-001".into()),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -178,23 +159,20 @@ async fn main() {
     assert_eq!(result.file.relative_path(), "output/gen-001.png");
     assert_eq!(result.transfers_created, 2); // local→pod, local→cloud
 
-    let view = service.get("output/gen-001.png").await.unwrap().unwrap();
+    let view = db.get("output/gen-001.png").await.unwrap().unwrap();
     assert_presence(&view, "local", PresenceState::Present);
     assert_presence(&view, "pod", PresenceState::Pending);
     assert_presence(&view, "cloud", PresenceState::Pending);
-    eprintln!("[PASS] 1. notify — local=present, pod=pending, cloud=pending");
+    eprintln!("[PASS] 1. put — local=present, pod=pending, cloud=pending");
 
     // =========================================================================
-    // 2. force_route(local, pod) — push to pod only
+    // 2. sync_route(local, pod) — transfer to pod only
     // =========================================================================
-    let batch = service
-        .force_route(&LocationId::local(), &pod_id)
-        .await
-        .unwrap();
-    assert_eq!(batch.pushed, 1, "should push 1 file to pod");
+    let batch = db.sync_route(&LocationId::local(), &pod_id).await.unwrap();
+    assert_eq!(batch.transferred, 1, "should transfer 1 file to pod");
     assert_eq!(batch.failed, 0, "no failures expected");
 
-    let view = service.get("output/gen-001.png").await.unwrap().unwrap();
+    let view = db.get("output/gen-001.png").await.unwrap().unwrap();
     assert_presence(&view, "local", PresenceState::Present);
     assert_presence(&view, "pod", PresenceState::Present);
     assert_presence(&view, "cloud", PresenceState::Pending);
@@ -210,27 +188,27 @@ async fn main() {
             other => panic!("expected Push, got {:?}", other),
         }
     }
-    eprintln!("[PASS] 2. force_route(local, pod) — pod=present, cloud still pending");
+    eprintln!("[PASS] 2. sync_route(local, pod) — pod=present, cloud still pending");
 
     // =========================================================================
-    // 3. force_route(local, cloud) — push to cloud
+    // 3. sync_route(local, cloud) — transfer to cloud
     // =========================================================================
-    let batch = service
-        .force_route(&LocationId::local(), &cloud_id)
+    let batch = db
+        .sync_route(&LocationId::local(), &cloud_id)
         .await
         .unwrap();
-    assert_eq!(batch.pushed, 1);
+    assert_eq!(batch.transferred, 1);
 
-    let view = service.get("output/gen-001.png").await.unwrap().unwrap();
+    let view = db.get("output/gen-001.png").await.unwrap().unwrap();
     assert_presence(&view, "local", PresenceState::Present);
     assert_presence(&view, "pod", PresenceState::Present);
     assert_presence(&view, "cloud", PresenceState::Present);
-    eprintln!("[PASS] 3. force_route(local, cloud) — all three locations present");
+    eprintln!("[PASS] 3. sync_route(local, cloud) — all three locations present");
 
     // =========================================================================
     // 4. status — verify aggregated summary
     // =========================================================================
-    let summary = service.status().await.unwrap();
+    let summary = db.status().await.unwrap();
     assert_eq!(summary.total_entries, 1);
     let local_summary = summary.locations.get(&LocationId::local()).unwrap();
     assert_eq!(local_summary.present, 1);
@@ -241,36 +219,46 @@ async fn main() {
     eprintln!("[PASS] 4. status — 1 entry, all locations present");
 
     // =========================================================================
-    // 5. file modification — re-notify marks remotes pending
+    // 5. file modification — re-put marks remotes pending
     // =========================================================================
     std::fs::write(&img_path, build_test_png(b"PIXEL_DATA_V2_MODIFIED", &[])).unwrap();
 
-    let result = service
-        .notify(img_path.to_str().unwrap(), FileType::Image, Some("gen-001"))
+    let result = db
+        .put(
+            "output/gen-001.png",
+            FileType::Image,
+            PutOptions {
+                embedded_id: Some("gen-001".into()),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
     assert!(!result.is_duplicate);
     assert_eq!(result.transfers_created, 2); // new transfers for modified file
 
-    let view = service.get("output/gen-001.png").await.unwrap().unwrap();
+    let view = db.get("output/gen-001.png").await.unwrap().unwrap();
     assert_presence(&view, "local", PresenceState::Present);
     assert_presence(&view, "pod", PresenceState::Pending);
     assert_presence(&view, "cloud", PresenceState::Pending);
     eprintln!("[PASS] 5. file modification — remotes back to pending");
 
     // =========================================================================
-    // 6. force() — topology-wide trigger, push ALL pending
+    // 6. sync() — topology-wide trigger, transfer ALL pending
     // =========================================================================
-    let result = service.force().await.unwrap();
-    assert_eq!(result.batch.pushed, 2, "should push to both pod and cloud");
+    let result = db.sync().await.unwrap();
+    assert_eq!(
+        result.batch.transferred, 2,
+        "should transfer to both pod and cloud"
+    );
     assert_eq!(result.batch.failed, 0);
 
-    let view = service.get("output/gen-001.png").await.unwrap().unwrap();
+    let view = db.get("output/gen-001.png").await.unwrap().unwrap();
     assert_presence(&view, "local", PresenceState::Present);
     assert_presence(&view, "pod", PresenceState::Present);
     assert_presence(&view, "cloud", PresenceState::Present);
-    eprintln!("[PASS] 6. force() — all remotes synced via topology trigger");
+    eprintln!("[PASS] 6. sync() — all remotes synced via topology trigger");
 
     // =========================================================================
     // 7. duplicate detection — same content, different path
@@ -278,8 +266,12 @@ async fn main() {
     let dup_path = dir.path().join("output/gen-001-copy.png");
     std::fs::copy(&img_path, &dup_path).unwrap();
 
-    let result = service
-        .notify(dup_path.to_str().unwrap(), FileType::Image, None)
+    let result = db
+        .put(
+            "output/gen-001-copy.png",
+            FileType::Image,
+            PutOptions::default(),
+        )
         .await
         .unwrap();
 
@@ -295,66 +287,72 @@ async fn main() {
     eprintln!("[PASS] 7. duplicate detection — same content identified");
 
     // =========================================================================
-    // 8. notify output + recipe (generation registration pattern)
+    // 8. put output + recipe (generation registration pattern)
     // =========================================================================
     let gen_output = dir.path().join("output/gen-002.png");
     let gen_recipe = dir.path().join("output/gen-002_recipe.json");
     std::fs::write(&gen_output, build_test_png(b"GEN002_PIXELS", &[])).unwrap();
     std::fs::write(&gen_recipe, br#"{"prompt":"test"}"#).unwrap();
 
-    let output_result = service
-        .notify(
-            gen_output.to_str().unwrap(),
+    let output_result = db
+        .put(
+            "output/gen-002.png",
             FileType::Image,
-            Some("gen-002"),
+            PutOptions {
+                embedded_id: Some("gen-002".into()),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
-    let recipe_result = service
-        .notify(
-            gen_recipe.to_str().unwrap(),
-            FileType::Recipe,
-            Some("gen-002"),
+    let recipe_result = db
+        .put(
+            "output/gen-002_recipe.json",
+            FileType::Asset,
+            PutOptions {
+                embedded_id: Some("gen-002".into()),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
 
     assert_eq!(output_result.file.file_type(), FileType::Image);
-    assert_eq!(recipe_result.file.file_type(), FileType::Recipe);
+    assert_eq!(recipe_result.file.file_type(), FileType::Asset);
     assert_eq!(output_result.file.embedded_id(), Some("gen-002"));
     assert_eq!(recipe_result.file.embedded_id(), Some("gen-002"));
-    eprintln!("[PASS] 8. notify output + recipe registered");
+    eprintln!("[PASS] 8. put output + recipe registered");
 
     // =========================================================================
-    // 9. error recovery — backend failure + retry via RetryPolicy
+    // 9. error recovery — backend failure + retry via sync()
     // =========================================================================
     // First, sync all pending files to pod so only gen-003 will be pending
-    let batch = service
-        .force_route(&LocationId::local(), &pod_id)
-        .await
-        .unwrap();
+    let batch = db.sync_route(&LocationId::local(), &pod_id).await.unwrap();
     assert_eq!(batch.failed, 0, "pre-cleanup should succeed");
 
     let err_path = dir.path().join("output/gen-003.png");
     std::fs::write(&err_path, build_test_png(b"GEN003_FAIL_FIRST", &[])).unwrap();
 
-    service
-        .notify(err_path.to_str().unwrap(), FileType::Image, Some("gen-003"))
-        .await
-        .unwrap();
+    db.put(
+        "output/gen-003.png",
+        FileType::Image,
+        PutOptions {
+            embedded_id: Some("gen-003".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
-    // Make pod backend fail on next push (only gen-003 is pending for pod)
+    // Make pod backend fail on next transfer (only gen-003 is pending for pod)
     *pod_backend.fail_next.lock().await = true;
 
-    let batch = service
-        .force_route(&LocationId::local(), &pod_id)
-        .await
-        .unwrap();
+    let batch = db.sync_route(&LocationId::local(), &pod_id).await.unwrap();
     assert_eq!(batch.failed, 1, "gen-003 should fail");
-    assert_eq!(batch.pushed, 0, "nothing should succeed");
+    assert_eq!(batch.transferred, 0, "nothing should succeed");
 
     // Verify error is recorded — Failed + Transient → Pending (retryable)
-    let view = service.get("output/gen-003.png").await.unwrap().unwrap();
+    let view = db.get("output/gen-003.png").await.unwrap().unwrap();
     let pod_presence = view.presence(&pod_id).unwrap();
     assert_eq!(
         pod_presence.state,
@@ -363,33 +361,43 @@ async fn main() {
     );
     assert!(pod_presence.error.is_some(), "error should be recorded");
 
-    // Verify transfer is in errors list
-    let errors = service.errors().await.unwrap();
-    let gen003_error = errors
-        .iter()
-        .find(|t| t.dest() == &pod_id)
-        .expect("gen-003 should be in errors");
-    assert_eq!(
-        gen003_error.error_kind(),
-        Some(vdsl_sync::TransferErrorKind::Transient)
+    // Verify retryable failure appears in pending_entries (not error_entries)
+    let summary = db.status().await.unwrap();
+    assert!(
+        summary
+            .pending_entries
+            .iter()
+            .any(|e| e.dest == pod_id && e.file_id.contains("gen-003")),
+        "retryable transient failure should appear as pending"
+    );
+    assert!(
+        summary.error_entries.is_empty(),
+        "retryable failure should NOT be in error_entries"
     );
 
-    // Retry via force() — calls retry_failed() internally, then executes
+    // Retry via sync() — retries failed transfers, then executes
     // (fail_next was auto-reset by InMemoryBackend)
-    let result = service.force().await.unwrap();
+    let result = db.sync().await.unwrap();
     // gen-003 to pod should be retried + succeed
     // gen-003 to cloud should also be pushed (was still queued)
-    assert!(result.batch.pushed >= 1, "retry should succeed");
+    assert!(result.batch.transferred >= 1, "retry should succeed");
     assert_eq!(result.batch.failed, 0);
 
-    let view = service.get("output/gen-003.png").await.unwrap().unwrap();
+    let view = db.get("output/gen-003.png").await.unwrap().unwrap();
     assert_presence(&view, "pod", PresenceState::Present);
-    eprintln!("[PASS] 9. error recovery — failure recorded, retry via force() succeeds");
+    eprintln!("[PASS] 9. error recovery — failure recorded, retry via sync() succeeds");
+
+    // =========================================================================
+    // 10. get() accepts absolute paths
+    // =========================================================================
+    let abs_view = db.get(img_path.to_str().unwrap()).await.unwrap();
+    assert!(abs_view.is_some(), "get() should accept absolute paths");
+    eprintln!("[PASS] 10. get() accepts absolute path");
 
     // =========================================================================
     // Final summary
     // =========================================================================
-    let summary = service.status().await.unwrap();
+    let summary = db.status().await.unwrap();
     eprintln!();
     eprintln!("=== Final Status ===");
     eprintln!(
@@ -403,5 +411,5 @@ async fn main() {
         );
     }
     eprintln!();
-    eprintln!("All 9 E2E scenarios passed.");
+    eprintln!("All 10 E2E scenarios passed.");
 }

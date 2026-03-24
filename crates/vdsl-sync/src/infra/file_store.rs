@@ -5,13 +5,14 @@
 
 use async_trait::async_trait;
 
-use crate::domain::error::SyncError;
+use crate::application::error::SyncError;
 use crate::domain::file_type::FileType;
 use crate::domain::tracked_file::TrackedFile;
 
 /// TrackedFile永続化。
 ///
 /// 実装: [`super::sqlite::SqliteSyncStore`] (feature = "sqlite")
+#[deprecated(note = "use TopologyFileStore + LocationFileStore")]
 #[async_trait]
 pub trait FileStore: Send + Sync {
     /// TrackedFileを保存（新規 or 更新）。
@@ -47,4 +48,17 @@ pub trait FileStore: Send + Sync {
 
     /// relative_pathで削除。削除した場合true。
     async fn delete_file(&self, relative_path: &str) -> Result<bool, SyncError>;
+
+    /// 登録済みファイル数（削除済みを除く）。
+    async fn count_files(&self) -> Result<usize, SyncError>;
+
+    /// 全ファイルのrelative_path一覧（削除済みを除く）。
+    ///
+    /// scan_and_registerの削除検出で使用: DB上のパスとFS上のパスの差分を取る。
+    async fn list_all_paths(&self) -> Result<Vec<String>, SyncError>;
+
+    /// 全ファイルのID一覧（削除済みを除く）。
+    ///
+    /// `force_full_rewrite` の requeue_all で使用。
+    async fn list_all_ids(&self) -> Result<Vec<String>, SyncError>;
 }

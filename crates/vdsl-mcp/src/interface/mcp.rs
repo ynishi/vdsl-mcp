@@ -29,6 +29,7 @@ use crate::infra::comfyui_client::{proxy_url, ComfyUiClient};
 #[cfg(feature = "mlua-backend")]
 use crate::infra::mlua_runtime::MluaRuntime;
 use crate::infra::runpod_cli::RunPodCli;
+use crate::infra::sync_tasks::SyncTaskManager;
 
 // =============================================================================
 // Public entry point
@@ -46,15 +47,6 @@ pub async fn run() -> anyhow::Result<()> {
 // MCP Server
 // =============================================================================
 
-/// Cached SyncService with the pod_id used to build it.
-///
-/// When pod_id changes (e.g. user connects to a different pod),
-/// the cache is invalidated and SyncService is rebuilt with new routes.
-struct SyncCache {
-    service: Arc<vdsl_sync::SyncService>,
-    pod_id: Option<String>,
-}
-
 #[derive(Clone)]
 struct VdslMcpServer {
     tool_router: ToolRouter<Self>,
@@ -69,8 +61,15 @@ struct VdslMcpServer {
     /// Whether the current session is an ephemeral pod (no network volume).
     /// When true, tools warn if images are not downloaded locally.
     ephemeral: Arc<Mutex<bool>>,
-    /// Cached SyncService. Rebuilt only when pod_id changes.
-    sync_cache: Arc<Mutex<Option<SyncCache>>>,
+    /// SyncStoreSdk instance. Built lazily on first sync tool call.
+    /// Rebuilt when pod_id changes (route topology depends on pod).
+    sync_sdk: Arc<tokio::sync::Mutex<Option<Arc<dyn vdsl_sync::SyncStoreSdk>>>>,
+    /// pod_id used to build the current sync SDK.
+    /// Compared against `last_pod_id` to detect pod changes requiring rebuild.
+    sync_sdk_pod_id: Arc<Mutex<Option<String>>>,
+    /// Background task manager for sync operations.
+    /// Shared between MCP tools and Lua runtime.
+    sync_task_mgr: Arc<SyncTaskManager>,
 }
 
 impl VdslMcpServer {
@@ -80,7 +79,9 @@ impl VdslMcpServer {
             last_url: Arc::new(Mutex::new(None)),
             last_pod_id: Arc::new(Mutex::new(None)),
             ephemeral: Arc::new(Mutex::new(false)),
-            sync_cache: Arc::new(Mutex::new(None)),
+            sync_sdk: Arc::new(tokio::sync::Mutex::new(None)),
+            sync_sdk_pod_id: Arc::new(Mutex::new(None)),
+            sync_task_mgr: Arc::new(SyncTaskManager::new()),
         }
     }
 
@@ -96,6 +97,73 @@ impl VdslMcpServer {
         std::env::var("VDSL_COMFYUI_TOKEN")
             .ok()
             .filter(|s| !s.is_empty())
+    }
+
+    /// Resolve or lazily initialize the SyncStoreSdk.
+    ///
+    /// Returns the existing SDK if pod_id hasn't changed.
+    /// Builds a new SDK when:
+    /// - First call (no SDK exists yet)
+    /// - pod_id changed since last build (route topology change)
+    async fn resolve_or_init_sdk(&self) -> Result<Arc<dyn vdsl_sync::SyncStoreSdk>, McpError> {
+        let mut current_pod_id = self.last_pod_id.lock().ok().and_then(|g| g.clone());
+
+        // Auto-detect running pod if not yet known via vdsl_connect.
+        if current_pod_id.is_none() {
+            if let Some(detected) = Self::detect_running_pod().await {
+                tracing::info!(pod_id = %detected, "sync: auto-detected running pod");
+                if let Ok(mut guard) = self.last_pod_id.lock() {
+                    *guard = Some(detected.clone());
+                }
+                current_pod_id = Some(detected);
+            }
+        }
+
+        let built_pod_id = self.sync_sdk_pod_id.lock().ok().and_then(|g| g.clone());
+
+        let mut guard = self.sync_sdk.lock().await;
+
+        // Return existing SDK if pod_id unchanged
+        if let Some(ref sdk) = *guard {
+            if built_pod_id == current_pod_id {
+                return Ok(sdk.clone());
+            }
+            // pod_id changed — fall through to rebuild
+        }
+
+        // Build new SDK
+        let work_dir = default_work_dir();
+        let sdk = build_sdk(&work_dir, current_pod_id.as_deref())
+            .await
+            .map_err(|e| {
+                McpError::invalid_params(format!("Failed to initialize sync SDK: {e:#}"), None)
+            })?;
+
+        *guard = Some(sdk.clone());
+        if let Ok(mut pid_guard) = self.sync_sdk_pod_id.lock() {
+            *pid_guard = current_pod_id;
+        }
+
+        Ok(sdk)
+    }
+
+    /// Detect a running RunPod pod by querying the RunPod API.
+    ///
+    /// Returns the first RUNNING pod's ID, or None if no pod is running
+    /// or the API key is not configured.
+    async fn detect_running_pod() -> Option<String> {
+        let api_key = resolve_api_key().ok()?;
+        let cli = RunPodCli::new(api_key);
+        let pods = cli.list_pods().await.ok()?;
+        pods.iter()
+            .find(|p| {
+                p.get("desiredStatus")
+                    .and_then(|s| s.as_str())
+                    .is_some_and(|s| s == "RUNNING")
+            })
+            .and_then(|p| p.get("id"))
+            .and_then(|id| id.as_str())
+            .map(|s| s.to_string())
     }
 
     /// Build a ComfyUiClient from URL, with env-based token auth.
@@ -125,8 +193,11 @@ impl VdslMcpServer {
     }
 
     /// Check if current session is ephemeral.
-    fn is_ephemeral(&self) -> bool {
-        self.ephemeral.lock().map(|g| *g).unwrap_or(false)
+    fn is_ephemeral(&self) -> Result<bool, McpError> {
+        self.ephemeral
+            .lock()
+            .map(|g| *g)
+            .map_err(|_| McpError::internal_error("ephemeral mutex poisoned", None))
     }
 
     /// Resolve pod ID from explicit parameter or session state.
@@ -809,6 +880,27 @@ pub struct VdslStorageArchiveRequest {
 
     /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519.
     pub ssh_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslSyncListRequest {
+    /// Filter by file type (e.g. "image", "video", "model"). If omitted, returns all.
+    pub file_type: Option<String>,
+
+    /// Maximum number of files to return.
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslSyncGetRequest {
+    /// File path (relative like "output/image.png" or absolute).
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslSyncPollRequest {
+    /// Task ID returned by vdsl_sync or vdsl_sync_force.
+    pub task_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2310,7 +2402,7 @@ impl VdslMcpServer {
 
         if !download_log.is_empty() {
             output.push_str(&format!("\n\ndownloads:\n{}", download_log.join("\n")));
-        } else if self.is_ephemeral() {
+        } else if self.is_ephemeral()? {
             output.push_str(
                 "\n\n⚠ Ephemeral pod — images exist only on the pod and will be lost on deletion.\n\
                  Specify save_dir to download images locally.",
@@ -2451,7 +2543,7 @@ impl VdslMcpServer {
         let mut output = log.join("\n");
         if !download_log.is_empty() {
             output.push_str(&format!("\n\ndownloads:\n{}", download_log.join("\n")));
-        } else if self.is_ephemeral() {
+        } else if self.is_ephemeral()? {
             output.push_str(
                 "\n\n⚠ Ephemeral pod — images exist only on the pod and will be lost on deletion.\n\
                  Specify save_dir to download images locally.",
@@ -2491,16 +2583,22 @@ impl VdslMcpServer {
             None
         };
 
-        // Pass pod_id for SyncService mesh routes (best-effort from session state)
-        let session_pod_id = self.last_pod_id.lock().ok().and_then(|g| g.clone());
+        let sync_store = match self.resolve_or_init_sdk().await {
+            Ok(store) => Some(store),
+            Err(e) => {
+                tracing::warn!(error = ?e, "run_script: store init failed, sync unavailable");
+                None
+            }
+        };
+        let task_mgr = Some(Arc::clone(&self.sync_task_mgr));
         let result = exec_lua(
             &lua_args,
             &work_dir,
             timeout,
             &[],
             &req.backend,
-            session_pod_id.as_deref(),
-            &self.sync_cache,
+            sync_store,
+            task_mgr,
         )
         .await?;
 
@@ -2581,14 +2679,22 @@ impl VdslMcpServer {
 
         let lua_args = vec![script.to_string_lossy().to_string()];
         // Catalogs don't need pod sync routes
+        let sync_store = match self.resolve_or_init_sdk().await {
+            Ok(store) => Some(store),
+            Err(e) => {
+                tracing::warn!(error = ?e, "catalogs: store init failed, sync unavailable");
+                None
+            }
+        };
+        let task_mgr = Some(Arc::clone(&self.sync_task_mgr));
         let result = exec_lua(
             &lua_args,
             &work_dir,
             30,
             &envs,
             &req.backend,
-            None,
-            &self.sync_cache,
+            sync_store,
+            task_mgr,
         )
         .await?;
 
@@ -3696,6 +3802,276 @@ impl VdslMcpServer {
     }
 
     // =========================================================================
+    // Sync (vdsl-sync Store)
+    // =========================================================================
+
+    #[tool(
+        name = "vdsl_sync",
+        description = "[sync] Trigger full synchronization across all configured routes. \
+            Scans local files, registers new/changed files, retries failed transfers, \
+            and executes pending transfers to all destinations (cloud, pod). \
+            Non-blocking: spawns a background task and returns a task_id immediately. \
+            Use vdsl_task_status to poll progress. \
+            Requires a Store to be initialized (run a VDSL script first, or ensure B2 env vars are set).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn sync(&self) -> Result<CallToolResult, McpError> {
+        let db = self.resolve_or_init_sdk().await?;
+        let task_id = self.sync_task_mgr.spawn_sync(&db).await;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "sync spawned.\ntask_id: {task_id}\n\nUse vdsl_sync_poll with this task_id to check progress."
+        ))]))
+    }
+
+    #[tool(
+        name = "vdsl_sync_status",
+        description = "[sync] Show sync status: total files, per-location presence counts \
+            (present/pending/syncing/failed), and error count. \
+            Requires a Store to be initialized.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn sync_status(&self) -> Result<CallToolResult, McpError> {
+        let db = self.resolve_or_init_sdk().await?;
+        let summary = db.status().await.map_err(Self::to_mcp_error)?;
+
+        let mut text = format_sync_summary(&summary);
+
+        // 件数が多い場合はファイルに書き出し
+        let total_detail = summary.error_entries.len() + summary.pending_entries.len();
+        if total_detail > MCP_RESPONSE_ENTRY_LIMIT {
+            if let Some(path) = dump_to_report_file("sync_status", &summary) {
+                text.push_str(&format!(
+                    "\nFull details ({} entries) written to:\n  {}\n",
+                    total_detail,
+                    path.display()
+                ));
+            }
+        }
+
+        // MCP responseにはLimited件数のみ含める
+        if !summary.error_entries.is_empty() {
+            let show = summary.error_entries.len().min(MCP_RESPONSE_ENTRY_LIMIT);
+            text.push_str(&format!(
+                "\nErrors (showing {}/{}):\n",
+                show,
+                summary.error_entries.len()
+            ));
+            if let Ok(json) = serde_json::to_string_pretty(&summary.error_entries[..show]) {
+                text.push_str(&json);
+            }
+        }
+        if !summary.pending_entries.is_empty() {
+            let show = summary.pending_entries.len().min(MCP_RESPONSE_ENTRY_LIMIT);
+            text.push_str(&format!(
+                "\n\nPending (showing {}/{}):\n",
+                show,
+                summary.pending_entries.len()
+            ));
+            if let Ok(json) = serde_json::to_string_pretty(&summary.pending_entries[..show]) {
+                text.push_str(&json);
+            }
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[tool(
+        name = "vdsl_sync_list",
+        description = "[sync] List tracked files with per-location presence state. \
+            Optional filter by file type (image, video, model, etc.) and limit. \
+            Returns FileView with presences for each configured location. \
+            Requires a Store to be initialized.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn sync_list(
+        &self,
+        Parameters(req): Parameters<VdslSyncListRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.resolve_or_init_sdk().await?;
+        let filter = req
+            .file_type
+            .as_deref()
+            .and_then(|s| s.parse::<vdsl_sync::FileType>().ok());
+        let views = db
+            .list(filter, req.limit)
+            .await
+            .map_err(Self::to_mcp_error)?;
+        if views.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No tracked files.",
+            )]));
+        }
+        let json = serde_json::to_string_pretty(&views).unwrap_or_else(|_| format!("{views:?}"));
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "vdsl_sync_get",
+        description = "[sync] Get detailed sync status for a single file. \
+            Accepts relative path (e.g. 'output/image.png') or absolute path. \
+            Returns file metadata and per-location presence state. \
+            Requires a Store to be initialized.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn sync_get(
+        &self,
+        Parameters(req): Parameters<VdslSyncGetRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.resolve_or_init_sdk().await?;
+        let view = db.get(&req.path).await.map_err(Self::to_mcp_error)?;
+        match view {
+            Some(v) => {
+                let json = serde_json::to_string_pretty(&v).unwrap_or_else(|_| format!("{v:?}"));
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            None => Ok(CallToolResult::success(vec![Content::text(format!(
+                "File not found: {}",
+                req.path
+            ))])),
+        }
+    }
+
+    #[tool(
+        name = "vdsl_sync_errors",
+        description = "[sync] List all failed transfers with error details. \
+            Shows file ID, source, destination, error message, and attempt count. \
+            Requires a Store to be initialized.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn sync_errors(&self) -> Result<CallToolResult, McpError> {
+        let db = self.resolve_or_init_sdk().await?;
+        let summary = db.status().await.map_err(Self::to_mcp_error)?;
+        if summary.error_entries.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No failed transfers.",
+            )]));
+        }
+
+        let total = summary.error_entries.len();
+        let mut text = format!("=== Sync Errors: {} total ===\n", total);
+
+        if total > MCP_RESPONSE_ENTRY_LIMIT {
+            if let Some(path) = dump_to_report_file("sync_errors", &summary.error_entries) {
+                text.push_str(&format!(
+                    "Full error list written to:\n  {}\n\n",
+                    path.display()
+                ));
+            }
+        }
+
+        let show = total.min(MCP_RESPONSE_ENTRY_LIMIT);
+        text.push_str(&format!("Showing first {show}/{total}:\n"));
+        if let Ok(json) = serde_json::to_string_pretty(&summary.error_entries[..show]) {
+            text.push_str(&json);
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[tool(
+        name = "vdsl_sync_force",
+        description = "[sync] Force full rewrite: re-queue ALL tracked files to ALL destinations \
+            regardless of current transfer state, then execute. \
+            WARNING: This is a LAST-RESORT maintenance operation. Do NOT use for normal sync — \
+            use vdsl_sync instead. Only use when: (1) remote storage lost/corrupted and needs \
+            full reconstruction, (2) DB state is inconsistent and cannot be repaired otherwise, \
+            (3) explicit user request with understanding of the cost (full re-transfer of all files). \
+            Transfers all files even if already present at destination. \
+            Spawns as a background task and returns a task_id for polling. \
+            NOT available in Lua scripts.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
+    #[allow(deprecated)]
+    async fn sync_force(&self) -> Result<CallToolResult, McpError> {
+        let db = self.resolve_or_init_sdk().await?;
+        let task_id = self.sync_task_mgr.spawn_force(&db).await;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "force_full_rewrite spawned.\ntask_id: {task_id}\n\nUse vdsl_sync_poll with this task_id to check progress."
+        ))]))
+    }
+
+    #[tool(
+        name = "vdsl_sync_poll",
+        description = "[sync] Poll the status of a background sync task. \
+            Returns the current status (pending/running/completed/failed) \
+            and result when completed. Use the task_id returned by \
+            vdsl_sync or vdsl_sync_force.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn sync_poll(
+        &self,
+        Parameters(req): Parameters<VdslSyncPollRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let task_id = vdsl_sync::TaskId::parse(&req.task_id);
+        let status = self.sync_task_mgr.poll(&task_id).await;
+        match status {
+            None => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Unknown task_id: {}\n\nTask may have been created in a previous session.",
+                req.task_id
+            ))])),
+            Some(vdsl_sync::TaskStatus::Pending) => {
+                Ok(CallToolResult::success(vec![Content::text(
+                    "Status: pending",
+                )]))
+            }
+            Some(vdsl_sync::TaskStatus::Running(phase)) => {
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Status: running\nPhase: {phase}"
+                ))]))
+            }
+            Some(vdsl_sync::TaskStatus::Failed(msg)) => {
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Status: failed\nError: {msg}"
+                ))]))
+            }
+            Some(vdsl_sync::TaskStatus::Completed(result)) => {
+                let mut text = format_sync_report_summary(&result);
+
+                // エラーが多い場合はファイルに書き出し
+                if result.errors.len() > MCP_RESPONSE_ENTRY_LIMIT {
+                    if let Some(path) = dump_to_report_file("sync_result", &result) {
+                        text.push_str(&format!(
+                            "\nFull result ({} error entries) written to:\n  {}\n",
+                            result.errors.len(),
+                            path.display()
+                        ));
+                    }
+                }
+
+                Ok(CallToolResult::success(vec![Content::text(text)]))
+            }
+        }
+    }
+
+    // =========================================================================
     // VDSL Script
     // =========================================================================
 
@@ -3765,20 +4141,23 @@ impl VdslMcpServer {
             envs.push(("VDSL_COMFY_TOKEN", token.as_str()));
         }
 
-        // Resolve pod_id from request or session state for mesh sync routes
-        let run_pod_id = req
-            .pod_id
-            .as_deref()
-            .map(String::from)
-            .or_else(|| self.last_pod_id.lock().ok().and_then(|g| g.clone()));
+        // Store for sync bridge (best-effort — Lua runs without sync if Store init fails)
+        let sync_store = match self.resolve_or_init_sdk().await {
+            Ok(store) => Some(store),
+            Err(e) => {
+                tracing::warn!(error = ?e, "vdsl_run: store init failed, sync unavailable");
+                None
+            }
+        };
+        let task_mgr = Some(Arc::clone(&self.sync_task_mgr));
         let lua_result = exec_lua(
             &lua_args,
             &work_dir,
             timeout,
             &envs,
             &req.backend,
-            run_pod_id.as_deref(),
-            &self.sync_cache,
+            sync_store,
+            task_mgr,
         )
         .await?;
 
@@ -4021,7 +4400,7 @@ impl VdslMcpServer {
 
             if !download_log.is_empty() {
                 log.push(format!("\ndownloads:\n{}", download_log.join("\n")));
-            } else if self.is_ephemeral() {
+            } else if self.is_ephemeral()? {
                 log.push(
                     "\n⚠ Ephemeral pod — images exist only on the pod and will be lost on deletion.\n\
                      Specify save_dir to download images locally."
@@ -4440,10 +4819,7 @@ fn save_inline_script(code: &str, work_dir: &std::path::Path) -> Option<std::pat
     };
 
     if let Err(e) = std::fs::create_dir_all(&history_dir) {
-        eprintln!(
-            "inline history: failed to create {}: {e}",
-            history_dir.display()
-        );
+        tracing::warn!(path = %history_dir.display(), error = %e, "inline history: failed to create dir");
         return None;
     }
 
@@ -4452,7 +4828,7 @@ fn save_inline_script(code: &str, work_dir: &std::path::Path) -> Option<std::pat
     let dest = unique_dest(&history_dir, &filename);
 
     if let Err(e) = std::fs::write(&dest, code) {
-        eprintln!("inline history: failed to write {}: {e}", dest.display());
+        tracing::warn!(path = %dest.display(), error = %e, "inline history: failed to write");
         return None;
     }
     Some(dest)
@@ -4527,15 +4903,15 @@ async fn exec_lua(
     timeout_secs: u64,
     envs: &[(&str, &str)],
     backend: &LuaBackend,
-    pod_id: Option<&str>,
-    sync_cache: &Mutex<Option<SyncCache>>,
+    sync_sdk: Option<Arc<dyn vdsl_sync::SyncStoreSdk>>,
+    sync_task_mgr: Option<Arc<SyncTaskManager>>,
 ) -> Result<LuaExecResult, McpError> {
     match backend {
         LuaBackend::Process => exec_lua_process(lua_args, work_dir, timeout_secs, envs).await,
         LuaBackend::Mlua => {
             #[cfg(feature = "mlua-backend")]
             {
-                exec_lua_mlua(lua_args, work_dir, envs, pod_id, sync_cache).await
+                exec_lua_mlua(lua_args, work_dir, envs, sync_sdk, sync_task_mgr).await
             }
             #[cfg(not(feature = "mlua-backend"))]
             {
@@ -4557,37 +4933,10 @@ async fn exec_lua_mlua(
     lua_args: &[String],
     work_dir: &std::path::Path,
     envs: &[(&str, &str)],
-    pod_id: Option<&str>,
-    sync_cache: &Mutex<Option<SyncCache>>,
+    sync_sdk: Option<Arc<dyn vdsl_sync::SyncStoreSdk>>,
+    sync_task_mgr: Option<Arc<SyncTaskManager>>,
 ) -> Result<LuaExecResult, McpError> {
-    // Reuse cached SyncService if pod_id hasn't changed.
-    // When pod_id changes (user connected to a different pod), rebuild with new routes.
-    let sync_service = {
-        let cached = sync_cache.lock().ok().and_then(|guard| {
-            let cache = guard.as_ref()?;
-            if cache.pod_id.as_deref() == pod_id {
-                Some(cache.service.clone())
-            } else {
-                None
-            }
-        });
-        if let Some(svc) = cached {
-            Some(svc)
-        } else {
-            let svc = build_sync_service(work_dir, pod_id).await;
-            if let Some(ref s) = svc {
-                if let Ok(mut guard) = sync_cache.lock() {
-                    *guard = Some(SyncCache {
-                        service: s.clone(),
-                        pod_id: pod_id.map(String::from),
-                    });
-                }
-            }
-            svc
-        }
-    };
-
-    let runtime = MluaRuntime::new(work_dir, sync_service).await?;
+    let runtime = MluaRuntime::new(work_dir, sync_sdk, sync_task_mgr).await?;
 
     // Reconstruct the code to execute from lua_args.
     // lua_args patterns:
@@ -4624,172 +4973,238 @@ async fn exec_lua_mlua(
     })
 }
 
-/// Build a [`SyncService`] from environment variables (best-effort).
+/// Build a [`Store`] from environment variables (best-effort).
 ///
-/// Returns `Some(Arc<SyncService>)` when all required env vars are set:
+/// Returns `Some(Arc<Store>)` when all required env vars are set:
 /// - `VDSL_B2_KEY_ID`, `VDSL_B2_KEY`, `VDSL_B2_BUCKET`
 ///
+/// Resolve default work_dir for Store initialization.
+///
+/// Priority: `VDSL_WORK_DIR` env var → `~/vdsl`.
+#[cfg(feature = "mlua-backend")]
+fn default_work_dir() -> std::path::PathBuf {
+    std::env::var("VDSL_WORK_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            std::path::PathBuf::from(home).join("vdsl")
+        })
+}
+
 /// When `pod_id` is provided and RunPod API key is available, additional
 /// Pod routes are registered for 3-location mesh sync (local/pod/cloud).
 ///
 /// Returns `None` on any error (missing env, DB open failure, etc.).
 /// Callers fall back to MOCK sync backend when `None`.
+// BuildStoreResult removed — build_sdk() returns Arc<dyn SyncStoreSdk> directly.
+
+/// Build a `SyncStoreSdk` from environment variables (best-effort).
+///
+/// SDK構築。必要な環境変数:
+/// - `VDSL_B2_KEY_ID`, `VDSL_B2_KEY`, `VDSL_B2_BUCKET`
+///
+/// SdkImpl を構築: Location[] → Scanner自動導出 → TopologyScanner → TopologyStore → TransferEngine → SdkImpl。
 #[cfg(feature = "mlua-backend")]
-async fn build_sync_service(
+async fn build_sdk(
     work_dir: &std::path::Path,
     pod_id: Option<&str>,
-) -> Option<Arc<vdsl_sync::SyncService>> {
+) -> anyhow::Result<Arc<dyn vdsl_sync::SyncStoreSdk>> {
     use crate::application::pod_service::resolve_api_key;
-    use crate::infra::pod_shell::RunPodCliShell;
     use crate::infra::runpod_cli::RunPodCli;
-    use vdsl_sync::infra::rclone::RcloneBackend;
+    use anyhow::Context as _;
+    use vdsl_sync::infra::location_file_store::LocationFileStore;
     use vdsl_sync::infra::sqlite::SqliteSyncStore;
-    use vdsl_sync::infra::store::RemoteConfig;
-    use vdsl_sync::{LocationId, SyncServiceBuilder, TransferRoute};
+    use vdsl_sync::infra::topology_file_store::TopologyFileStore;
+    use vdsl_sync::LocationId;
 
     // Resolve B2 credentials
-    let key_id = std::env::var("VDSL_B2_KEY_ID")
-        .ok()
-        .filter(|s| !s.is_empty())?;
-    let key = std::env::var("VDSL_B2_KEY")
-        .ok()
-        .filter(|s| !s.is_empty())?;
-    let bucket = std::env::var("VDSL_B2_BUCKET")
-        .ok()
-        .filter(|s| !s.is_empty())?;
+    let key_id = std::env::var("VDSL_B2_KEY_ID").context("VDSL_B2_KEY_ID not set")?;
+    anyhow::ensure!(!key_id.is_empty(), "VDSL_B2_KEY_ID is empty");
+    let key = std::env::var("VDSL_B2_KEY").context("VDSL_B2_KEY not set")?;
+    anyhow::ensure!(!key.is_empty(), "VDSL_B2_KEY is empty");
+    let bucket = std::env::var("VDSL_B2_BUCKET").context("VDSL_B2_BUCKET not set")?;
+    anyhow::ensure!(!bucket.is_empty(), "VDSL_B2_BUCKET is empty");
 
     // Sync DB path: work_dir/.vdsl/sync.db
     let db_dir = work_dir.join(".vdsl");
-    if let Err(e) = tokio::fs::create_dir_all(&db_dir).await {
-        eprintln!("[WARN] sync: failed to create .vdsl dir: {e}");
-        return None;
-    }
+    tokio::fs::create_dir_all(&db_dir)
+        .await
+        .context("failed to create .vdsl dir")?;
     let db_path = db_dir.join("sync.db");
 
     // Open SQLite store
-    let store = match SqliteSyncStore::open(&db_path).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[WARN] sync: failed to open sync DB: {e}");
-            return None;
-        }
-    };
+    let persistence = std::sync::Arc::new(
+        SqliteSyncStore::open(&db_path)
+            .await
+            .context("failed to open sync DB")?,
+    );
 
     let rclone_remote = format!(":b2,account={key_id},key={key}:{bucket}");
-    let cloud_id = LocationId::new("cloud").ok()?;
+    let cloud_id = LocationId::new("cloud").context("invalid LocationId 'cloud'")?;
 
-    // Build via SyncServiceBuilder — remote registration is automatic on build()
-    let store = std::sync::Arc::new(store);
-    let mut builder = SyncServiceBuilder::new(
-        store.clone() as std::sync::Arc<dyn vdsl_sync::FileStore>,
-        store.clone() as std::sync::Arc<dyn vdsl_sync::TransferStore>,
-        store.clone() as std::sync::Arc<dyn vdsl_sync::RemoteStore>,
-    )
-    .remote(RemoteConfig {
-        location_id: cloud_id.clone(),
-        backend: "rclone".into(),
-        config: serde_json::json!({}),
-        created_at: chrono::Utc::now(),
-    })
-    .route(TransferRoute::new(
-        LocationId::local(),
-        cloud_id.clone(),
-        work_dir.to_path_buf(),
-        std::path::PathBuf::from("vdsl/output"),
-        Box::new(RcloneBackend::new(&rclone_remote)),
-    ))
-    .route(TransferRoute::pull(
-        cloud_id.clone(),
-        LocationId::local(),
-        std::path::PathBuf::from("vdsl/output"),
-        work_dir.to_path_buf(),
-        Box::new(RcloneBackend::new(&rclone_remote)),
-    ));
-
-    // Pod routes (when pod_id is available)
-    if let Some(pid) = pod_id {
-        if let Ok(api_key) = resolve_api_key() {
-            let pod_id_owned = pid.to_string();
-            let ssh_key = Some(resolve_ssh_key(None));
-
-            if let Ok(pod_loc) = LocationId::new("pod") {
-                let pod_output_root = std::path::PathBuf::from(format!("{}/output", *COMFYUI_BASE));
-
-                // pod→cloud: push from Pod filesystem to B2 (rclone runs on Pod)
-                let pod_shell_for_push_rclone = RunPodCliShell::new(
-                    RunPodCli::new(api_key.clone()),
-                    pod_id_owned.clone(),
-                    ssh_key.clone(),
+    // Pre-fetch SSH info once (async)
+    let api_key = resolve_api_key().ok();
+    let ssh_info = if let (Some(pid), Some(ref ak)) = (pod_id, &api_key) {
+        let cli_for_ssh = RunPodCli::new(ak.clone());
+        match cli_for_ssh.pod_ssh_info(pid).await {
+            Ok(Some(info)) => {
+                tracing::info!(
+                    host = %info.host,
+                    port = info.port,
+                    "sync: local→pod route available (SFTP)"
                 );
-                let pod_shell_for_push_inspect = RunPodCliShell::new(
-                    RunPodCli::new(api_key.clone()),
-                    pod_id_owned.clone(),
-                    ssh_key.clone(),
+                Some(info)
+            }
+            Ok(None) => {
+                tracing::info!(
+                    "sync: local→pod route skipped (pod not running or SSH unavailable)"
                 );
-
-                // cloud→pod: pull from B2 to Pod filesystem (rclone runs on Pod)
-                let pod_shell_for_pull_rclone = RunPodCliShell::new(
-                    RunPodCli::new(api_key.clone()),
-                    pod_id_owned.clone(),
-                    ssh_key.clone(),
-                );
-
-                builder = builder
-                    .remote(RemoteConfig {
-                        location_id: pod_loc.clone(),
-                        backend: "rclone".into(),
-                        config: serde_json::json!({"pod_id": pod_id_owned}),
-                        created_at: chrono::Utc::now(),
-                    })
-                    // pod→cloud (push direction)
-                    .route(TransferRoute::with_src_shell(
-                        pod_loc.clone(),
-                        cloud_id.clone(),
-                        pod_output_root.clone(),
-                        std::path::PathBuf::from("vdsl/output"),
-                        Box::new(RcloneBackend::with_shell(
-                            &rclone_remote,
-                            Box::new(pod_shell_for_push_rclone),
-                        )),
-                        Box::new(pod_shell_for_push_inspect),
-                    ))
-                    // cloud→pod (pull direction: B2 → Pod filesystem)
-                    .route(TransferRoute::pull(
-                        cloud_id,
-                        pod_loc,
-                        std::path::PathBuf::from("vdsl/output"),
-                        pod_output_root,
-                        Box::new(RcloneBackend::with_shell(
-                            &rclone_remote,
-                            Box::new(pod_shell_for_pull_rclone),
-                        )),
-                    ));
-
-                eprintln!("[INFO] sync: pod routes added (pod_id={pod_id_owned})");
-            } else {
-                eprintln!("[WARN] sync: failed to create pod LocationId");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "sync: failed to get pod SSH info");
+                None
             }
         }
+    } else {
+        None
+    };
+
+    // =========================================================================
+    // Location 登録
+    // =========================================================================
+
+    use crate::infra::pod_shell::RunPodCliShell;
+    use vdsl_sync::infra::rclone::RcloneBackend;
+
+    let local_root = work_dir.join("output");
+    let hasher: std::sync::Arc<dyn vdsl_sync::ContentHasher> =
+        std::sync::Arc::new(vdsl_sync::infra::hasher::Djb2Hasher);
+    let local_loc: std::sync::Arc<dyn vdsl_sync::Location> =
+        std::sync::Arc::new(vdsl_sync::LocalLocation::new(local_root, hasher));
+
+    let cloud_loc: std::sync::Arc<dyn vdsl_sync::Location> =
+        std::sync::Arc::new(vdsl_sync::CloudLocation::new(
+            cloud_id.clone(),
+            std::path::PathBuf::from("vdsl/output"),
+            std::sync::Arc::new(RcloneBackend::new(&rclone_remote)),
+        ));
+
+    let local_id = vdsl_sync::LocationId::local();
+
+    let mut builder = vdsl_sync::SdkImplBuilder::new(
+        persistence.clone() as std::sync::Arc<dyn TopologyFileStore>,
+        persistence.clone() as std::sync::Arc<dyn LocationFileStore>,
+        persistence.clone() as std::sync::Arc<dyn vdsl_sync::TransferStore>,
+    )
+    .location(local_loc)
+    .location(cloud_loc)
+    .exclude(".git")
+    .exclude(".git/**")
+    .exclude(".vdsl")
+    .exclude(".vdsl/**")
+    .exclude(".*");
+
+    // =========================================================================
+    // Route 接続 — Local ↔ Cloud（常時）
+    // コストは LocationKind (Local↔Cloud) から自動推定される。
+    // =========================================================================
+
+    builder = builder.connect(
+        &local_id,
+        &cloud_id,
+        Box::new(RcloneBackend::new(&rclone_remote)),
+    );
+
+    builder = builder.connect_pull(
+        &cloud_id,
+        &local_id,
+        Box::new(RcloneBackend::new(&rclone_remote)),
+    );
+
+    // =========================================================================
+    // Route 接続 — Pod ↔ Cloud / Local → Pod（Pod利用時）
+    // コストは LocationKind の組み合わせから自動推定:
+    //   Local→Remote(Pod) = 1.0, Remote→Cloud = 2.0, Local→Cloud = 5.0
+    // → optimal_tree が自動的に Local→Pod→Cloud チェーンを選択する。
+    // =========================================================================
+
+    let mut route_desc = "local↔cloud";
+
+    if let (Some(pid), Some(ref ak)) = (pod_id, &api_key) {
+        if let Ok(pod_loc_id) = vdsl_sync::LocationId::new("pod") {
+            let pod_output_root = std::path::PathBuf::from(format!("{}/output", *COMFYUI_BASE));
+            let ssh_key = Some(resolve_ssh_key(None));
+
+            // Pod Location 登録（Scanner 自動導出用）
+            let pod_shell_for_scan =
+                RunPodCliShell::new(RunPodCli::new(ak.clone()), pid.to_string(), ssh_key.clone());
+            let pod_loc: std::sync::Arc<dyn vdsl_sync::Location> =
+                std::sync::Arc::new(vdsl_sync::SshLocation::new(
+                    pod_loc_id.clone(),
+                    pod_output_root,
+                    std::sync::Arc::new(pod_shell_for_scan),
+                ));
+            builder = builder.location(pod_loc);
+
+            // pod→cloud (push, rclone on Pod)
+            let pod_shell_for_push_rclone =
+                RunPodCliShell::new(RunPodCli::new(ak.clone()), pid.to_string(), ssh_key.clone());
+            let pod_shell_for_push_inspect =
+                RunPodCliShell::new(RunPodCli::new(ak.clone()), pid.to_string(), ssh_key.clone());
+            builder = builder.connect_with_shell(
+                &pod_loc_id,
+                &cloud_id,
+                Box::new(RcloneBackend::with_shell(
+                    &rclone_remote,
+                    Box::new(pod_shell_for_push_rclone),
+                )),
+                Box::new(pod_shell_for_push_inspect),
+            );
+
+            // cloud→pod (pull, rclone on Pod)
+            let pod_shell_for_pull_rclone =
+                RunPodCliShell::new(RunPodCli::new(ak.clone()), pid.to_string(), ssh_key.clone());
+            builder = builder.connect_pull(
+                &cloud_id,
+                &pod_loc_id,
+                Box::new(RcloneBackend::with_shell(
+                    &rclone_remote,
+                    Box::new(pod_shell_for_pull_rclone),
+                )),
+            );
+
+            route_desc = "local↔cloud+pod↔cloud";
+
+            // local→pod (SFTP, SSH到達時のみ)
+            if let Some(ref ssh_info) = ssh_info {
+                let ssh_key_path = resolve_ssh_key(None);
+                let sftp_remote = ssh_info.to_rclone_sftp_remote(&ssh_key_path);
+
+                builder = builder.connect(
+                    &local_id,
+                    &pod_loc_id,
+                    Box::new(RcloneBackend::new(&sftp_remote)),
+                );
+
+                route_desc = "local→pod→cloud+local↔cloud+pod↔cloud";
+            }
+
+            tracing::info!(pod_id = pid, "sync: pod routes added");
+        }
     }
 
-    match builder.build().await {
-        Ok(service) => {
-            eprintln!(
-                "[INFO] sync: SyncService initialized (cloud=B2, routes={}, db={})",
-                if pod_id.is_some() {
-                    "local↔cloud+pod↔cloud"
-                } else {
-                    "local↔cloud"
-                },
-                db_path.display()
-            );
-            Some(Arc::new(service))
-        }
-        Err(e) => {
-            eprintln!("[WARN] sync: SyncService build failed: {e}");
-            None
-        }
-    }
+    let sdk = builder.build();
+
+    tracing::info!(
+        routes = route_desc,
+        db = %db_path.display(),
+        "sync: SyncStoreSdk initialized (cloud=B2)"
+    );
+
+    Ok(Arc::new(sdk) as Arc<dyn vdsl_sync::SyncStoreSdk>)
 }
 
 /// Parse lua CLI args into code string for mlua execution.
@@ -5760,8 +6175,7 @@ async fn inject_vdsl_metadata(
     let manifest_path = manifest_file.path().to_string_lossy().to_string();
 
     let lua_args = vec!["-e".to_string(), VDSL_INJECT_LUA.to_string()];
-    // Inject uses Process backend (not mlua), so sync_cache is unused.
-    let no_cache = Mutex::new(None);
+    // Inject uses Process backend (not mlua), so sync store/task_mgr are unused.
     let result = exec_lua(
         &lua_args,
         work_dir,
@@ -5769,7 +6183,7 @@ async fn inject_vdsl_metadata(
         &[("VDSL_INJECT_MANIFEST", &manifest_path)],
         &LuaBackend::default(),
         None,
-        &no_cache,
+        None,
     )
     .await
     .map_err(|e| format!("{e}"))?;
@@ -5877,6 +6291,79 @@ fn resolve_ssh_key(param: Option<&str>) -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_SSH_KEY.to_string())
+}
+
+// =============================================================================
+// MCP Response Helpers — Summary + Limit + File dump
+// =============================================================================
+
+/// MCPレスポンスに含めるリスト要素の上限。
+const MCP_RESPONSE_ENTRY_LIMIT: usize = 20;
+
+/// SyncSummary を人間可読なSummary文字列に変換する。
+/// locations の present/pending/syncing/failed/absent を一覧表示。
+fn format_sync_summary(summary: &vdsl_sync::SyncSummary) -> String {
+    use std::fmt::Write;
+    let mut buf = String::new();
+    let _ = writeln!(buf, "=== Sync Status Summary ===");
+    let _ = writeln!(buf, "Total tracked files: {}", summary.total_entries);
+    let _ = writeln!(buf, "Total errors: {}", summary.total_errors);
+    let _ = writeln!(buf, "Pending transfers: {}", summary.pending_entries.len());
+    let _ = writeln!(buf);
+    let _ = writeln!(buf, "Locations:");
+
+    let mut locs: Vec<_> = summary.locations.iter().collect();
+    locs.sort_by_key(|(id, _)| id.as_str().to_string());
+    for (id, loc) in &locs {
+        let _ = writeln!(
+            buf,
+            "  {}: present={}, pending={}, syncing={}, failed={}, absent={}",
+            id.as_str(),
+            loc.present,
+            loc.pending,
+            loc.syncing,
+            loc.failed,
+            loc.absent
+        );
+    }
+    buf
+}
+
+/// SyncReport（sync/force完了後）を人間可読なSummary文字列に変換する。
+fn format_sync_report_summary(result: &vdsl_sync::SyncReport) -> String {
+    use std::fmt::Write;
+    let mut buf = String::new();
+    let _ = writeln!(buf, "=== Sync Result Summary ===");
+    let _ = writeln!(buf, "Scanned: {}", result.scanned);
+    let _ = writeln!(buf, "Transfers created: {}", result.transfers_created);
+    let _ = writeln!(buf, "Transferred: {}", result.transferred);
+    let _ = writeln!(buf, "Failed: {}", result.failed);
+    if !result.errors.is_empty() {
+        let _ = writeln!(
+            buf,
+            "Errors (first {}):",
+            result.errors.len().min(MCP_RESPONSE_ENTRY_LIMIT)
+        );
+        for e in result.errors.iter().take(MCP_RESPONSE_ENTRY_LIMIT) {
+            let _ = writeln!(buf, "  - {}: {}", e.path, e.error);
+        }
+    }
+    buf
+}
+
+/// 全データをJSONファイルに書き出し、パスを返す。
+/// 書き出し失敗時は None を返す（MCPレスポンス自体は継続）。
+fn dump_to_report_file(label: &str, value: &impl serde::Serialize) -> Option<std::path::PathBuf> {
+    let dir = default_work_dir().join(".vdsl");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let filename = format!("{label}_{ts}.json");
+    let path = dir.join(&filename);
+    let json = serde_json::to_string_pretty(value).ok()?;
+    std::fs::write(&path, json).ok()?;
+    Some(path)
 }
 
 // =============================================================================

@@ -1,10 +1,12 @@
-//! Sync engine error types.
+//! Domain error — ドメイン不変条件違反のみ。
+//!
+//! インフラ（DB, FS, ネットワーク）の詳細を一切含まない。
+//! アプリケーション層の [`SyncError`](crate::application::error::SyncError) が
+//! `#[from]` でこのエラーを包含する。
 
-use std::path::PathBuf;
-
-/// Errors produced by the sync engine.
+/// ドメイン不変条件違反。
 #[derive(Debug, thiserror::Error)]
-pub enum SyncError {
+pub enum DomainError {
     #[error("invalid file type: {0}")]
     InvalidFileType(String),
 
@@ -17,43 +19,6 @@ pub enum SyncError {
     #[error("invalid state transition: {from} → {to}")]
     InvalidStateTransition { from: String, to: String },
 
-    #[error("file not found: {}", .0.display())]
-    FileNotFound(PathBuf),
-
-    #[error("path is outside sync root: {path}")]
-    OutsideSyncRoot { path: String },
-
-    #[error("duplicate file: {path} is a duplicate of {duplicate_of}")]
-    Duplicate { path: String, duplicate_of: String },
-
-    #[error("file not registered in sync store: {0}")]
-    NotRegistered(String),
-
-    #[error("backend not configured for location: {0}")]
-    NoBackend(String),
-
-    #[error("no route available: {src} → {dest}, path={path}")]
-    NoRouteAvailable {
-        src: String,
-        dest: String,
-        path: String,
-    },
-
-    #[error("transfer failed: {0}")]
-    TransferFailed(String),
-
-    #[error("store error: {0}")]
-    Store(String),
-
-    #[error("hash computation failed: {0}")]
-    Hash(String),
-
-    #[error("serialization error: {0}")]
-    Serialization(String),
-
     #[error("validation error: {field} — {reason}")]
     Validation { field: String, reason: String },
-
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
 }

@@ -12,7 +12,8 @@
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::domain::error::SyncError;
+use crate::application::error::SyncError;
+use crate::infra::error::InfraError;
 
 /// Result of hashing a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,16 +77,19 @@ impl ContentHasher for Djb2Hasher {
 /// Reads file in 8KB chunks for memory efficiency.
 /// Returns 16-char hex string (`%016x`).
 pub fn djb2_file_hash(path: &Path) -> Result<String, SyncError> {
-    let file =
-        std::fs::File::open(path).map_err(|e| SyncError::Hash(format!("open failed: {e}")))?;
+    let file = std::fs::File::open(path).map_err(|e| InfraError::Hash {
+        op: "djb2",
+        reason: format!("open failed: {e}"),
+    })?;
     let mut reader = BufReader::new(file);
 
     let mut h: u64 = 5381;
     let mut buf = [0u8; 8192];
     loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| SyncError::Hash(format!("read failed: {e}")))?;
+        let n = reader.read(&mut buf).map_err(|e| InfraError::Hash {
+            op: "djb2",
+            reason: format!("read failed: {e}"),
+        })?;
         if n == 0 {
             break;
         }
@@ -105,17 +109,24 @@ pub fn djb2_file_hash(path: &Path) -> Result<String, SyncError> {
 /// 2. Walk chunks, for IHDR and IDAT: feed chunk_type + chunk_data into DJB2
 /// 3. Return 16-char hex string (`%016x`)
 pub fn png_image_hash(path: &Path) -> Result<String, SyncError> {
-    let file =
-        std::fs::File::open(path).map_err(|e| SyncError::Hash(format!("open failed: {e}")))?;
+    let file = std::fs::File::open(path).map_err(|e| InfraError::Hash {
+        op: "png",
+        reason: format!("open failed: {e}"),
+    })?;
     let mut reader = BufReader::new(file);
 
     // Verify PNG signature
     let mut sig = [0u8; 8];
-    reader
-        .read_exact(&mut sig)
-        .map_err(|e| SyncError::Hash(format!("read sig failed: {e}")))?;
+    reader.read_exact(&mut sig).map_err(|e| InfraError::Hash {
+        op: "png",
+        reason: format!("read sig failed: {e}"),
+    })?;
     if sig != [137, 80, 78, 71, 13, 10, 26, 10] {
-        return Err(SyncError::Hash("not a valid PNG file".into()));
+        return Err(InfraError::Hash {
+            op: "png",
+            reason: "not a valid PNG file".into(),
+        }
+        .into());
     }
 
     let mut h: u64 = 5381;
@@ -126,16 +137,24 @@ pub fn png_image_hash(path: &Path) -> Result<String, SyncError> {
         match reader.read_exact(&mut header) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(SyncError::Hash(format!("read chunk header failed: {e}"))),
+            Err(e) => {
+                return Err(InfraError::Hash {
+                    op: "png",
+                    reason: format!("read chunk header failed: {e}"),
+                }
+                .into())
+            }
         }
         // u32 → u64: always lossless (max 4_294_967_295). Further bounded by MAX_CHUNK_LEN below.
         let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as u64;
         // Guard against malicious chunk lengths (PNG spec max is 2^31-1)
         const MAX_CHUNK_LEN: u64 = 0x7FFF_FFFF;
         if length > MAX_CHUNK_LEN {
-            return Err(SyncError::Hash(format!(
-                "chunk length exceeds PNG spec maximum: {length}"
-            )));
+            return Err(InfraError::Hash {
+                op: "png",
+                reason: format!("chunk length exceeds PNG spec maximum: {length}"),
+            }
+            .into());
         }
         let chunk_type = &header[4..8];
 
@@ -158,7 +177,10 @@ pub fn png_image_hash(path: &Path) -> Result<String, SyncError> {
                 let to_read = std::cmp::min(remaining, buf.len() as u64) as usize;
                 reader
                     .read_exact(&mut buf[..to_read])
-                    .map_err(|e| SyncError::Hash(format!("read data failed: {e}")))?;
+                    .map_err(|e| InfraError::Hash {
+                        op: "png",
+                        reason: format!("read data failed: {e}"),
+                    })?;
                 for &b in &buf[..to_read] {
                     h = h.wrapping_mul(33).wrapping_add(b as u64) % 0x100000000;
                 }
@@ -167,22 +189,31 @@ pub fn png_image_hash(path: &Path) -> Result<String, SyncError> {
             // Skip CRC (4 bytes)
             reader
                 .seek(SeekFrom::Current(4))
-                .map_err(|e| SyncError::Hash(format!("seek crc failed: {e}")))?;
+                .map_err(|e| InfraError::Hash {
+                    op: "png",
+                    reason: format!("seek crc failed: {e}"),
+                })?;
         } else {
             // Skip chunk data + CRC
-            let skip = i64::try_from(length)
-                .map_err(|_| SyncError::Hash(format!("chunk length overflow: {length}")))?
-                + 4;
+            let skip = i64::try_from(length).map_err(|_| InfraError::Hash {
+                op: "png",
+                reason: format!("chunk length overflow: {length}"),
+            })? + 4;
             reader
                 .seek(SeekFrom::Current(skip))
-                .map_err(|e| SyncError::Hash(format!("seek skip failed: {e}")))?;
+                .map_err(|e| InfraError::Hash {
+                    op: "png",
+                    reason: format!("seek skip failed: {e}"),
+                })?;
         }
     }
 
     if !reached_iend {
-        return Err(SyncError::Hash(
-            "truncated PNG: IEND chunk not found".into(),
-        ));
+        return Err(InfraError::Hash {
+            op: "png",
+            reason: "truncated PNG: IEND chunk not found".into(),
+        }
+        .into());
     }
 
     Ok(format!("{h:016x}"))

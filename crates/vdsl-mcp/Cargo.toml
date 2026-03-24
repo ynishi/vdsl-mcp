@@ -22,17 +22,21 @@ serde_json = { workspace = true }
 schemars = "1.2"
 thiserror = { workspace = true }
 anyhow = "1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "stream"] }
 urlencoding = "2"
 tempfile = { workspace = true }
 chrono = { workspace = true }
 rusqlite = { workspace = true, optional = true }
 uuid = { workspace = true }
+glob = { workspace = true }
 
 # Feature-gated: mlua in-process backend
 mlua = { version = "0.11", features = ["lua54", "vendored"], optional = true }
 mlua-batteries = { version = "0.2", features = ["fs", "json", "http"], optional = true }
-mlua-isle = { version = "0.3", features = ["tokio"], optional = true }
+mlua-isle = { version = "0.4", features = ["tokio"], optional = true }
 pngmeta = { version = "0.1.4", optional = true }
 pngmetagrep-core = { version = "0.1.4", optional = true }
 

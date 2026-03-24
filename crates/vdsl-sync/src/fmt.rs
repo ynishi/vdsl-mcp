@@ -76,6 +76,8 @@ mod tests {
             locations,
             total_entries: 5,
             total_errors: 0,
+            error_entries: Vec::new(),
+            pending_entries: Vec::new(),
         };
         let text = format_summary(&summary);
         assert!(text.contains("5 entries"));

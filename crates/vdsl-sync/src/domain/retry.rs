@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-use super::error::SyncError;
+use super::error::DomainError;
 
 /// 転送エラーの種別。
 ///
@@ -46,15 +46,16 @@ impl fmt::Display for TransferErrorKind {
 }
 
 impl std::str::FromStr for TransferErrorKind {
-    type Err = SyncError;
+    type Err = DomainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "transient" => Ok(Self::Transient),
             "permanent" => Ok(Self::Permanent),
-            other => Err(SyncError::InvalidTransferState(format!(
-                "unknown TransferErrorKind: {other}"
-            ))),
+            other => Err(DomainError::Validation {
+                field: "transfer_error_kind".into(),
+                reason: format!("unknown value: {other}"),
+            }),
         }
     }
 }

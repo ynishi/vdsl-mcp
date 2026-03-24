@@ -8,11 +8,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-use super::error::SyncError;
 use super::location::LocationId;
 use super::retry::RetryPolicy;
 use super::tracked_file::TrackedFile;
-use super::transfer::{Transfer, TransferState};
+use super::transfer::{Transfer, TransferKind, TransferState};
 
 /// 特定locationでのファイルの存在状態。
 ///
@@ -43,6 +42,20 @@ impl PresenceState {
         }
     }
 
+    /// Priority for conflict resolution when a location appears as both
+    /// src and dest for the same file. Higher value wins.
+    ///
+    /// Failed > Syncing > Pending > Present > Absent
+    pub fn priority(&self) -> u8 {
+        match self {
+            Self::Absent => 0,
+            Self::Present => 1,
+            Self::Pending => 2,
+            Self::Syncing => 3,
+            Self::Failed => 4,
+        }
+    }
+
     /// Transfer + RetryPolicy からPresenceStateを導出。
     ///
     /// - Queued → Pending
@@ -50,8 +63,10 @@ impl PresenceState {
     /// - Completed → Present
     /// - Failed + retryable → Pending（リトライ待ち）
     /// - Failed + exhausted → Failed（手動介入が必要）
+    /// - Cancelled → Absent（転送は中断済み。ファイルは到達していない）
     pub fn from_transfer(transfer: &Transfer, policy: &RetryPolicy) -> Self {
         match transfer.state() {
+            TransferState::Blocked => Self::Pending,
             TransferState::Queued => Self::Pending,
             TransferState::InFlight => Self::Syncing,
             TransferState::Completed => Self::Present,
@@ -62,6 +77,7 @@ impl PresenceState {
                     Self::Failed
                 }
             }
+            TransferState::Cancelled => Self::Absent,
         }
     }
 }
@@ -88,8 +104,7 @@ pub struct PresenceView {
 
 /// TrackedFile + 各locationのPresence情報を結合したビュー。
 ///
-/// `SyncService::get()` 等のクエリAPIが返す型。
-/// 旧SyncEntryの外部APIを代替する。
+/// `Store::get()` 等のクエリAPIが返す型。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileView {
     #[serde(flatten)]
@@ -109,8 +124,60 @@ impl FileView {
     }
 
     /// Serialize to [`serde_json::Value`] for cross-boundary transport.
-    pub fn to_value(&self) -> Result<serde_json::Value, SyncError> {
-        serde_json::to_value(self).map_err(|e| SyncError::Serialization(format!("FileView: {e}")))
+    pub fn to_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(self)
+    }
+}
+
+// =============================================================================
+// Status detail entries (Store::status() 用)
+// =============================================================================
+
+/// 失敗したTransferの表示情報。
+///
+/// Transfer本体を公開せず、Store利用者が必要な情報のみを提供する。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorEntry {
+    pub file_id: String,
+    pub src: LocationId,
+    pub dest: LocationId,
+    pub error: String,
+    pub attempts: u32,
+}
+
+impl ErrorEntry {
+    /// Transferから表示用ErrorEntryを構築する。
+    pub(crate) fn from_transfer(t: &Transfer) -> Self {
+        Self {
+            file_id: t.file_id().to_string(),
+            src: t.src().clone(),
+            dest: t.dest().clone(),
+            error: t.error().unwrap_or("unknown error").to_string(),
+            attempts: t.attempt(),
+        }
+    }
+}
+
+/// 待機中Transferの表示情報。
+///
+/// Transfer本体を公開せず、Store利用者が必要な情報のみを提供する。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingEntry {
+    pub file_id: String,
+    pub src: LocationId,
+    pub dest: LocationId,
+    pub kind: TransferKind,
+}
+
+impl PendingEntry {
+    /// Transferから表示用PendingEntryを構築する。
+    pub(crate) fn from_transfer(t: &Transfer) -> Self {
+        Self {
+            file_id: t.file_id().to_string(),
+            src: t.src().clone(),
+            dest: t.dest().clone(),
+            kind: t.kind(),
+        }
     }
 }
 
@@ -119,6 +186,7 @@ mod tests {
     use super::*;
     use crate::domain::file_type::FileType;
     use crate::domain::retry::TransferErrorKind;
+    use crate::domain::transfer::TransferKind;
 
     fn loc(s: &str) -> LocationId {
         LocationId::new(s).unwrap()
@@ -171,6 +239,7 @@ mod tests {
             "f-1".into(),
             loc("local"),
             loc("cloud"),
+            TransferKind::Sync,
             state,
             if state == TransferState::Failed {
                 Some("err".into())

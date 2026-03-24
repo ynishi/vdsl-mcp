@@ -19,6 +19,8 @@ chrono = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 secrecy = { workspace = true }
+glob = { workspace = true }
+walkdir = { workspace = true }
 
 # Default store
 rusqlite = { workspace = true, optional = true }

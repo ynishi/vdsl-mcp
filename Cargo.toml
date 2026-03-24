@@ -19,9 +19,13 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 async-trait = "0.1"
 tokio-rusqlite = { version = "0.7", features = ["bundled"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 futures = "0.3"
+glob = "0.3"
 tempfile = "3"
 secrecy = "0.10"
+walkdir = "2"
 
 # Internal
 vdsl-sync = { path = "crates/vdsl-sync" }

@@ -20,7 +20,7 @@
 //! | 4 | PNG | `pngmetagrep-core` + `pngmeta` | `runtime/png.lua` | `read_text(path), inject_text(path,chunks), inject_text_to(src,dst,chunks)` |
 //! | 5 | Registry | `std.http` + `std.json` | `runtime/registry.lua` | `fetch_object_info(url, headers) -> table` |
 //! | 6 | Emit | `std.fs` (via bridge) | `runtime/emit.lua` | `write(name, json_str) -> bool, write_recipe(name, recipe_json)` |
-//! | 7 | Sync | `vdsl-sync SyncService` | `runtime/sync.lua` | `status(), force(), force_route(src,dest), get(path), pending(dest)` |
+//! | 7 | Store | `vdsl-sync Store` | `runtime/store.lua` | `status(), sync(), sync_route(src,dest), get(path), pending(dest)` |
 //!
 //! # VM Initialization Sequence (`MluaRuntime::new`)
 //!
@@ -35,7 +35,10 @@
 //! 9. Registry bridge: `std.http` + `std.json` -> `runtime/registry.set_backend()`
 //! 10. Emit bridge: `std.fs` -> `runtime/emit.set_backend()`
 //! 11. `os.getenv` wrapper: `_injected_env` table takes priority, falls back to real `os.getenv`
-//! 12. Sync bridge: `SyncService` -> `runtime/sync.set_backend()` (optional, only when SyncService provided)
+//! 12. Sync bridge: `Store` -> `runtime/store.set_backend()` (optional, only when Store provided)
+//! 13. OS sandbox: disable `os.exit`, `os.execute`, `os.remove`, `os.rename`,
+//!     `io.popen`, `debug` table, and `package.loadlib` to prevent host process
+//!     termination, arbitrary command execution, and VM internals access.
 //!
 //! # Environment Variable Injection
 //!
@@ -56,12 +59,13 @@
 #[cfg(feature = "mlua-backend")]
 mod inner {
     use mlua::prelude::*;
-    use mlua_isle::{AsyncIsle, AsyncIsleDriver, IsleError};
+    use mlua_isle::{AsyncIsle, AsyncIsleDriver};
     use rmcp::ErrorData as McpError;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
-    use vdsl_sync::SyncService;
+    use crate::infra::sync_tasks::SyncTaskManager;
+    use vdsl_sync::SyncStoreSdk;
 
     /// rusqlite Connection wrapped for mlua UserData.
     ///
@@ -264,24 +268,21 @@ mod inner {
         /// - mlua-batteries `std.fs` + `std.json`
         /// - `package.path` set for VDSL module resolution
         /// - DI bridges #1-#10 (see module doc)
-        /// - DI bridge #12: `SyncService` → `runtime/sync.set_backend()` (when provided)
+        /// - DI bridge #12: `Store` → `runtime/store.set_backend()` (when provided)
         ///
         /// # Parameters
         ///
-        /// - `sync_service`: Optional `Arc<SyncService>` for sync store bridge.
-        ///   When `None`, `runtime/sync` uses its default (error) backend.
+        /// - `store`: Optional `Arc<Store>` for sync store bridge.
+        ///   When `None`, `runtime/store` uses its default (error) backend.
+        /// - `task_mgr`: Optional `Arc<SyncTaskManager>` for background task management.
+        ///   When `None` (or `store` is `None`), sync/poll functions are not available.
         pub async fn new(
             work_dir: &Path,
-            sync_service: Option<Arc<SyncService>>,
+            sdk: Option<Arc<dyn vdsl_sync::SyncStoreSdk>>,
+            task_mgr: Option<Arc<SyncTaskManager>>,
         ) -> Result<Self, McpError> {
             let work_dir = Arc::new(work_dir.to_path_buf());
             let wd = Arc::clone(&work_dir);
-
-            // Capture tokio Handle before AsyncIsle::spawn (the Isle thread
-            // is a plain std::thread with no tokio context). The handle is
-            // needed for sync bridge functions that call async SyncService
-            // methods via block_on() from the non-tokio Isle thread.
-            let tokio_handle = tokio::runtime::Handle::try_current().ok();
 
             let (isle, driver) = AsyncIsle::spawn(move |lua| {
                 // 1. Register mlua-batteries (std.fs, std.json)
@@ -302,6 +303,19 @@ mod inner {
                 //
                 //    We build an adapter table that maps VDSL's API names
                 //    to mlua-batteries' std.fs functions.
+                //
+                //    sleep is a create_async_function so the Lua coroutine
+                //    yields for the duration, allowing tokio::spawn'd tasks
+                //    (e.g. SyncTaskManager background sync) to make progress
+                //    on the current_thread runtime.
+                let async_sleep = lua.create_async_function(|_lua, seconds: f64| async move {
+                    if seconds > 0.0 {
+                        tokio::time::sleep(std::time::Duration::from_secs_f64(seconds)).await;
+                    }
+                    Ok(())
+                })?;
+                lua.globals().set("_async_sleep", async_sleep)?;
+
                 let bridge_code = r#"
                     local ok, fs_mod = pcall(require, "vdsl.runtime.fs")
                     if ok and fs_mod and fs_mod.set_backend then
@@ -334,10 +348,7 @@ mod inner {
                                 local glob_pattern = dir .. "/" .. (pattern or "*")
                                 return rust_fs.glob(glob_pattern)
                             end,
-                            sleep      = function(seconds)
-                                -- No-op or use os.execute for sleep
-                                -- mlua-batteries doesn't provide sleep
-                            end,
+                            sleep      = _async_sleep,
                         }
                         fs_mod.set_backend(backend)
                     end
@@ -645,151 +656,215 @@ mod inner {
                 "#;
                 lua.load(getenv_wrapper).exec()?;
 
-                // 12. Sync bridge: SyncService → runtime/sync.set_backend()
-                //     Each Lua function captures Arc<SyncService> and uses
-                //     tokio Handle::block_on() to call async methods from
-                //     the dedicated Isle thread (non-tokio thread).
+                // 12. Store bridge: Store → runtime/store.set_backend()
+                //     Each Lua function captures Arc<Store> and is registered
+                //     via create_async_function so that calls yield in
+                //     coroutine_eval (mlua-isle v0.4+). No block_on needed.
                 //
                 //     Serialization uses vdsl-sync's to_value() → json_value_to_lua()
                 //     so field changes in vdsl-sync don't require MCP-side updates.
-                if let Some(svc) = sync_service {
-                    let rt_handle = match tokio_handle.clone() {
-                        Some(h) => h,
-                        None => {
-                            eprintln!("[WARN] sync: SyncService available but no tokio runtime — sync bridge disabled");
-                            // Skip sync bridge registration entirely; Lua will use MOCK fallback
-                            return Ok(());
-                        }
-                    };
+                //
+                //     # API design: force is MCP-only
+                //
+                //     Lua exposes `sync()` / `sync_route()` for normal workflow.
+                //     `force()` (maintenance, full rescan regardless of state) is
+                //     available only via MCP tools — not in Lua — because it is an
+                //     operator-level maintenance action, not a script-level concern.
+                if let Some(db) = sdk {
+                    let store_table = lua.create_table()?;
 
-                    let sync_table = lua.create_table()?;
+                    // task_mgr: use provided or create a local one for this runtime
+                    let task_mgr = task_mgr.unwrap_or_else(|| Arc::new(SyncTaskManager::new()));
 
                     // status() -> table
                     {
-                        let svc = Arc::clone(&svc);
-                        let handle = rt_handle.clone();
-                        sync_table.set(
+                        let db = Arc::clone(&db);
+                        store_table.set(
                             "status",
-                            lua.create_function(move |lua, ()| {
-                                let summary = handle
-                                    .block_on(svc.status())
-                                    .map_err(|e| LuaError::external(e.to_string()))?;
-                                let val = summary.to_value()
-                                    .map_err(|e| LuaError::external(e.to_string()))?;
-                                json_value_to_lua(lua, &val)
+                            lua.create_async_function(move |lua, ()| {
+                                let db = Arc::clone(&db);
+                                async move {
+                                    let summary = db.status().await
+                                        .map_err(|e| LuaError::external(e.to_string()))?;
+                                    let val = serde_json::to_value(&summary)
+                                        .map_err(|e| LuaError::external(e.to_string()))?;
+                                    json_value_to_lua(&lua, &val)
+                                }
                             })?,
                         )?;
                     }
 
-                    // force() -> table
-                    // Processes all pending entries in topology order (cloud before pod).
+                    // sync() -> string (task_id)
+                    // Non-blocking full sync: spawns background task, returns task_id.
+                    // Use poll(task_id) to check completion.
                     {
-                        let svc = Arc::clone(&svc);
-                        let handle = rt_handle.clone();
-                        sync_table.set(
-                            "force",
-                            lua.create_function(move |lua, ()| {
-                                let batch = handle
-                                    .block_on(svc.force())
-                                    .map_err(|e| LuaError::external(e.to_string()))?;
-                                let val = batch.to_value()
-                                    .map_err(|e| LuaError::external(e.to_string()))?;
-                                json_value_to_lua(lua, &val)
+                        let db = Arc::clone(&db);
+                        let mgr = Arc::clone(&task_mgr);
+                        store_table.set(
+                            "sync",
+                            lua.create_async_function(move |lua, ()| {
+                                let db = Arc::clone(&db);
+                                let mgr = Arc::clone(&mgr);
+                                async move {
+                                    let task_id = mgr.spawn_sync(&db).await;
+                                    Ok(LuaValue::String(
+                                        lua.create_string(task_id.as_str())?,
+                                    ))
+                                }
                             })?,
                         )?;
                     }
 
-                    // force_route(src, dest) -> table
-                    // Explicit source→destination transfer for debugging/maintenance.
+                    // sync_route(src, dest) -> string (task_id)
+                    // Non-blocking single-route sync: spawns background task, returns task_id.
+                    // Use poll(task_id) to check completion.
                     {
-                        let svc = Arc::clone(&svc);
-                        let handle = rt_handle.clone();
-                        sync_table.set(
-                            "force_route",
-                            lua.create_function(
+                        let db = Arc::clone(&db);
+                        let mgr = Arc::clone(&task_mgr);
+                        store_table.set(
+                            "sync_route",
+                            lua.create_async_function(
                                 move |lua, (src, dest): (String, String)| {
-                                    let src_id =
-                                        vdsl_sync::LocationId::new(src).map_err(|e| {
-                                            LuaError::external(e.to_string())
-                                        })?;
-                                    let dest_id =
-                                        vdsl_sync::LocationId::new(dest).map_err(|e| {
-                                            LuaError::external(e.to_string())
-                                        })?;
-                                    let batch = handle
-                                        .block_on(svc.force_route(&src_id, &dest_id))
-                                        .map_err(|e| LuaError::external(e.to_string()))?;
-                                    let val = batch.to_value()
-                                        .map_err(|e| LuaError::external(e.to_string()))?;
-                                    json_value_to_lua(lua, &val)
+                                    let db = Arc::clone(&db);
+                                    let mgr = Arc::clone(&mgr);
+                                    async move {
+                                        let src_id =
+                                            vdsl_sync::LocationId::new(src).map_err(|e| {
+                                                LuaError::external(e.to_string())
+                                            })?;
+                                        let dest_id =
+                                            vdsl_sync::LocationId::new(dest).map_err(|e| {
+                                                LuaError::external(e.to_string())
+                                            })?;
+                                        let task_id =
+                                            mgr.spawn_sync_route(&db, src_id, dest_id).await;
+                                        Ok(LuaValue::String(
+                                            lua.create_string(task_id.as_str())?,
+                                        ))
+                                    }
                                 },
                             )?,
                         )?;
                     }
 
-                    // get(absolute_path) -> table | nil
-                    // Bridge converts absolute path → relative path via
-                    // SyncService::to_relative().
+                    // poll(task_id) -> table | nil
+                    // Poll a background task status. Returns {status="pending"|"running"|"completed"|"failed", result=...}
                     {
-                        let svc = Arc::clone(&svc);
-                        let handle = rt_handle.clone();
-                        sync_table.set(
-                            "get",
-                            lua.create_function(move |lua, path: String| {
-                                let relative = svc
-                                    .to_relative(std::path::Path::new(&path))
-                                    .map_err(|e| LuaError::external(e.to_string()))?;
-                                let entry = handle
-                                    .block_on(svc.get(&relative))
-                                    .map_err(|e| LuaError::external(e.to_string()))?;
-                                match entry {
-                                    Some(e) => {
-                                        let val = e.to_value()
-                                            .map_err(|e| LuaError::external(e.to_string()))?;
-                                        json_value_to_lua(lua, &val)
+                        let mgr = Arc::clone(&task_mgr);
+                        store_table.set(
+                            "poll",
+                            lua.create_async_function(move |lua, task_id_str: String| {
+                                let mgr = Arc::clone(&mgr);
+                                async move {
+                                    let task_id = vdsl_sync::TaskId::parse(&task_id_str);
+                                    let status = mgr.poll(&task_id).await;
+                                    match status {
+                                        None => Ok(LuaValue::Nil),
+                                        Some(s) => {
+                                            let val = serde_json::to_value(&s)
+                                                .map_err(|e| LuaError::external(e.to_string()))?;
+                                            json_value_to_lua(&lua, &val)
+                                        }
                                     }
-                                    None => Ok(LuaValue::Nil),
+                                }
+                            })?,
+                        )?;
+                    }
+
+                    // get(path) -> table | nil
+                    // Store::get() accepts both absolute and relative paths.
+                    {
+                        let db = Arc::clone(&db);
+                        store_table.set(
+                            "get",
+                            lua.create_async_function(move |lua, path: String| {
+                                let db = Arc::clone(&db);
+                                async move {
+                                    let entry = db.get(&path).await
+                                        .map_err(|e| LuaError::external(e.to_string()))?;
+                                    match entry {
+                                        Some(e) => {
+                                            let val = serde_json::to_value(&e)
+                                                .map_err(|e| LuaError::external(e.to_string()))?;
+                                            json_value_to_lua(&lua, &val)
+                                        }
+                                        None => Ok(LuaValue::Nil),
+                                    }
                                 }
                             })?,
                         )?;
                     }
 
                     // pending(dest) -> { entry, ... }
+                    // SDK.pending(dest) returns filtered entries directly.
                     {
-                        let svc = Arc::clone(&svc);
-                        let handle = rt_handle.clone();
-                        sync_table.set(
+                        let db = Arc::clone(&db);
+                        store_table.set(
                             "pending",
-                            lua.create_function(move |lua, dest: String| {
-                                let dest_id =
-                                    vdsl_sync::LocationId::new(dest).map_err(|e| {
-                                        LuaError::external(e.to_string())
-                                    })?;
-                                let entries = handle
-                                    .block_on(svc.pending(&dest_id))
-                                    .map_err(|e| LuaError::external(e.to_string()))?;
-                                let arr: Vec<serde_json::Value> = entries
-                                    .iter()
-                                    .map(|e| e.to_value())
-                                    .collect::<Result<Vec<_>, _>>()
-                                    .map_err(|e| LuaError::external(e.to_string()))?;
-                                json_value_to_lua(lua, &serde_json::Value::Array(arr))
+                            lua.create_async_function(move |lua, dest: String| {
+                                let db = Arc::clone(&db);
+                                async move {
+                                    let dest_id =
+                                        vdsl_sync::LocationId::new(dest).map_err(|e| {
+                                            LuaError::external(e.to_string())
+                                        })?;
+                                    let entries = db.pending(&dest_id).await
+                                        .map_err(|e| LuaError::external(e.to_string()))?;
+                                    let arr: Vec<serde_json::Value> = entries
+                                        .iter()
+                                        .map(serde_json::to_value)
+                                        .collect::<Result<Vec<_>, _>>()
+                                        .map_err(|e| LuaError::external(e.to_string()))?;
+                                    json_value_to_lua(&lua, &serde_json::Value::Array(arr))
+                                }
                             })?,
                         )?;
                     }
 
                     // Inject via set_backend().
-                    // _sync_bridge remains in globals so Lua code can
-                    // restore it after DI tests (set_backend(nil) → set_backend(_sync_bridge)).
-                    let sync_bridge_code = r#"
-                        local ok, sync_mod = pcall(require, "vdsl.runtime.sync")
-                        if ok and sync_mod and sync_mod.set_backend then
-                            sync_mod.set_backend(_sync_bridge)
+                    // _store_bridge remains in globals so Lua code can
+                    // restore it after DI tests (set_backend(nil) → set_backend(_store_bridge)).
+                    let store_bridge_code = r#"
+                        local ok, store_mod = pcall(require, "vdsl.runtime.store")
+                        if ok and store_mod and store_mod.set_backend then
+                            store_mod.set_backend(_store_bridge)
                         end
                     "#;
-                    lua.globals().set("_sync_bridge", sync_table)?;
-                    lua.load(sync_bridge_code).exec()?;
+                    lua.globals().set("_store_bridge", store_table)?;
+                    lua.load(store_bridge_code).exec()?;
                 }
+
+                // 13. OS sandbox: neutralise dangerous standard library functions.
+                //     mlua-isle hosts Lua in-process — os.exit() would kill the
+                //     MCP server, os.execute()/io.popen() allow arbitrary shell
+                //     commands, and debug.* exposes VM internals.
+                //     File operations (os.remove/rename) are blocked because the
+                //     FS bridge (bridge #1) is the only sanctioned file-mutation path.
+                let sandbox_code = r#"
+                    local function _disabled(name)
+                        return function()
+                            error("[sandbox] " .. name .. " is disabled in mlua backend", 2)
+                        end
+                    end
+
+                    -- Host-process termination
+                    os.exit    = _disabled("os.exit")
+
+                    -- Arbitrary shell command execution
+                    os.execute = _disabled("os.execute")
+                    io.popen   = _disabled("io.popen")
+
+                    -- File mutation outside FS bridge
+                    os.remove  = _disabled("os.remove")
+                    os.rename  = _disabled("os.rename")
+
+                    -- VM internals access
+                    debug = nil
+
+                    -- C shared library loading
+                    package.loadlib = _disabled("package.loadlib")
+                "#;
+                lua.load(sandbox_code).exec()?;
 
                 Ok(())
             })
@@ -805,83 +880,70 @@ mod inner {
 
         /// Execute Lua code and capture stdout/stderr via `print()` override.
         ///
-        /// The code is run inside the existing VM with stdout/stderr captured
-        /// by temporarily overriding `print` and `io.stderr:write`.
+        /// Uses `coroutine_eval` (mlua-isle v0.4+) so that Lua code calling
+        /// async Rust functions (e.g. sync bridge) can yield instead of
+        /// blocking the Lua thread.
         pub async fn exec_code(&self, code: &str) -> Result<MluaExecResult, McpError> {
-            let code = code.to_string();
+            // Wrap execution with stdout/stderr capture.
+            // The wrapper uses pcall so Lua errors become stderr + exit_code=1
+            // rather than propagating as IsleError.
+            let wrapper = format!(
+                r#"
+                local _stdout_buf = {{}}
+                local _stderr_buf = {{}}
+                local _orig_print = print
+                local _orig_io_write = io.write
 
-            let json_str = self
-                .isle
-                .exec(move |lua| {
-                    // Wrap execution with stdout/stderr capture
-                    let wrapper = format!(
-                        r#"
-                        local _stdout_buf = {{}}
-                        local _stderr_buf = {{}}
-                        local _orig_print = print
-                        local _orig_io_write = io.write
+                print = function(...)
+                    local args = {{...}}
+                    local parts = {{}}
+                    for i, v in ipairs(args) do
+                        parts[i] = tostring(v)
+                    end
+                    _stdout_buf[#_stdout_buf + 1] = table.concat(parts, "\t") .. "\n"
+                end
 
-                        print = function(...)
-                            local args = {{...}}
-                            local parts = {{}}
-                            for i, v in ipairs(args) do
-                                parts[i] = tostring(v)
-                            end
-                            _stdout_buf[#_stdout_buf + 1] = table.concat(parts, "\t") .. "\n"
-                        end
+                io.write = function(...)
+                    local args = {{...}}
+                    for _, v in ipairs(args) do
+                        _stdout_buf[#_stdout_buf + 1] = tostring(v)
+                    end
+                end
 
-                        io.write = function(...)
-                            local args = {{...}}
-                            for _, v in ipairs(args) do
-                                _stdout_buf[#_stdout_buf + 1] = tostring(v)
-                            end
-                        end
+                local _ok, _err = pcall(function()
+                    {code}
+                end)
 
-                        local _ok, _err = pcall(function()
-                            {code}
-                        end)
+                print = _orig_print
+                io.write = _orig_io_write
 
-                        print = _orig_print
-                        io.write = _orig_io_write
+                local _stdout = table.concat(_stdout_buf)
+                local _stderr = ""
+                local _exit = 0
+                if not _ok then
+                    _stderr = tostring(_err)
+                    _exit = 1
+                end
 
-                        local _stdout = table.concat(_stdout_buf)
-                        local _stderr = ""
-                        local _exit = 0
-                        if not _ok then
-                            _stderr = tostring(_err)
-                            _exit = 1
-                        end
+                return _exit .. "\n" .. _stdout .. "\0" .. _stderr
+                "#,
+                code = code
+            );
 
-                        return _exit .. "\n" .. _stdout .. "\0" .. _stderr
-                    "#,
-                        code = code
-                    );
+            let raw =
+                self.isle.coroutine_eval(&wrapper).await.map_err(|e| {
+                    McpError::internal_error(format!("mlua exec failed: {e}"), None)
+                })?;
 
-                    let raw: String = lua
-                        .load(&wrapper)
-                        .eval()
-                        .map_err(|e| IsleError::Lua(e.to_string()))?;
+            // Parse: "<exit_code>\n<stdout>\0<stderr>"
+            let (exit_str, rest) = raw.split_once('\n').unwrap_or(("1", &raw));
+            let exit_code: i32 = exit_str.parse().unwrap_or(1);
+            let (stdout, stderr) = rest.split_once('\0').unwrap_or((rest, ""));
 
-                    // Parse: "<exit_code>\n<stdout>\0<stderr>"
-                    let (exit_str, rest) = raw.split_once('\n').unwrap_or(("1", &raw));
-                    let exit_code: i32 = exit_str.parse().unwrap_or(1);
-                    let (stdout, stderr) = rest.split_once('\0').unwrap_or((rest, ""));
-
-                    Ok(serde_json::json!({
-                        "exit_code": exit_code,
-                        "stdout": stdout,
-                        "stderr": stderr,
-                    })
-                    .to_string())
-                })
-                .await
-                .map_err(|e| McpError::internal_error(format!("mlua exec failed: {e}"), None))?;
-
-            let v: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_default();
             Ok(MluaExecResult {
-                exit_code: v["exit_code"].as_i64().unwrap_or(1) as i32,
-                stdout: v["stdout"].as_str().unwrap_or("").to_string(),
-                stderr: v["stderr"].as_str().unwrap_or("").to_string(),
+                exit_code,
+                stdout: stdout.to_string(),
+                stderr: stderr.to_string(),
             })
         }
 

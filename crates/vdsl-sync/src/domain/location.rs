@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
-use super::error::SyncError;
+use super::error::DomainError;
+use super::view::{ErrorEntry, PendingEntry};
 
 // =============================================================================
 // LocationId
@@ -36,17 +37,17 @@ impl LocationId {
     pub const LOCAL: &str = "local";
 
     /// Create a new LocationId. Empty strings are rejected.
-    pub fn new(id: impl Into<String>) -> Result<Self, SyncError> {
+    pub fn new(id: impl Into<String>) -> Result<Self, DomainError> {
         let id = id.into();
         if id.is_empty() {
-            return Err(SyncError::InvalidLocation("empty location id".into()));
+            return Err(DomainError::InvalidLocation("empty location id".into()));
         }
         // Enforce lowercase alphanumeric + hyphens for consistency
         if !id
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
         {
-            return Err(SyncError::InvalidLocation(format!(
+            return Err(DomainError::InvalidLocation(format!(
                 "location id must be lowercase alphanumeric with hyphens/underscores: {id}"
             )));
         }
@@ -75,7 +76,7 @@ impl fmt::Display for LocationId {
 }
 
 impl std::str::FromStr for LocationId {
-    type Err = SyncError;
+    type Err = DomainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::new(s)
@@ -112,13 +113,16 @@ pub struct SyncSummary {
     pub locations: HashMap<LocationId, LocationSummary>,
     pub total_entries: usize,
     pub total_errors: usize,
+    /// 失敗したTransferの詳細（Transfer本体は非公開）。
+    pub error_entries: Vec<ErrorEntry>,
+    /// 待機中Transferの詳細（Transfer本体は非公開）。
+    pub pending_entries: Vec<PendingEntry>,
 }
 
 impl SyncSummary {
     /// Serialize to [`serde_json::Value`] for cross-boundary transport.
-    pub fn to_value(&self) -> Result<serde_json::Value, SyncError> {
+    pub fn to_value(&self) -> Result<serde_json::Value, serde_json::Error> {
         serde_json::to_value(self)
-            .map_err(|e| SyncError::Serialization(format!("SyncSummary: {e}")))
     }
 }
 

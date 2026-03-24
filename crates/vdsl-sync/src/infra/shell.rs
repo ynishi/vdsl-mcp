@@ -10,7 +10,8 @@
 
 use async_trait::async_trait;
 
-use crate::domain::error::SyncError;
+use crate::application::error::SyncError;
+use crate::infra::error::InfraError;
 
 /// Output from a shell command execution.
 #[derive(Debug, Clone)]
@@ -19,6 +20,17 @@ pub struct ShellOutput {
     pub stderr: String,
     pub success: bool,
     pub exit_code: Option<i32>,
+}
+
+/// Per-file inspection result from batch_inspect.
+#[derive(Debug, Clone)]
+pub struct FileInspection {
+    /// Relative path (same key as input).
+    pub relative_path: String,
+    /// SHA-256 hex hash of the file content.
+    pub sha256: String,
+    /// File size in bytes.
+    pub size: u64,
 }
 
 /// Abstract shell for executing commands on a location's host.
@@ -32,6 +44,86 @@ pub trait RemoteShell: Send + Sync {
         args: &[&str],
         timeout_secs: Option<u64>,
     ) -> Result<ShellOutput, SyncError>;
+
+    /// Execute a shell script on this host.
+    ///
+    /// Default: `exec(&["sh", "-c", script])`.
+    /// Remote shells may override to use file-based transfer (SCP)
+    /// to avoid shell escaping issues with SSH.
+    async fn exec_script(
+        &self,
+        script: &str,
+        timeout_secs: Option<u64>,
+    ) -> Result<ShellOutput, SyncError> {
+        self.exec(&["sh", "-c", script], timeout_secs).await
+    }
+
+    /// Batch inspect files: get sha256 + size for ALL paths in one exec call.
+    ///
+    /// Constructs a single shell script that processes every file in the list
+    /// and outputs `<sha256> <size> <relative_path>` per line. Parsed on return.
+    ///
+    /// Timeout scales with file count: base 30s + 2s per file.
+    async fn batch_inspect(
+        &self,
+        root: &str,
+        relative_paths: &[String],
+    ) -> Result<Vec<FileInspection>, SyncError> {
+        if relative_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build heredoc file list embedded in a single sh -c script.
+        // Each file is read line-by-line, sha256sum + stat in one pass.
+        let mut script = format!(
+            "cd '{}' && while IFS= read -r f; do \
+             h=$(sha256sum \"$f\" 2>/dev/null | cut -d' ' -f1); \
+             s=$(stat --format=%s \"$f\" 2>/dev/null || echo 0); \
+             [ -n \"$h\" ] && printf '%s %s %s\\n' \"$h\" \"$s\" \"$f\"; \
+             done <<'__VDSL_FILELIST__'\n",
+            root
+        );
+        for rel in relative_paths {
+            script.push_str(rel);
+            script.push('\n');
+        }
+        script.push_str("__VDSL_FILELIST__");
+
+        let timeout = 30 + (relative_paths.len() as u64 * 2);
+        let output = self.exec(&["sh", "-c", &script], Some(timeout)).await?;
+
+        if !output.success {
+            return Err(InfraError::Transfer {
+                reason: format!("batch_inspect failed: {}", output.stderr.trim()),
+            }
+            .into());
+        }
+
+        let mut results = Vec::with_capacity(relative_paths.len());
+        for line in output.stdout.lines() {
+            // Format: <sha256_hex> <size> <relative_path>
+            let mut parts = line.splitn(3, ' ');
+            let sha256 = match parts.next() {
+                Some(h) if h.len() == 64 => h.to_string(),
+                _ => continue,
+            };
+            let size = parts
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let relative_path = match parts.next() {
+                Some(p) if !p.is_empty() => p.to_string(),
+                _ => continue,
+            };
+            results.push(FileInspection {
+                relative_path,
+                sha256,
+                size,
+            });
+        }
+
+        Ok(results)
+    }
 }
 
 /// Execute commands on the local machine via `tokio::process::Command`.
@@ -47,7 +139,10 @@ impl RemoteShell for LocalShell {
         timeout_secs: Option<u64>,
     ) -> Result<ShellOutput, SyncError> {
         if args.is_empty() {
-            return Err(SyncError::TransferFailed("empty command".into()));
+            return Err(InfraError::Transfer {
+                reason: "empty command".into(),
+            }
+            .into());
         }
 
         let mut cmd = tokio::process::Command::new(args[0]);
@@ -60,14 +155,22 @@ impl RemoteShell for LocalShell {
 
         let output = tokio::time::timeout(timeout, cmd.output())
             .await
-            .map_err(|_| {
-                SyncError::TransferFailed(format!(
-                    "command timed out after {}s: {}",
-                    timeout.as_secs(),
-                    args.join(" ")
-                ))
+            .map_err(|_| -> SyncError {
+                InfraError::Transfer {
+                    reason: format!(
+                        "command timed out after {}s: {}",
+                        timeout.as_secs(),
+                        args.join(" ")
+                    ),
+                }
+                .into()
             })?
-            .map_err(|e| SyncError::TransferFailed(format!("exec failed ({}): {e}", args[0])))?;
+            .map_err(|e| -> SyncError {
+                InfraError::Transfer {
+                    reason: format!("exec failed ({}): {e}", args[0]),
+                }
+                .into()
+            })?;
 
         Ok(ShellOutput {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),

@@ -224,6 +224,43 @@ impl RunPodCli {
         self.exec(&args).await
     }
 
+    /// Start a background task by uploading a script file to the pod.
+    ///
+    /// Wraps `runpod-cli task run --script <tmpfile> -i <key> <pod_id>`.
+    /// The script content is written to a local temp file, SCP'd to the pod,
+    /// and executed via `sh`. Avoids shell escaping issues with complex scripts.
+    pub async fn task_run_script(
+        &self,
+        pod_id: &str,
+        script_content: &str,
+        ssh_key: &str,
+    ) -> Result<serde_json::Value, DomainError> {
+        // Write script to a temp file
+        let tmp_dir = std::env::temp_dir();
+        let script_path = tmp_dir.join(format!("vdsl-task-{}.sh", std::process::id()));
+        tokio::fs::write(&script_path, script_content)
+            .await
+            .map_err(|e| DomainError::CliExecution(format!("failed to write temp script: {e}")))?;
+
+        let script_path_str = script_path.to_string_lossy().to_string();
+        let result = self
+            .exec(&[
+                "task",
+                "run",
+                "--script",
+                &script_path_str,
+                "-i",
+                ssh_key,
+                pod_id,
+            ])
+            .await;
+
+        // Cleanup temp file (best effort)
+        let _ = tokio::fs::remove_file(&script_path).await;
+
+        result
+    }
+
     /// Check task status.
     ///
     /// Wraps `runpod-cli task status -i <key> <pod_id> <job_id>`.
@@ -268,6 +305,54 @@ impl RunPodCli {
         self.exec(&args).await
     }
 
+    /// Get SSH connection info for a running pod.
+    ///
+    /// Fetches the pod's public IP and mapped SSH port from the RunPod API.
+    /// Returns `None` if the pod is not running or SSH port mapping is unavailable.
+    pub async fn pod_ssh_info(&self, pod_id: &str) -> Result<Option<PodSshInfo>, DomainError> {
+        let pods = self.list_pods().await?;
+        let pod = pods.iter().find(|p| p["id"].as_str() == Some(pod_id));
+        let pod = match pod {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        // Pod must be RUNNING
+        let status = pod["desiredStatus"].as_str().unwrap_or("");
+        if status != "RUNNING" {
+            return Ok(None);
+        }
+
+        // RunPod API structure:
+        //   publicIp: "1.2.3.4"           (top-level)
+        //   portMappings: {"22": 37040}   (container_port → public_port)
+        let ip = pod["publicIp"].as_str().unwrap_or("").to_string();
+        if ip.is_empty() {
+            return Ok(None);
+        }
+
+        // portMappings is {"22": <public_port>} where key is container port as string
+        let ssh_port = pod["portMappings"]["22"]
+            .as_u64()
+            .or_else(|| {
+                // Fallback: portMappings might use integer key in some API versions
+                pod["portMappings"]
+                    .as_object()
+                    .and_then(|m| m.get("22"))
+                    .and_then(|v| v.as_u64())
+            })
+            .unwrap_or(0) as u16;
+
+        if ssh_port == 0 {
+            return Ok(None);
+        }
+
+        Ok(Some(PodSshInfo {
+            host: ip,
+            port: ssh_port,
+        }))
+    }
+
     /// List network volumes.
     ///
     /// Equivalent to Lua `M.volumes(opts)` in runpod.lua L626-633.
@@ -279,6 +364,27 @@ impl RunPodCli {
             serde_json::Value::Array(vols) => Ok(vols),
             other => Ok(vec![other]),
         }
+    }
+}
+
+/// SSH connection info for a running pod.
+#[derive(Debug, Clone)]
+pub struct PodSshInfo {
+    /// Public IP address of the pod's host machine.
+    pub host: String,
+    /// Public SSH port (mapped from container port 22).
+    pub port: u16,
+}
+
+impl PodSshInfo {
+    /// Build an rclone SFTP remote string for this pod.
+    ///
+    /// Example: `:sftp,host=1.2.3.4,port=12345,user=root,key_file=/path/to/key:`
+    pub fn to_rclone_sftp_remote(&self, ssh_key: &str) -> String {
+        format!(
+            ":sftp,host={},port={},user=root,key_file={}:",
+            self.host, self.port, ssh_key,
+        )
     }
 }
 

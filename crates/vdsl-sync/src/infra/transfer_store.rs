@@ -6,9 +6,20 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use crate::domain::error::SyncError;
+use crate::application::error::SyncError;
 use crate::domain::location::LocationId;
-use crate::domain::transfer::Transfer;
+use crate::domain::transfer::{Transfer, TransferState};
+
+/// DB集約クエリの1行。dest×state別のファイル数カウント。
+#[derive(Debug, Clone)]
+pub struct TransferStatRow {
+    pub src: LocationId,
+    pub dest: LocationId,
+    pub state: TransferState,
+    pub error_kind: Option<String>,
+    pub attempt: u32,
+    pub file_count: usize,
+}
 
 /// Transfer永続化。
 ///
@@ -39,4 +50,59 @@ pub trait TransferStore: Send + Sync {
     ///
     /// 履歴肥大化防止用。各file_id×destの最新は保持される。
     async fn prune_completed(&self, before: DateTime<Utc>) -> Result<usize, SyncError>;
+
+    /// Queued状態のTransfer件数を返す。進捗表示用。
+    async fn count_queued(&self) -> Result<usize, SyncError>;
+
+    /// InFlight状態のTransferをCancelledに遷移。
+    ///
+    /// プロセス再起動時にInFlightのまま残った孤児transferを終端状態にする。
+    /// Cancelledは終端状態 — 再実行されない。必要であれば新しいTransferを作成する。
+    /// 返り値はキャンセルした件数。
+    async fn cancel_orphaned_inflight(&self) -> Result<usize, SyncError>;
+
+    /// 指定Transfer IDに依存するBlocked TransferをQueuedに遷移させる。
+    ///
+    /// Transfer完了時に呼び出し、依存チェーンの次ホップを実行可能にする。
+    /// 返り値はunblockした件数。
+    async fn unblock_dependents(&self, completed_transfer_id: &str) -> Result<usize, SyncError>;
+
+    /// 全destのQueued/Blocked Transfer一覧（最新のみ）。
+    ///
+    /// `status()` のpending_entries構築用。dest指定なしで全pendingを返す。
+    async fn all_pending_transfers(&self) -> Result<Vec<Transfer>, SyncError>;
+
+    /// Transfer状態の集約統計。
+    ///
+    /// 最新Transfer（file_id×dest別）をsrc, dest, state, error_kind, attemptでGROUP BYし、
+    /// ファイル数カウントを返す。`status()`のN+1クエリ問題を解消するための集約メソッド。
+    async fn transfer_stats(&self) -> Result<Vec<TransferStatRow>, SyncError>;
+
+    /// Location別のPresent file数。
+    ///
+    /// 各locationについて、srcとして送出した or completedとして到達したdistinct file数を返す。
+    /// UNIONでsrc/completed-destを統合し、同一location×file_idの重複を排除する。
+    async fn present_counts_by_location(
+        &self,
+    ) -> Result<std::collections::HashMap<LocationId, usize>, SyncError>;
+
+    /// 全TrackedFileの全destinationについてQueued Transferを作成。
+    ///
+    /// `force_full_rewrite` 用。既にCompletedが存在するfile×routeはスキップし、
+    /// 未完了のもののみキューに入れる。
+    /// 返り値は作成したTransfer件数。
+    #[deprecated(note = "force_rewrite is deprecated — requeue_all will be removed")]
+    async fn requeue_all(
+        &self,
+        file_ids: &[String],
+        routes: &[(LocationId, LocationId)],
+    ) -> Result<usize, SyncError>;
+
+    /// Completed以外の全Transfer（failed/queued/blocked/in_flight）を一括削除。
+    ///
+    /// `force_full_rewrite` のクリーンスレート確保用。
+    /// 累積した失敗レコードを除去し、requeue_allで正確に再キューする。
+    /// 返り値は削除した件数。
+    #[deprecated(note = "force_rewrite is deprecated — purge_non_completed will be removed")]
+    async fn purge_non_completed(&self) -> Result<usize, SyncError>;
 }

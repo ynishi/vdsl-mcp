@@ -7,8 +7,16 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::error::SyncError;
+use super::error::DomainError;
 use super::file_type::FileType;
+use super::fingerprint::FileFingerprint;
+
+/// Cloud Storageファイルの仮hash prefix。
+///
+/// Cloud検出時はfile_hashが不明なため `"size:{bytes}"` 形式の仮hashを使用する。
+/// この値は [`FileFingerprint`] 構築時に `file_hash: None` として扱われ、
+/// 精度が正確に Metadata/SizeOnly として反映される。
+const PLACEHOLDER_HASH_PREFIX: &str = "size:";
 
 /// 追跡対象ファイルの身元情報。
 ///
@@ -28,6 +36,9 @@ use super::file_type::FileType;
 /// | `content_hash` | フォーマット固有ハッシュ (PNG IHDR+IDAT等) |
 /// | `file_size` | `fs::metadata().len()` |
 /// | `embedded_id` | ファイル内メタデータから抽出 (PNG tEXt, JSON field等) |
+#[deprecated(
+    note = "use TopologyFile + LocationFile — TrackedFile mixes identity and location state"
+)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackedFile {
     id: String,
@@ -39,8 +50,16 @@ pub struct TrackedFile {
     file_size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     embedded_id: Option<String>,
+
+    /// ストレージが報告するファイルの最終更新日時。
+    /// Cloud Storageの場合に設定される。ローカルファイルはNone（hashで判定するため）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    modified_at: Option<DateTime<Utc>>,
     registered_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    /// ファイルが削除検出された日時。Noneなら生存中。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deleted_at: Option<DateTime<Utc>>,
 }
 
 impl TrackedFile {
@@ -63,15 +82,15 @@ impl TrackedFile {
         content_hash: Option<String>,
         file_size: u64,
         embedded_id: Option<String>,
-    ) -> Result<Self, SyncError> {
+    ) -> Result<Self, DomainError> {
         if relative_path.is_empty() {
-            return Err(SyncError::Validation {
+            return Err(DomainError::Validation {
                 field: "relative_path".into(),
                 reason: "must not be empty".into(),
             });
         }
         if file_hash.is_empty() {
-            return Err(SyncError::Validation {
+            return Err(DomainError::Validation {
                 field: "file_hash".into(),
                 reason: "must not be empty".into(),
             });
@@ -85,8 +104,43 @@ impl TrackedFile {
             content_hash,
             file_size,
             embedded_id,
+            modified_at: None,
             registered_at: now,
             updated_at: now,
+            deleted_at: None,
+        })
+    }
+
+    /// Cloud Storage検出ファイル用ファクトリ。
+    ///
+    /// file_hashが不明なため、sizeベースの仮hashを使用。
+    /// ローカルにpull後、`update_from_scan()`でDJB2に置換される。
+    pub fn from_cloud_scan(
+        relative_path: String,
+        file_type: FileType,
+        size: u64,
+        modified_at: Option<DateTime<Utc>>,
+    ) -> Result<Self, DomainError> {
+        if relative_path.is_empty() {
+            return Err(DomainError::Validation {
+                field: "relative_path".into(),
+                reason: "must not be empty".into(),
+            });
+        }
+        let now = Utc::now();
+        Ok(Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            relative_path,
+            file_type,
+            // sizeベース仮hash — pull後にDJB2で上書きされる
+            file_hash: format!("{PLACEHOLDER_HASH_PREFIX}{size}"),
+            content_hash: None,
+            file_size: size,
+            embedded_id: None,
+            modified_at,
+            registered_at: now,
+            updated_at: now,
+            deleted_at: None,
         })
     }
 
@@ -103,8 +157,10 @@ impl TrackedFile {
         content_hash: Option<String>,
         file_size: u64,
         embedded_id: Option<String>,
+        modified_at: Option<DateTime<Utc>>,
         registered_at: DateTime<Utc>,
         updated_at: DateTime<Utc>,
+        deleted_at: Option<DateTime<Utc>>,
     ) -> Self {
         Self {
             id,
@@ -114,8 +170,10 @@ impl TrackedFile {
             content_hash,
             file_size,
             embedded_id,
+            modified_at,
             registered_at,
             updated_at,
+            deleted_at,
         }
     }
 
@@ -123,10 +181,29 @@ impl TrackedFile {
     // Commands
     // =========================================================================
 
+    /// 削除済みマーク。削除伝播Transfer発行後に呼ぶ。
+    ///
+    /// 既にdeleted_atが設定済みの場合は何もしない（冪等）。
+    pub fn mark_deleted(&mut self) {
+        if self.deleted_at.is_none() {
+            let now = Utc::now();
+            self.deleted_at = Some(now);
+            self.updated_at = now;
+        }
+    }
+
+    /// 削除済みマークを解除（再登録時に使用）。
+    pub fn unmark_deleted(&mut self) {
+        self.deleted_at = None;
+        self.updated_at = Utc::now();
+    }
+
     /// ファイル実体の再スキャン結果でメタデータを更新。
     ///
-    /// ハッシュが変わった場合はtrue、変わらなかった場合はfalseを返す。
+    /// 変更があった場合はtrue、なかった場合はfalseを返す。
     /// 呼び出し側はtrueの場合に新しいTransferを作成する。
+    ///
+    /// 変更検知は [`FileFingerprint::matches()`] に委譲する。
     pub fn update_from_scan(
         &mut self,
         file_type: FileType,
@@ -135,16 +212,58 @@ impl TrackedFile {
         file_size: u64,
         embedded_id: Option<String>,
     ) -> bool {
-        let hash_changed = self.file_hash != file_hash;
+        let scan_fp = FileFingerprint {
+            file_hash: Some(file_hash.clone()),
+            content_hash: content_hash.clone(),
+            meta_hash: None, // TrackedFile(旧モデル)はmeta_hashを直接保持しない
+            size: file_size,
+            modified_at: None,
+        };
+        let changed = self.has_changed(&scan_fp);
+
+        // hash精度昇格（Cloud仮hash→実hash）もメタデータ更新が必要
+        let hash_upgraded = !self.has_real_file_hash();
 
         self.file_type = file_type;
         self.file_hash = file_hash;
         self.content_hash = content_hash;
         self.file_size = file_size;
         self.embedded_id = embedded_id;
-        self.updated_at = Utc::now();
+        self.modified_at = None; // ローカルスキャン時はmtimeリセット
 
-        hash_changed
+        if changed || hash_upgraded {
+            self.updated_at = Utc::now();
+        }
+
+        changed
+    }
+
+    /// Cloud Storageのメタデータでファイル情報を更新。
+    ///
+    /// file_hashは不明のまま（sizeベース仮hash維持）。
+    /// 変更があった場合はtrue。
+    pub fn update_from_cloud_scan(
+        &mut self,
+        size: u64,
+        modified_at: Option<DateTime<Utc>>,
+    ) -> bool {
+        let scan_fp = FileFingerprint {
+            file_hash: None,
+            content_hash: None,
+            meta_hash: None,
+            size,
+            modified_at,
+        };
+        let changed = self.has_changed(&scan_fp);
+
+        if changed {
+            self.file_hash = format!("{PLACEHOLDER_HASH_PREFIX}{size}");
+            self.file_size = size;
+            self.modified_at = modified_at;
+            self.updated_at = Utc::now();
+        }
+
+        changed
     }
 
     // =========================================================================
@@ -179,12 +298,58 @@ impl TrackedFile {
         self.embedded_id.as_deref()
     }
 
+    pub fn modified_at(&self) -> Option<DateTime<Utc>> {
+        self.modified_at
+    }
+
+    /// ファイルシステムのmtimeを設定。incremental scan用。
+    pub fn set_modified_at(&mut self, mtime: Option<DateTime<Utc>>) {
+        self.modified_at = mtime;
+    }
+
+    /// 現在の身元情報からフィンガープリントを構築。
+    ///
+    /// Cloud Storage由来の仮hash (`"size:..."`) は実バイトハッシュではないため
+    /// `file_hash: None` として扱い、精度が Metadata/SizeOnly に正しく反映される。
+    pub fn fingerprint(&self) -> FileFingerprint {
+        let real_hash = if self.file_hash.starts_with(PLACEHOLDER_HASH_PREFIX) {
+            None
+        } else {
+            Some(self.file_hash.clone())
+        };
+        FileFingerprint {
+            file_hash: real_hash,
+            content_hash: self.content_hash.clone(),
+            meta_hash: None, // TrackedFile(旧モデル)はmeta_hashを直接保持しない
+            size: self.file_size,
+            modified_at: self.modified_at,
+        }
+    }
+
+    /// file_hashが実バイトハッシュか（仮hashでないか）。
+    pub fn has_real_file_hash(&self) -> bool {
+        !self.file_hash.starts_with(PLACEHOLDER_HASH_PREFIX)
+    }
+
+    /// スキャン結果のフィンガープリントと比較し、変更があればtrue。
+    pub fn has_changed(&self, scan: &FileFingerprint) -> bool {
+        !self.fingerprint().matches(scan)
+    }
+
     pub fn registered_at(&self) -> DateTime<Utc> {
         self.registered_at
     }
 
     pub fn updated_at(&self) -> DateTime<Utc> {
         self.updated_at
+    }
+
+    pub fn deleted_at(&self) -> Option<DateTime<Utc>> {
+        self.deleted_at
+    }
+
+    pub fn is_deleted(&self) -> bool {
+        self.deleted_at.is_some()
     }
 
     /// 重複検出用の最適ハッシュ。
@@ -195,9 +360,8 @@ impl TrackedFile {
     }
 
     /// Serialize to [`serde_json::Value`] for cross-boundary transport.
-    pub fn to_value(&self) -> Result<serde_json::Value, SyncError> {
+    pub fn to_value(&self) -> Result<serde_json::Value, serde_json::Error> {
         serde_json::to_value(self)
-            .map_err(|e| SyncError::Serialization(format!("TrackedFile: {e}")))
     }
 }
 
@@ -266,7 +430,7 @@ mod tests {
     fn identity_hash_falls_back_to_file_hash() {
         let f = TrackedFile::from_scan(
             "data.json".into(),
-            FileType::Recipe,
+            FileType::Asset,
             "abc123".into(),
             None,
             64,
@@ -287,8 +451,10 @@ mod tests {
             Some("chash".into()),
             512,
             Some("emb".into()),
+            None, // modified_at
             now,
             now,
+            None,
         );
         assert_eq!(f.id(), "id-1");
         assert_eq!(f.relative_path(), "path.png");
@@ -309,7 +475,7 @@ mod tests {
     fn serde_omits_none_fields() {
         let f = TrackedFile::from_scan(
             "data.json".into(),
-            FileType::Recipe,
+            FileType::Asset,
             "hash".into(),
             None,
             64,
@@ -345,5 +511,72 @@ mod tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // fingerprint() — 仮hashフィルタ
+    // =========================================================================
+
+    #[test]
+    fn fingerprint_local_file_has_file_hash() {
+        let f = sample_file(); // from_scan → 実hash "abc123"
+        let fp = f.fingerprint();
+        assert_eq!(fp.file_hash.as_deref(), Some("abc123"));
+        assert!(f.has_real_file_hash());
+    }
+
+    #[test]
+    fn fingerprint_cloud_file_has_no_file_hash() {
+        let f = TrackedFile::from_cloud_scan("cloud/photo.png".into(), FileType::Image, 2048, None)
+            .expect("valid");
+        let fp = f.fingerprint();
+        assert!(
+            fp.file_hash.is_none(),
+            "Cloud仮hashはfingerprintではNoneになるべき"
+        );
+        assert!(!f.has_real_file_hash());
+    }
+
+    #[test]
+    fn fingerprint_cloud_same_size_not_byte_level_match() {
+        // 同sizeのCloud同士がByteLevel一致と誤判定されないことを検証
+        let a = TrackedFile::from_cloud_scan("a.png".into(), FileType::Image, 1024, None)
+            .expect("valid");
+        let b = TrackedFile::from_cloud_scan("b.png".into(), FileType::Image, 1024, None)
+            .expect("valid");
+        let fp_a = a.fingerprint();
+        let fp_b = b.fingerprint();
+        // 双方file_hash=None → size比較にフォールバック（SizeOnly精度）
+        assert!(fp_a.matches(&fp_b));
+        assert_eq!(
+            fp_a.effective_precision(&fp_b),
+            super::super::fingerprint::FingerprintPrecision::SizeOnly
+        );
+    }
+
+    #[test]
+    fn cloud_file_upgraded_after_local_scan_same_size() {
+        // 同sizeでhash精度だけ上がる場合 → ファイル実体は同一なのでchanged=false
+        let mut f = TrackedFile::from_cloud_scan("photo.png".into(), FileType::Image, 2048, None)
+            .expect("valid");
+        assert!(!f.has_real_file_hash());
+
+        let changed =
+            f.update_from_scan(FileType::Image, "djb2_real_hash".into(), None, 2048, None);
+        assert!(!changed, "同sizeファイルのhash精度向上はTransfer不要");
+        // フィールドは更新される（update_from_scanは常に全フィールド書き換え）
+        assert!(f.has_real_file_hash());
+        assert_eq!(f.fingerprint().file_hash.as_deref(), Some("djb2_real_hash"));
+    }
+
+    #[test]
+    fn cloud_file_upgraded_after_local_scan_different_size() {
+        // sizeが異なる場合 → 実体が変わっているのでchanged=true
+        let mut f = TrackedFile::from_cloud_scan("photo.png".into(), FileType::Image, 2048, None)
+            .expect("valid");
+
+        let changed = f.update_from_scan(FileType::Image, "djb2_new".into(), None, 4096, None);
+        assert!(changed, "size変化はファイル実体の変更");
+        assert!(f.has_real_file_hash());
     }
 }

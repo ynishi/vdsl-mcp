@@ -4,17 +4,29 @@
 //! push/pull/list/exists operations. vdsl-sync defines the trait;
 //! consumers (e.g. vdsl-mcp) provide concrete implementations.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
-use crate::domain::error::SyncError;
+use crate::application::error::SyncError;
+use crate::infra::error::InfraError;
 
 /// A file discovered on a remote location.
+///
+/// Metadata available depends on the storage backend:
+/// - `size`: most backends provide this (rclone lsf `%s`)
+/// - `modified_at`: available from rclone lsf `%t` (ISO 8601)
+///
+/// Used for metadata-based change detection on Cloud storage
+/// where content hash computation requires downloading the file.
 #[derive(Debug, Clone)]
 pub struct RemoteFile {
     pub path: String,
     pub size: Option<u64>,
+    /// Last modification time reported by the storage backend.
+    pub modified_at: Option<DateTime<Utc>>,
 }
 
 /// Abstract file transfer backend.
@@ -34,6 +46,83 @@ pub trait StorageBackend: Send + Sync {
 
     /// Check if a remote file exists.
     async fn exists(&self, remote_path: &str) -> Result<bool, SyncError>;
+
+    /// Delete a file on this remote.
+    ///
+    /// Returns `Ok(())` if the file was deleted or didn't exist.
+    /// Default implementation returns `Err` — backends that support deletion
+    /// must override this.
+    async fn delete(&self, remote_path: &str) -> Result<(), SyncError> {
+        Err(InfraError::Transfer {
+            reason: format!(
+                "delete not supported by {} backend for path: {remote_path}",
+                self.backend_type()
+            ),
+        }
+        .into())
+    }
+
+    /// Push multiple files in a single batch operation.
+    ///
+    /// `src_root` is the local base directory, `dest_root` is the remote base,
+    /// and `relative_paths` are paths relative to both roots.
+    ///
+    /// Returns a map of relative_path → Ok/Err for per-file status tracking.
+    /// Default implementation falls back to sequential `push()` calls.
+    async fn push_batch(
+        &self,
+        src_root: &Path,
+        dest_root: &str,
+        relative_paths: &[String],
+    ) -> HashMap<String, Result<(), SyncError>> {
+        let mut results = HashMap::with_capacity(relative_paths.len());
+        for rel in relative_paths {
+            let local_path = src_root.join(rel);
+            let remote_path = if dest_root.is_empty() {
+                rel.clone()
+            } else {
+                format!("{dest_root}/{rel}")
+            };
+            let result = self.push(&local_path, &remote_path).await;
+            results.insert(rel.clone(), result);
+        }
+        results
+    }
+
+    /// Pull multiple files in a single batch operation.
+    ///
+    /// `src_root` is the remote base, `dest_root` is the local base directory,
+    /// and `relative_paths` are paths relative to both roots.
+    ///
+    /// Returns a map of relative_path → Ok/Err for per-file status tracking.
+    /// Default implementation falls back to sequential `pull()` calls.
+    async fn pull_batch(
+        &self,
+        src_root: &str,
+        dest_root: &Path,
+        relative_paths: &[String],
+    ) -> HashMap<String, Result<(), SyncError>> {
+        let mut results = HashMap::with_capacity(relative_paths.len());
+        for rel in relative_paths {
+            let remote_path = if src_root.is_empty() {
+                rel.clone()
+            } else {
+                format!("{src_root}/{rel}")
+            };
+            let local_path = dest_root.join(rel);
+            let result = self.pull(&remote_path, &local_path).await;
+            results.insert(rel.clone(), result);
+        }
+        results
+    }
+
+    /// Whether this backend supports efficient batch push/pull.
+    ///
+    /// When true, callers should prefer `push_batch`/`pull_batch` over individual calls.
+    /// Default: false (sequential fallback).
+    fn supports_batch(&self) -> bool {
+        false
+    }
 
     /// Backend type name for display and config matching.
     fn backend_type(&self) -> &str;
@@ -69,6 +158,7 @@ pub mod memory {
         Pull { remote: String, local: String },
         List { path: String },
         Exists { path: String },
+        Delete { path: String },
     }
 
     #[async_trait]
@@ -81,7 +171,10 @@ pub mod memory {
             let mut guard = self.fail_next.lock().await;
             if *guard {
                 *guard = false;
-                return Err(SyncError::TransferFailed("mock push error".into()));
+                return Err(InfraError::Transfer {
+                    reason: "mock push error".into(),
+                }
+                .into());
             }
             Ok(())
         }
@@ -94,7 +187,10 @@ pub mod memory {
             let mut guard = self.fail_next.lock().await;
             if *guard {
                 *guard = false;
-                return Err(SyncError::TransferFailed("mock pull error".into()));
+                return Err(InfraError::Transfer {
+                    reason: "mock pull error".into(),
+                }
+                .into());
             }
             Ok(())
         }
@@ -103,7 +199,15 @@ pub mod memory {
             self.log.lock().await.push(Op::List {
                 path: remote_path.into(),
             });
-            Ok(vec![])
+            let files = self.files.lock().await;
+            Ok(files
+                .iter()
+                .map(|(path, data)| RemoteFile {
+                    path: path.clone(),
+                    size: Some(data.len() as u64),
+                    modified_at: None,
+                })
+                .collect())
         }
 
         async fn exists(&self, remote_path: &str) -> Result<bool, SyncError> {
@@ -113,8 +217,62 @@ pub mod memory {
             Ok(self.files.lock().await.contains_key(remote_path))
         }
 
+        async fn delete(&self, remote_path: &str) -> Result<(), SyncError> {
+            self.log.lock().await.push(Op::Delete {
+                path: remote_path.into(),
+            });
+            let mut guard = self.fail_next.lock().await;
+            if *guard {
+                *guard = false;
+                return Err(InfraError::Transfer {
+                    reason: "mock delete error".into(),
+                }
+                .into());
+            }
+            self.files.lock().await.remove(remote_path);
+            Ok(())
+        }
+
         fn backend_type(&self) -> &str {
             "memory"
+        }
+    }
+
+    /// Blanket impl so `Arc<InMemoryBackend>` can be used as a `StorageBackend`.
+    ///
+    /// Avoids orphan-rule workarounds (newtype wrapper) in every test module.
+    #[async_trait]
+    impl StorageBackend for std::sync::Arc<InMemoryBackend> {
+        async fn push(&self, local_path: &Path, remote_path: &str) -> Result<(), SyncError> {
+            (**self).push(local_path, remote_path).await
+        }
+        async fn pull(&self, remote_path: &str, local_path: &Path) -> Result<(), SyncError> {
+            (**self).pull(remote_path, local_path).await
+        }
+        async fn list(&self, remote_path: &str) -> Result<Vec<RemoteFile>, SyncError> {
+            (**self).list(remote_path).await
+        }
+        async fn exists(&self, remote_path: &str) -> Result<bool, SyncError> {
+            (**self).exists(remote_path).await
+        }
+        async fn delete(&self, remote_path: &str) -> Result<(), SyncError> {
+            (**self).delete(remote_path).await
+        }
+        async fn push_batch(
+            &self,
+            src_root: &Path,
+            dest_root: &str,
+            relative_paths: &[String],
+        ) -> HashMap<String, Result<(), SyncError>> {
+            (**self)
+                .push_batch(src_root, dest_root, relative_paths)
+                .await
+        }
+        fn supports_batch(&self) -> bool {
+            (**self).supports_batch()
+        }
+        fn backend_type(&self) -> &str {
+            (**self).backend_type()
         }
     }
 }
