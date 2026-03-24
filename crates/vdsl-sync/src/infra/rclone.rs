@@ -120,9 +120,16 @@ impl StorageBackend for RcloneBackend {
 
     async fn pull(&self, remote_path: &str, local_path: &Path) -> Result<(), SyncError> {
         let src = self.remote_path(remote_path)?;
-        // Ensure parent directory exists
+        // Ensure parent directory exists via shell (works for both local and remote hosts)
         if let Some(parent) = local_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            if let Some(parent_str) = parent.to_str() {
+                if !parent_str.is_empty() {
+                    let _ = self
+                        .shell
+                        .exec(&["mkdir", "-p", parent_str], Some(10))
+                        .await;
+                }
+            }
         }
         let local_str = local_path.to_str().ok_or_else(|| {
             SyncError::TransferFailed(format!(

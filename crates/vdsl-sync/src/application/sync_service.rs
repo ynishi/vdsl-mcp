@@ -1,85 +1,146 @@
 //! SyncService — application-layer orchestrator for sync operations.
 //!
-//! Coordinates [`SyncStore`], [`TransferEngine`], and [`ContentHasher`]
-//! to provide register/notify/push/pull/force operations.
+//! Coordinates [`FileStore`], [`TransferStore`], [`RemoteStore`],
+//! [`TransferEngine`], and [`ContentHasher`] to provide
+//! notify/force/status operations.
 //!
-//! Transfer routing and concurrent push logic is delegated to
-//! [`TransferEngine`](super::transfer_engine::TransferEngine).
+//! # v2 architecture
+//!
+//! - **TrackedFile** — file identity (hash, size, type)
+//! - **Transfer** — delivery object with state machine (Queued→InFlight→Completed|Failed)
+//! - **FileView** — query result combining TrackedFile + PresenceView per location
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use super::route::TransferRoute;
 use super::transfer_engine::{BatchResult, TransferEngine};
-use crate::domain::entry::SyncEntry;
 use crate::domain::error::SyncError;
 use crate::domain::file_type::FileType;
-use crate::domain::location::{LocationId, LocationState, SyncSummary};
-use crate::domain::route::TransferRoute;
+use crate::domain::location::{LocationId, LocationSummary, SyncSummary};
+use crate::domain::retry::RetryPolicy;
+use crate::domain::tracked_file::TrackedFile;
+use crate::domain::transfer::{Transfer, TransferState};
+use crate::domain::view::{FileView, PresenceState, PresenceView};
+use crate::infra::file_store::FileStore;
 use crate::infra::hasher::{ContentHasher, Djb2Hasher, HashResult};
-use crate::infra::store::{RemoteConfig, SyncStore};
+use crate::infra::remote_store::RemoteStore;
+use crate::infra::store::RemoteConfig;
+use crate::infra::transfer_store::TransferStore;
+
+/// スキャン時の個別ファイルエラー。
+///
+/// スキャンは「1ファイルの失敗で全体を中断しない」設計。
+/// 失敗したファイルはScanErrorとして蓄積し、呼び出し元に返す。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScanError {
+    /// 問題のあったファイルパス（absoluteまたはrelative）。
+    pub path: String,
+    /// エラー内容。
+    pub error: String,
+}
+
+/// `force()` の戻り値。scan結果とtransfer結果を分離保持する。
+///
+/// scanフェーズとtransferフェーズは独立したエラー源を持つ。
+/// 混合するとデバッグ時にどのフェーズで失敗したか判別できない。
+#[derive(Debug, Default, serde::Serialize)]
+pub struct ForceResult {
+    /// スキャンで新規登録されたファイル数。
+    pub scanned: usize,
+    /// スキャン時に失敗した個別ファイル。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scan_errors: Vec<ScanError>,
+    /// transfer実行結果（pushed/failed/errors）。
+    #[serde(flatten)]
+    pub batch: BatchResult,
+}
+
+impl ForceResult {
+    /// Serialize to [`serde_json::Value`] for cross-boundary transport.
+    pub fn to_value(&self) -> Result<serde_json::Value, SyncError> {
+        serde_json::to_value(self)
+            .map_err(|e| SyncError::Serialization(format!("ForceResult: {e}")))
+    }
+}
 
 /// Result of a notify operation.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct NotifyResult {
-    pub entry: SyncEntry,
+    pub file: TrackedFile,
     pub is_duplicate: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub duplicate_of: Option<String>,
+    pub transfers_created: usize,
 }
 
-/// Options for registering a file.
-#[derive(Debug)]
-pub struct RegisterOpts {
-    pub file_hash: String,
-    pub content_hash: Option<String>,
-    pub file_size: Option<u64>,
-    pub gen_id: Option<String>,
-    pub initial_locations: HashMap<LocationId, LocationState>,
-}
-
-/// Result of a register operation.
-#[derive(Debug)]
-pub enum RegisterResult {
-    Created(SyncEntry),
-    Updated(SyncEntry),
-    Duplicate {
-        existing: SyncEntry,
-        duplicate_of: String,
-    },
+impl NotifyResult {
+    /// Serialize to [`serde_json::Value`] for cross-boundary transport.
+    pub fn to_value(&self) -> Result<serde_json::Value, SyncError> {
+        serde_json::to_value(self)
+            .map_err(|e| SyncError::Serialization(format!("NotifyResult: {e}")))
+    }
 }
 
 /// Sync service — application-layer orchestrator.
 ///
-/// Coordinates store (persistence) + transfer engine (routing) + hasher (identity).
+/// Coordinates stores (persistence) + transfer engine (routing) + hasher (identity).
 ///
 /// The local file root is derived from routes via [`TransferEngine::local_root`].
 pub struct SyncService {
-    store: Box<dyn SyncStore>,
+    file_store: Arc<dyn FileStore>,
+    transfer_store: Arc<dyn TransferStore>,
+    remote_store: Arc<dyn RemoteStore>,
     engine: TransferEngine,
     hasher: Arc<dyn ContentHasher>,
+    retry_policy: RetryPolicy,
 }
 
 impl SyncService {
     /// Create a new SyncService.
-    pub fn new(store: Box<dyn SyncStore>, routes: Vec<TransferRoute>) -> Self {
+    pub fn new(
+        file_store: Arc<dyn FileStore>,
+        transfer_store: Arc<dyn TransferStore>,
+        remote_store: Arc<dyn RemoteStore>,
+        routes: Vec<TransferRoute>,
+    ) -> Self {
         Self {
-            store,
+            file_store,
+            transfer_store,
+            remote_store,
             engine: TransferEngine::new(routes),
             hasher: Arc::new(Djb2Hasher),
+            retry_policy: RetryPolicy::default(),
         }
     }
 
     /// Create with a custom content hasher.
     pub fn with_hasher(
-        store: Box<dyn SyncStore>,
+        file_store: Arc<dyn FileStore>,
+        transfer_store: Arc<dyn TransferStore>,
+        remote_store: Arc<dyn RemoteStore>,
         routes: Vec<TransferRoute>,
         hasher: Arc<dyn ContentHasher>,
     ) -> Self {
         Self {
-            store,
+            file_store,
+            transfer_store,
+            remote_store,
             engine: TransferEngine::new(routes),
             hasher,
+            retry_policy: RetryPolicy::default(),
         }
+    }
+
+    /// Access the retry policy.
+    pub fn retry_policy(&self) -> &RetryPolicy {
+        &self.retry_policy
+    }
+
+    /// Set a custom retry policy.
+    pub fn set_retry_policy(&mut self, policy: RetryPolicy) {
+        self.retry_policy = policy;
     }
 
     /// Access the transfer engine (for route management, concurrency settings, etc.).
@@ -126,13 +187,118 @@ impl SyncService {
     }
 
     // =========================================================================
-    // Lua thin IF: notify / status / force
+    // Public API: notify / force / get / list / status
     // =========================================================================
 
-    /// Notify the service of a new or modified file (by absolute path).
+    /// Scan sync_root for new/modified files and register them.
     ///
-    /// Phase 1: Local-only. Auto-computes hash, checks for duplicates,
-    /// and marks all configured remotes as pending.
+    /// Walks the local sync_root directory, computes hashes, and registers
+    /// any files not yet tracked or whose hash has changed.
+    ///
+    /// 1ファイルの失敗で全体を中断しない。失敗はScanErrorとして蓄積し返す。
+    async fn scan_and_register(&self) -> Result<(usize, Vec<ScanError>), SyncError> {
+        let local_root = match self.local_root() {
+            Some(root) => root.to_path_buf(),
+            None => return Ok((0, Vec::new())),
+        };
+
+        let mut registered = 0usize;
+        let mut errors = Vec::new();
+        let mut stack = vec![local_root.clone()];
+
+        while let Some(dir) = stack.pop() {
+            let mut entries = tokio::fs::read_dir(&dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let ft = entry.file_type().await?;
+                if ft.is_dir() {
+                    stack.push(entry.path());
+                    continue;
+                }
+                if !ft.is_file() {
+                    continue;
+                }
+
+                let path = entry.path();
+                let path_display = path.display().to_string();
+
+                // non-UTF-8パスはエラーとして記録
+                let path_str = match path.to_str() {
+                    Some(s) => s,
+                    None => {
+                        errors.push(ScanError {
+                            path: path_display,
+                            error: "path is not valid UTF-8".into(),
+                        });
+                        continue;
+                    }
+                };
+
+                let relative_path = match path.strip_prefix(&local_root) {
+                    Ok(rel) => match rel.to_str() {
+                        Some(s) => s.to_string(),
+                        None => {
+                            errors.push(ScanError {
+                                path: path_display,
+                                error: "relative path is not valid UTF-8".into(),
+                            });
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        errors.push(ScanError {
+                            path: path_display,
+                            error: format!("strip_prefix failed: {e}"),
+                        });
+                        continue;
+                    }
+                };
+
+                let (hash_result, _file_size) = match self.inspect_file(&path).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        errors.push(ScanError {
+                            path: path_display,
+                            error: format!("hash failed: {e}"),
+                        });
+                        continue;
+                    }
+                };
+
+                // Check if already tracked with same hash
+                if let Some(existing) = self.file_store.get_file_by_path(&relative_path).await? {
+                    if existing.file_hash() == hash_result.file_hash {
+                        continue; // unchanged
+                    }
+                }
+
+                let file_type = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(FileType::from_extension)
+                    .unwrap_or(FileType::Asset);
+
+                match self.notify(path_str, file_type, None).await {
+                    Ok(_) => registered += 1,
+                    Err(e) => {
+                        errors.push(ScanError {
+                            path: path_display,
+                            error: format!("notify failed: {e}"),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok((registered, errors))
+    }
+
+    /// Register a new or modified local file in the sync index (by absolute path).
+    ///
+    /// 1. Creates/updates TrackedFile
+    /// 2. Creates Transfer objects for each direct route from local
+    ///
+    /// Normally called internally by [`force()`](Self::force) during Dir scan.
+    /// Direct use is supported for tests and explicit registration scenarios.
     pub async fn notify(
         &self,
         absolute_path: &str,
@@ -147,8 +313,8 @@ impl SyncService {
 
         // Check for duplicate by hash
         if let Some(existing) = self
-            .store
-            .find_duplicate(
+            .file_store
+            .find_duplicate_file(
                 &hash_result.file_hash,
                 hash_result.content_hash.as_deref(),
                 &relative_path,
@@ -157,185 +323,280 @@ impl SyncService {
         {
             return Ok(NotifyResult {
                 is_duplicate: true,
-                duplicate_of: Some(existing.relative_path.clone()),
-                entry: existing,
+                duplicate_of: Some(existing.relative_path().to_string()),
+                file: existing,
+                transfers_created: 0,
             });
         }
 
-        // Build initial locations via domain factory
-        let remotes = self.store.list_remotes().await?;
-        let remote_locs: Vec<LocationId> = remotes.iter().map(|r| r.location_id.clone()).collect();
+        // Create or update TrackedFile
+        let file =
+            if let Some(mut existing) = self.file_store.get_file_by_path(&relative_path).await? {
+                let hash_changed = existing.update_from_scan(
+                    file_type,
+                    hash_result.file_hash,
+                    hash_result.content_hash,
+                    file_size.unwrap_or(0),
+                    gen_id.map(|s| s.to_string()),
+                );
+                self.file_store.upsert_file(&existing).await?;
 
-        // Check existing entry and delegate to domain
-        if let Some(mut existing) = self.store.get_by_path(&relative_path).await? {
-            existing.update_metadata(
-                file_type,
-                hash_result.file_hash,
-                hash_result.content_hash,
-                file_size,
-                gen_id.map(|s| s.to_string()),
-            );
-            self.store.update_entry(&existing).await?;
-            return Ok(NotifyResult {
-                entry: existing,
-                is_duplicate: false,
-                duplicate_of: None,
-            });
-        }
+                if hash_changed {
+                    // Hash changed → create new transfers
+                    let created = self
+                        .create_transfers_from(&existing, &LocationId::local())
+                        .await?;
+                    return Ok(NotifyResult {
+                        file: existing,
+                        is_duplicate: false,
+                        duplicate_of: None,
+                        transfers_created: created,
+                    });
+                }
+                // Hash unchanged but metadata updated
+                return Ok(NotifyResult {
+                    file: existing,
+                    is_duplicate: false,
+                    duplicate_of: None,
+                    transfers_created: 0,
+                });
+            } else {
+                TrackedFile::from_scan(
+                    relative_path,
+                    file_type,
+                    hash_result.file_hash,
+                    hash_result.content_hash,
+                    file_size.unwrap_or(0),
+                    gen_id.map(|s| s.to_string()),
+                )?
+            };
 
-        // New entry via domain factory
-        let entry = SyncEntry::new(
-            relative_path,
-            file_type,
-            hash_result.file_hash,
-            hash_result.content_hash,
-            file_size,
-            gen_id.map(|s| s.to_string()),
-            &remote_locs,
-        );
-        self.store.insert_entry(&entry).await?;
+        self.file_store.upsert_file(&file).await?;
+        let created = self
+            .create_transfers_from(&file, &LocationId::local())
+            .await?;
+
         Ok(NotifyResult {
-            entry,
+            file,
             is_duplicate: false,
             duplicate_of: None,
+            transfers_created: created,
         })
     }
 
-    /// Notify the service of a file on a remote location.
+    /// Register a file known to exist on a remote source.
     ///
-    /// Computes hash/size via `RemoteShell` (sha256sum + stat), then registers
-    /// the entry with `origin` as Present and all other remotes as Pending.
+    /// Creates TrackedFile + Transfer objects from the specified source
+    /// to all directly reachable destinations.
     ///
-    /// Requires a route FROM `origin` with a `src_shell` configured.
-    ///
-    /// `relative_path` is relative to the route's `src_file_root`.
-    pub async fn notify_remote(
+    /// Used when files are produced on remote nodes (e.g., GPU pod generates images)
+    /// and we want to sync them to other locations.
+    pub async fn register_file(
         &self,
-        origin: &LocationId,
-        relative_path: &str,
+        relative_path: String,
         file_type: FileType,
-        gen_id: Option<&str>,
-    ) -> Result<NotifyResult, SyncError> {
-        // Find a route from this origin (to get the shell)
-        let route = self
-            .engine
-            .routes()
-            .find(|r| r.src() == origin && r.src_shell().is_some())
-            .ok_or_else(|| SyncError::NoRouteAvailable {
-                src: origin.to_string(),
-                dest: "*".to_string(),
-                path: relative_path.to_string(),
-            })?;
-
-        // Verify file exists on remote
-        if !route.src_file_exists(relative_path).await? {
-            return Err(SyncError::FileNotFound(
-                route.src_file_root().join(relative_path),
-            ));
-        }
-
-        // Inspect file via RemoteShell
-        let (hash_result, file_size) = route
-            .inspect_src_file(relative_path, self.hasher.as_ref())
-            .await?;
-
-        // Duplicate check
-        if let Some(existing) = self
-            .store
-            .find_duplicate(
-                &hash_result.file_hash,
-                hash_result.content_hash.as_deref(),
-                relative_path,
-            )
-            .await?
-        {
-            return Ok(NotifyResult {
-                is_duplicate: true,
-                duplicate_of: Some(existing.relative_path.clone()),
-                entry: existing,
-            });
-        }
-
-        // Determine all sync targets: registered remotes + local (if reachable via route)
-        let remotes = self.store.list_remotes().await?;
-        let mut pending_targets: Vec<LocationId> = remotes
-            .iter()
-            .filter(|r| r.location_id != *origin)
-            .map(|r| r.location_id.clone())
-            .collect();
-
-        // If there's a route from origin → local, local should also be Pending
-        let local = LocationId::local();
-        if *origin != local && self.engine.find_route(origin, &local).is_some() {
-            pending_targets.push(local);
-        }
-
-        // Build initial locations: origin=Present, others=Pending
-        let mut locations = HashMap::new();
-        locations.insert(origin.clone(), LocationState::Present);
-        for target in &pending_targets {
-            locations.insert(target.clone(), LocationState::Pending);
-        }
-
-        // Update existing or create new
-        if let Some(mut existing) = self.store.get_by_path(relative_path).await? {
-            existing.update_metadata(
-                file_type,
-                hash_result.file_hash,
-                hash_result.content_hash,
-                file_size,
-                gen_id.map(|s| s.to_string()),
-            );
-            // Update locations: origin=Present, others=Pending
-            existing
-                .locations
-                .insert(origin.clone(), LocationState::Present);
-            for target in &pending_targets {
-                existing
-                    .locations
-                    .entry(target.clone())
-                    .or_insert(LocationState::Pending);
-            }
-            self.store.update_entry(&existing).await?;
-            return Ok(NotifyResult {
-                entry: existing,
-                is_duplicate: false,
-                duplicate_of: None,
-            });
-        }
-
-        let entry = SyncEntry::with_locations(
-            relative_path.to_string(),
+        file_hash: String,
+        content_hash: Option<String>,
+        file_size: u64,
+        src: &LocationId,
+    ) -> Result<TrackedFile, SyncError> {
+        let file = TrackedFile::from_scan(
+            relative_path,
             file_type,
-            hash_result.file_hash,
-            hash_result.content_hash,
+            file_hash,
+            content_hash,
             file_size,
-            gen_id.map(|s| s.to_string()),
-            locations,
-        );
-        self.store.insert_entry(&entry).await?;
-        Ok(NotifyResult {
-            entry,
-            is_duplicate: false,
-            duplicate_of: None,
-        })
+            None,
+        )?;
+        self.file_store.upsert_file(&file).await?;
+        self.create_transfers_from(&file, src).await?;
+        Ok(file)
     }
 
     /// Get aggregated sync status.
     pub async fn status(&self) -> Result<SyncSummary, SyncError> {
-        self.store.summary().await
+        let files = self.file_store.list_files(None, None).await?;
+        let total_files = files.len();
+        let mut total_errors = 0usize;
+        let mut locations: HashMap<LocationId, LocationSummary> = HashMap::new();
+
+        for file in &files {
+            let transfers = self
+                .transfer_store
+                .latest_transfers_by_file(file.id())
+                .await?;
+
+            // Track which sources we've already counted for this file
+            // to avoid double-counting when multiple transfers share the same src.
+            let mut seen_srcs = std::collections::HashSet::new();
+
+            for t in &transfers {
+                // Source is implicitly Present — count once per file
+                if seen_srcs.insert(t.src().clone()) {
+                    let src_summary = locations.entry(t.src().clone()).or_default();
+                    src_summary.present = src_summary.present.saturating_add(1);
+                }
+
+                // Dest state from Transfer + RetryPolicy
+                let dest_summary = locations.entry(t.dest().clone()).or_default();
+                let presence = PresenceState::from_transfer(t, &self.retry_policy);
+                match presence {
+                    PresenceState::Present => {
+                        dest_summary.present = dest_summary.present.saturating_add(1);
+                    }
+                    PresenceState::Pending => {
+                        dest_summary.pending = dest_summary.pending.saturating_add(1);
+                    }
+                    PresenceState::Syncing => {
+                        dest_summary.syncing = dest_summary.syncing.saturating_add(1);
+                    }
+                    PresenceState::Failed => {
+                        dest_summary.failed = dest_summary.failed.saturating_add(1);
+                        total_errors = total_errors.saturating_add(1);
+                    }
+                    PresenceState::Absent => {
+                        // Absent = Transferが存在しないlocation向け。
+                        // from_transfer()からは到達しないが、将来
+                        // Transfer未作成locationの集計で使用予定。
+                        dest_summary.absent = dest_summary.absent.saturating_add(1);
+                    }
+                }
+            }
+        }
+
+        Ok(SyncSummary {
+            locations,
+            total_entries: total_files,
+            total_errors,
+        })
     }
 
-    /// Force-sync all pending files to a destination (or all route targets if None).
+    /// Force-sync all pending entries across the entire topology.
     ///
-    /// Delegates to [`TransferEngine::force`].
-    pub async fn force(&self, dest: Option<&LocationId>) -> Result<BatchResult, SyncError> {
-        self.engine.force(self.store.as_ref(), dest).await
+    /// 1. Scans sync_root for new/modified files
+    /// 2. Retries failed transfers (transient errors within retry limit)
+    /// 3. Executes transfers in BFS order (cloud before pod)
+    ///
+    /// scan失敗とtransfer失敗は [`ForceResult`] で分離して返す。
+    pub async fn force(&self) -> Result<ForceResult, SyncError> {
+        let (scanned, scan_errors) = self.scan_and_register().await?;
+        self.retry_failed().await?;
+        let batch = self
+            .engine
+            .force(self.file_store.as_ref(), self.transfer_store.as_ref())
+            .await?;
+
+        Ok(ForceResult {
+            scanned,
+            scan_errors,
+            batch,
+        })
+    }
+
+    /// Force-sync queued transfers for a specific route (src → dest).
+    pub async fn force_route(
+        &self,
+        src: &LocationId,
+        dest: &LocationId,
+    ) -> Result<BatchResult, SyncError> {
+        self.engine
+            .force_route(
+                self.file_store.as_ref(),
+                self.transfer_store.as_ref(),
+                src,
+                dest,
+            )
+            .await
+    }
+
+    /// Get a single file's sync state by relative path.
+    ///
+    /// Returns a [`FileView`] combining TrackedFile metadata with
+    /// PresenceView per location (derived from latest Transfers).
+    pub async fn get(&self, relative_path: &str) -> Result<Option<FileView>, SyncError> {
+        let file = match self.file_store.get_file_by_path(relative_path).await? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+
+        let view = self.build_file_view(file).await?;
+        Ok(Some(view))
+    }
+
+    /// List queued transfers for a destination.
+    pub async fn pending(&self, dest: &LocationId) -> Result<Vec<Transfer>, SyncError> {
+        self.transfer_store.queued_transfers(dest).await
+    }
+
+    /// List all tracked files.
+    pub async fn list(
+        &self,
+        filter: Option<FileType>,
+        limit: Option<usize>,
+    ) -> Result<Vec<TrackedFile>, SyncError> {
+        self.file_store.list_files(filter, limit).await
+    }
+
+    /// List failed transfers.
+    pub async fn errors(&self) -> Result<Vec<Transfer>, SyncError> {
+        self.transfer_store.failed_transfers().await
+    }
+
+    /// Register a remote endpoint in the store.
+    pub async fn register_remote(&self, config: &RemoteConfig) -> Result<(), SyncError> {
+        self.remote_store.register_remote(config).await
+    }
+
+    /// Remove a remote endpoint from the store and all associated routes.
+    pub async fn remove_remote(&mut self, location: &LocationId) -> Result<(), SyncError> {
+        self.remote_store.remove_remote(location).await?;
+        self.engine.remove_routes_for(location);
+        Ok(())
+    }
+
+    /// List registered remotes.
+    pub async fn list_remotes(&self) -> Result<Vec<RemoteConfig>, SyncError> {
+        self.remote_store.list_remotes().await
+    }
+
+    /// Register a location: persist remote config + add routes atomically.
+    pub async fn register_location(
+        &mut self,
+        config: &RemoteConfig,
+        routes: Vec<TransferRoute>,
+    ) -> Result<(), SyncError> {
+        self.remote_store.register_remote(config).await?;
+        for route in routes {
+            self.engine.add_route(route);
+        }
+        Ok(())
     }
 
     // =========================================================================
     // Infrastructure helpers
     // =========================================================================
+
+    /// Retry failed transfers that are retryable per the retry policy.
+    ///
+    /// Creates new Queued transfers for each Failed transfer that:
+    /// - Has a Transient error kind
+    /// - Has not exceeded max_attempts
+    ///
+    /// Returns the number of transfers retried.
+    async fn retry_failed(&self) -> Result<usize, SyncError> {
+        let failed = self.transfer_store.failed_transfers().await?;
+        let mut retried = 0usize;
+
+        for t in &failed {
+            if t.is_retryable(&self.retry_policy) {
+                let new_transfer = t.retry()?;
+                self.transfer_store.insert_transfer(&new_transfer).await?;
+                retried += 1;
+            }
+        }
+
+        Ok(retried)
+    }
 
     /// Assert that a file exists, returning a typed error.
     async fn assert_file_exists(&self, path: &Path) -> Result<(), SyncError> {
@@ -357,188 +618,164 @@ impl SyncService {
         Ok((hash_result, file_size))
     }
 
-    // =========================================================================
-    // Detailed operations
-    // =========================================================================
-
-    /// Register a file in the sync store (idempotent by relative_path).
-    pub async fn register(
+    /// Create Transfer objects for all direct routes from `origin`.
+    ///
+    /// For chain routing (local→cloud→pod): only creates the direct
+    /// Transfer (local→cloud). Next-hop (cloud→pod) is created by
+    /// TransferEngine on completion.
+    async fn create_transfers_from(
         &self,
-        relative_path: &str,
-        file_type: FileType,
-        opts: RegisterOpts,
-    ) -> Result<RegisterResult, SyncError> {
-        // Check existing by path
-        if let Some(mut existing) = self.store.get_by_path(relative_path).await? {
-            existing.update_metadata(
-                file_type,
-                opts.file_hash,
-                opts.content_hash,
-                opts.file_size,
-                opts.gen_id,
-            );
-            self.store.update_entry(&existing).await?;
-            return Ok(RegisterResult::Updated(existing));
+        file: &TrackedFile,
+        origin: &LocationId,
+    ) -> Result<usize, SyncError> {
+        let graph = self.engine.graph();
+        let direct_dests = graph.direct_from(origin);
+        let mut created = 0usize;
+
+        for dest in direct_dests {
+            if self.engine.find_route(origin, dest).is_some() {
+                let transfer = Transfer::new(file.id().to_string(), origin.clone(), dest.clone())?;
+                self.transfer_store.insert_transfer(&transfer).await?;
+                created += 1;
+            }
         }
 
-        // Check for duplicate by hash
-        if let Some(dup) = self
-            .store
-            .find_duplicate(&opts.file_hash, opts.content_hash.as_deref(), relative_path)
-            .await?
-        {
-            return Ok(RegisterResult::Duplicate {
-                duplicate_of: dup.relative_path.clone(),
-                existing: dup,
+        Ok(created)
+    }
+
+    /// Build a FileView from a TrackedFile by querying latest Transfers.
+    async fn build_file_view(&self, file: TrackedFile) -> Result<FileView, SyncError> {
+        let transfers = self
+            .transfer_store
+            .latest_transfers_by_file(file.id())
+            .await?;
+
+        let mut presences = Vec::new();
+        let mut seen_sources = std::collections::HashSet::new();
+
+        for t in &transfers {
+            // Source location is implicitly Present
+            if seen_sources.insert(t.src().clone()) {
+                presences.push(PresenceView {
+                    location: t.src().clone(),
+                    state: PresenceState::Present,
+                    error: None,
+                    synced_at: None,
+                    attempt: 0,
+                });
+            }
+
+            // Dest location state from Transfer + RetryPolicy
+            presences.push(PresenceView {
+                location: t.dest().clone(),
+                state: PresenceState::from_transfer(t, &self.retry_policy),
+                error: t.error().map(|s| s.to_string()),
+                synced_at: t
+                    .finished_at()
+                    .filter(|_| t.state() == TransferState::Completed),
+                attempt: t.attempt(),
             });
         }
 
-        // New entry
-        let entry = SyncEntry::with_locations(
-            relative_path.to_string(),
-            file_type,
-            opts.file_hash,
-            opts.content_hash,
-            opts.file_size,
-            opts.gen_id,
-            opts.initial_locations,
-        );
-        self.store.insert_entry(&entry).await?;
-        Ok(RegisterResult::Created(entry))
+        Ok(FileView { file, presences })
+    }
+}
+
+// =============================================================================
+// SyncServiceBuilder
+// =============================================================================
+
+/// Builder for [`SyncService`] with automatic remote registration.
+///
+/// Collects routes and remote configs, then builds the service in one step.
+/// Remote configs are registered in the store during `build()`.
+pub struct SyncServiceBuilder {
+    file_store: Arc<dyn FileStore>,
+    transfer_store: Arc<dyn TransferStore>,
+    remote_store: Arc<dyn RemoteStore>,
+    routes: Vec<TransferRoute>,
+    remotes: Vec<RemoteConfig>,
+    hasher: Option<Arc<dyn ContentHasher>>,
+    retry_policy: Option<RetryPolicy>,
+}
+
+impl SyncServiceBuilder {
+    /// Start building a SyncService with the given stores.
+    pub fn new(
+        file_store: Arc<dyn FileStore>,
+        transfer_store: Arc<dyn TransferStore>,
+        remote_store: Arc<dyn RemoteStore>,
+    ) -> Self {
+        Self {
+            file_store,
+            transfer_store,
+            remote_store,
+            routes: Vec::new(),
+            remotes: Vec::new(),
+            hasher: None,
+            retry_policy: None,
+        }
     }
 
-    /// Pull a file from a remote location to local.
-    ///
-    /// Requires a route registered from `src` → `local`.
-    /// The route's `src_file_root` is used as the remote path root.
-    ///
-    /// # Route registration for pull
-    ///
-    /// ```ignore
-    /// // Push route: local → cloud
-    /// TransferRoute::new(local, cloud, local_dir, "vdsl/output", backend)
-    /// // Pull route: cloud → local (explicit reverse)
-    /// TransferRoute::new(cloud, local, "vdsl/output", "", backend)
-    /// ```
-    pub async fn pull_file(&self, src: &LocationId, relative_path: &str) -> Result<(), SyncError> {
-        let local = LocationId::local();
+    /// Add a transfer route.
+    pub fn route(mut self, route: TransferRoute) -> Self {
+        self.routes.push(route);
+        self
+    }
 
-        let route =
-            self.engine
-                .find_route(src, &local)
-                .ok_or_else(|| SyncError::NoRouteAvailable {
-                    src: src.to_string(),
-                    dest: local.to_string(),
-                    path: relative_path.to_string(),
-                })?;
+    /// Add multiple transfer routes.
+    pub fn routes(mut self, routes: impl IntoIterator<Item = TransferRoute>) -> Self {
+        self.routes.extend(routes);
+        self
+    }
 
-        // remote_path = src_file_root / relative_path
-        let remote_path = TransferRoute::safe_join(route.src_file_root(), relative_path);
-        let local_path = TransferRoute::safe_join(route.dest_file_root(), relative_path);
+    /// Register a remote endpoint (persisted to store on `build()`).
+    pub fn remote(mut self, config: RemoteConfig) -> Self {
+        self.remotes.push(config);
+        self
+    }
 
-        // Ensure parent directory exists
-        if let Some(parent) = local_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+    /// Set a custom content hasher (default: Djb2Hasher).
+    pub fn hasher(mut self, hasher: Arc<dyn ContentHasher>) -> Self {
+        self.hasher = Some(hasher);
+        self
+    }
+
+    /// Set a custom retry policy (default: 3 attempts).
+    pub fn retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = Some(policy);
+        self
+    }
+
+    /// Build the SyncService, registering all remotes in the store.
+    pub async fn build(self) -> Result<SyncService, SyncError> {
+        // Register all remotes (idempotent)
+        for remote in &self.remotes {
+            self.remote_store.register_remote(remote).await?;
         }
 
-        let remote_str = remote_path.to_str().ok_or_else(|| {
-            SyncError::TransferFailed(format!(
-                "remote path contains non-UTF-8: {}",
-                remote_path.to_string_lossy()
-            ))
-        })?;
+        let mut service = if let Some(hasher) = self.hasher {
+            SyncService::with_hasher(
+                self.file_store,
+                self.transfer_store,
+                self.remote_store,
+                self.routes,
+                hasher,
+            )
+        } else {
+            SyncService::new(
+                self.file_store,
+                self.transfer_store,
+                self.remote_store,
+                self.routes,
+            )
+        };
 
-        route.backend().pull(remote_str, &local_path).await?;
-
-        // Auto-register if not tracked, or update state if already tracked
-        match self.store.get_by_path(relative_path).await? {
-            None => {
-                // Compute hash of the pulled file
-                let (hash_result, file_size) = self.inspect_file(&local_path).await?;
-
-                let file_type = local_path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(FileType::from_extension)
-                    .unwrap_or(FileType::Asset);
-
-                let mut locations = HashMap::new();
-                locations.insert(LocationId::local(), LocationState::Present);
-                locations.insert(src.clone(), LocationState::Present);
-
-                let result = self
-                    .register(
-                        relative_path,
-                        file_type,
-                        RegisterOpts {
-                            file_hash: hash_result.file_hash,
-                            content_hash: hash_result.content_hash,
-                            file_size,
-                            gen_id: None,
-                            initial_locations: locations,
-                        },
-                    )
-                    .await?;
-
-                if let RegisterResult::Duplicate { duplicate_of, .. } = result {
-                    return Err(SyncError::Duplicate {
-                        path: relative_path.to_string(),
-                        duplicate_of,
-                    });
-                }
-            }
-            Some(existing) => {
-                self.store
-                    .set_location_state(&existing.id, &LocationId::local(), LocationState::Present)
-                    .await?;
-                self.store
-                    .set_location_state(&existing.id, src, LocationState::Present)
-                    .await?;
-            }
+        if let Some(policy) = self.retry_policy {
+            service.set_retry_policy(policy);
         }
 
-        Ok(())
-    }
-
-    /// Get a single file's sync state by relative path.
-    pub async fn get(&self, relative_path: &str) -> Result<Option<SyncEntry>, SyncError> {
-        self.store.get_by_path(relative_path).await
-    }
-
-    /// List entries pending sync to a destination.
-    pub async fn pending(&self, dest: &LocationId) -> Result<Vec<SyncEntry>, SyncError> {
-        self.store.pending(dest).await
-    }
-
-    /// List all tracked entries.
-    pub async fn list(
-        &self,
-        filter: Option<FileType>,
-        limit: Option<usize>,
-    ) -> Result<Vec<SyncEntry>, SyncError> {
-        self.store.list(filter, limit).await
-    }
-
-    /// List entries with errors.
-    pub async fn errors(&self) -> Result<Vec<SyncEntry>, SyncError> {
-        self.store.errors().await
-    }
-
-    /// Register a remote endpoint in the store.
-    pub async fn register_remote(&self, config: &RemoteConfig) -> Result<(), SyncError> {
-        self.store.register_remote(config).await
-    }
-
-    /// Remove a remote endpoint from the store and all associated routes.
-    pub async fn remove_remote(&mut self, location: &LocationId) -> Result<(), SyncError> {
-        self.store.remove_remote(location).await?;
-        self.engine.remove_routes_for(location);
-        Ok(())
-    }
-
-    /// List registered remotes.
-    pub async fn list_remotes(&self) -> Result<Vec<RemoteConfig>, SyncError> {
-        self.store.list_remotes().await
+        Ok(service)
     }
 }
 
@@ -586,15 +823,17 @@ mod tests {
         let cloud_backend = Arc::new(InMemoryBackend::default());
 
         // Register "cloud" as a remote
-        store
-            .register_remote(&RemoteConfig {
+        RemoteStore::register_remote(
+            &store,
+            &RemoteConfig {
                 location_id: LocationId::new("cloud").unwrap(),
                 backend: "memory".into(),
                 config: serde_json::json!({}),
                 created_at: chrono::Utc::now(),
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
 
         // Create route: local → cloud
         let routes = vec![TransferRoute::new(
@@ -605,7 +844,13 @@ mod tests {
             Box::new(Arc::clone(&cloud_backend)),
         )];
 
-        let service = SyncService::new(Box::new(store), routes);
+        let store = Arc::new(store);
+        let service = SyncService::new(
+            store.clone() as Arc<dyn FileStore>,
+            store.clone() as Arc<dyn TransferStore>,
+            store.clone() as Arc<dyn RemoteStore>,
+            routes,
+        );
         (service, cloud_backend)
     }
 
@@ -615,7 +860,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (service, _backend) = test_service_with_dir(dir.path()).await;
 
-        // Create a temp file (non-PNG, so hash will be None)
         let path = dir.path().join("test.json");
         std::fs::write(&path, b"{}").unwrap();
 
@@ -625,18 +869,19 @@ mod tests {
             .unwrap();
 
         assert!(!result.is_duplicate);
-        assert_eq!(result.entry.file_type, FileType::Recipe);
-        assert_eq!(result.entry.gen_id.as_deref(), Some("gen-1"));
-        assert_eq!(result.entry.relative_path, "test.json");
+        assert_eq!(result.file.file_type(), FileType::Recipe);
+        assert_eq!(result.file.relative_path(), "test.json");
+        assert_eq!(result.transfers_created, 1); // local → cloud
+
+        // Verify via get()
+        let view = service.get("test.json").await.unwrap().unwrap();
         assert_eq!(
-            result.entry.location_state(&LocationId::local()),
-            LocationState::Present
+            view.presence_state(&LocationId::local()),
+            Some(PresenceState::Present)
         );
         assert_eq!(
-            result
-                .entry
-                .location_state(&LocationId::new("cloud").unwrap()),
-            LocationState::Pending
+            view.presence_state(&LocationId::new("cloud").unwrap()),
+            Some(PresenceState::Pending)
         );
     }
 
@@ -682,9 +927,10 @@ mod tests {
             .unwrap();
 
         let cloud = LocationId::new("cloud").unwrap();
-        let batch = service.force(Some(&cloud)).await.unwrap();
-        assert_eq!(batch.pushed, 1);
-        assert_eq!(batch.failed, 0);
+        let result = service.force().await.unwrap();
+        assert_eq!(result.batch.pushed, 1);
+        assert_eq!(result.batch.failed, 0);
+        assert!(result.scan_errors.is_empty());
 
         // Verify backend received the dest_file_root-prefixed path
         let log = backend.log.lock().await;
@@ -696,15 +942,14 @@ mod tests {
             _ => panic!("expected Push op"),
         }
 
-        // Verify state updated
-        let entry = service.get("push.json").await.unwrap().unwrap();
-        assert_eq!(entry.location_state(&cloud), LocationState::Present);
-        assert!(entry.synced_at.is_some());
+        // Verify state via FileView
+        let view = service.get("push.json").await.unwrap().unwrap();
+        assert_eq!(view.presence_state(&cloud), Some(PresenceState::Present));
     }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn force_failure_rollback() {
+    async fn force_failure_records_error() {
         let dir = tempfile::tempdir().unwrap();
         let (service, backend) = test_service_with_dir(dir.path()).await;
 
@@ -719,52 +964,14 @@ mod tests {
         // Set backend to fail
         *backend.fail_next.lock().await = true;
 
-        let cloud = LocationId::new("cloud").unwrap();
-        let batch = service.force(Some(&cloud)).await.unwrap();
-        assert_eq!(batch.failed, 1);
-        assert_eq!(batch.pushed, 0);
+        let result = service.force().await.unwrap();
+        assert_eq!(result.batch.failed, 1);
+        assert_eq!(result.batch.pushed, 0);
 
-        // State should revert to pending, error recorded
-        let entry = service.get("fail.json").await.unwrap().unwrap();
-        assert_eq!(entry.location_state(&cloud), LocationState::Pending);
-        assert!(entry.error.is_some());
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn register_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let (service, _) = test_service_with_dir(dir.path()).await;
-
-        let opts1 = RegisterOpts {
-            file_hash: "hash_idem".into(),
-            content_hash: None,
-            file_size: None,
-            gen_id: None,
-            initial_locations: HashMap::new(),
-        };
-        let r1 = service
-            .register("idem.json", FileType::Asset, opts1)
-            .await
-            .unwrap();
-        assert!(matches!(r1, RegisterResult::Created(_)));
-
-        let opts2 = RegisterOpts {
-            file_hash: "hash_idem".into(),
-            content_hash: None,
-            file_size: None,
-            gen_id: None,
-            initial_locations: HashMap::new(),
-        };
-        let r2 = service
-            .register("idem.json", FileType::Asset, opts2)
-            .await
-            .unwrap();
-        assert!(matches!(r2, RegisterResult::Updated(_)));
-
-        // Only 1 entry in store
-        let all = service.list(None, None).await.unwrap();
-        assert_eq!(all.len(), 1);
+        // Transfer should be Failed
+        let errors = service.errors().await.unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].error().is_some());
     }
 
     #[cfg(feature = "sqlite")]
@@ -784,8 +991,15 @@ mod tests {
 
         let summary = service.status().await.unwrap();
         assert_eq!(summary.total_entries, 2);
+
         let local = summary.locations.get(&LocationId::local()).unwrap();
         assert_eq!(local.present, 2);
+
+        let cloud = summary
+            .locations
+            .get(&LocationId::new("cloud").unwrap())
+            .unwrap();
+        assert_eq!(cloud.pending, 2);
     }
 
     #[cfg(feature = "sqlite")]
@@ -802,239 +1016,6 @@ mod tests {
         assert_eq!(back, abs);
     }
 
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn notify_remote_registers_file() {
-        use crate::infra::shell::mock::{MockFile, MockShell};
-
-        let dir = tempfile::tempdir().unwrap();
-        let shell = MockShell::with_files(vec![(
-            "/workspace/output/gen-pod-001.png",
-            MockFile::new(
-                "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-                2048,
-            ),
-        )]);
-        let (service, _backend) =
-            test_service_with_remote_source(dir.path(), Box::new(shell)).await;
-
-        let pod = LocationId::new("pod").unwrap();
-        let cloud = LocationId::new("cloud").unwrap();
-
-        let result = service
-            .notify_remote(&pod, "gen-pod-001.png", FileType::Image, Some("gen-pod"))
-            .await
-            .unwrap();
-
-        assert!(!result.is_duplicate);
-        assert_eq!(result.entry.relative_path, "gen-pod-001.png");
-        assert_eq!(result.entry.file_type, FileType::Image);
-        assert_eq!(result.entry.gen_id.as_deref(), Some("gen-pod"));
-        // Pod should be Present (origin)
-        assert_eq!(result.entry.location_state(&pod), LocationState::Present);
-        // Cloud should be Pending
-        assert_eq!(result.entry.location_state(&cloud), LocationState::Pending);
-        // file_hash should be sha256
-        assert_eq!(
-            result.entry.file_hash,
-            "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
-        );
-        assert_eq!(result.entry.file_size, Some(2048));
-        // content_hash should be None (remote can't compute PNG semantic hash)
-        assert!(result.entry.content_hash.is_none());
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn notify_remote_file_not_found() {
-        use crate::infra::shell::mock::MockShell;
-
-        let dir = tempfile::tempdir().unwrap();
-        let shell = MockShell::new(Vec::<String>::new());
-        let (service, _) = test_service_with_remote_source(dir.path(), Box::new(shell)).await;
-
-        let pod = LocationId::new("pod").unwrap();
-        let result = service
-            .notify_remote(&pod, "nonexistent.png", FileType::Image, None)
-            .await;
-
-        assert!(matches!(result, Err(SyncError::FileNotFound(_))));
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn notify_remote_then_force_to_cloud() {
-        use crate::infra::shell::mock::{MockFile, MockShell};
-
-        let dir = tempfile::tempdir().unwrap();
-        let shell = MockShell::with_files(vec![(
-            "/workspace/output/gen-mesh-001.png",
-            MockFile::new(
-                "sha256_hash_value_placeholder_0000000000000000000000000000000000",
-                4096,
-            ),
-        )]);
-        let (service, backend) = test_service_with_remote_source(dir.path(), Box::new(shell)).await;
-
-        let pod = LocationId::new("pod").unwrap();
-        let cloud = LocationId::new("cloud").unwrap();
-
-        // Step 1: notify on pod
-        service
-            .notify_remote(&pod, "gen-mesh-001.png", FileType::Image, Some("gen-mesh"))
-            .await
-            .unwrap();
-
-        // Step 2: force to cloud (uses pod→cloud route)
-        let batch = service.force(Some(&cloud)).await.unwrap();
-        assert_eq!(batch.pushed, 1);
-        assert_eq!(batch.failed, 0);
-
-        // Verify backend received correct paths
-        let log = backend.log.lock().await;
-        assert_eq!(log.len(), 1);
-        match &log[0] {
-            crate::infra::backend::memory::Op::Push { remote, .. } => {
-                assert_eq!(remote, "vdsl/output/gen-mesh-001.png");
-            }
-            _ => panic!("expected Push op"),
-        }
-
-        // Both locations should be Present
-        let entry = service.get("gen-mesh-001.png").await.unwrap().unwrap();
-        assert_eq!(entry.location_state(&pod), LocationState::Present);
-        assert_eq!(entry.location_state(&cloud), LocationState::Present);
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn find_route_prefers_local() {
-        let dir = tempfile::tempdir().unwrap();
-        let (service, _) = test_service_with_dir(dir.path()).await;
-
-        // Entry with local=Present
-        let entry = SyncEntry::new(
-            "test.png".to_string(),
-            FileType::Image,
-            "hash".into(),
-            None,
-            None,
-            None,
-            &[LocationId::new("cloud").unwrap()],
-        );
-
-        let cloud = LocationId::new("cloud").unwrap();
-        let route = service.engine().find_route_for_entry(&entry, &cloud);
-        assert!(route.is_some());
-        assert!(route.unwrap().src().is_local());
-    }
-
-    /// Build a service with local→cloud (push) + cloud→local (pull) routes.
-    #[cfg(feature = "sqlite")]
-    async fn test_service_with_pull_route(dir: &Path) -> (SyncService, Arc<InMemoryBackend>) {
-        let store = SqliteSyncStore::open_in_memory().await.unwrap();
-        let cloud_backend = Arc::new(InMemoryBackend::default());
-
-        store
-            .register_remote(&RemoteConfig {
-                location_id: LocationId::new("cloud").unwrap(),
-                backend: "memory".into(),
-                config: serde_json::json!({}),
-                created_at: chrono::Utc::now(),
-            })
-            .await
-            .unwrap();
-
-        let routes = vec![
-            // Push: local → cloud
-            TransferRoute::new(
-                LocationId::local(),
-                LocationId::new("cloud").unwrap(),
-                dir.to_path_buf(),
-                PathBuf::from("remote/output"),
-                Box::new(Arc::clone(&cloud_backend)),
-            ),
-            // Pull: cloud → local (reverse route)
-            TransferRoute::new(
-                LocationId::new("cloud").unwrap(),
-                LocationId::local(),
-                PathBuf::from("remote/output"),
-                dir.to_path_buf(),
-                Box::new(Arc::clone(&cloud_backend)),
-            ),
-        ];
-
-        let service = SyncService::new(Box::new(store), routes);
-        (service, cloud_backend)
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn pull_file_uses_reverse_route() {
-        let dir = tempfile::tempdir().unwrap();
-        let (service, backend) = test_service_with_pull_route(dir.path()).await;
-
-        // Pre-register the file as existing on cloud, pending on local
-        let cloud = LocationId::new("cloud").unwrap();
-        let mut locations = HashMap::new();
-        locations.insert(cloud.clone(), LocationState::Present);
-        locations.insert(LocationId::local(), LocationState::Pending);
-
-        let opts = RegisterOpts {
-            file_hash: "hash_pull".into(),
-            content_hash: None,
-            file_size: Some(512),
-            gen_id: None,
-            initial_locations: locations,
-        };
-        service
-            .register("pull-me.json", FileType::Asset, opts)
-            .await
-            .unwrap();
-
-        // Pull from cloud to local
-        let result = service.pull_file(&cloud, "pull-me.json").await;
-        assert!(result.is_ok(), "pull_file should succeed: {result:?}");
-
-        // Verify backend received correct remote path
-        let log = backend.log.lock().await;
-        let pull_ops: Vec<_> = log
-            .iter()
-            .filter(|op| matches!(op, crate::infra::backend::memory::Op::Pull { .. }))
-            .collect();
-        assert_eq!(pull_ops.len(), 1);
-        match pull_ops[0] {
-            crate::infra::backend::memory::Op::Pull { remote, local } => {
-                assert_eq!(remote, "remote/output/pull-me.json");
-                assert!(
-                    local.ends_with("pull-me.json"),
-                    "local path should end with filename: {local}"
-                );
-            }
-            _ => panic!("expected Pull op"),
-        }
-
-        // Both locations should be Present
-        let entry = service.get("pull-me.json").await.unwrap().unwrap();
-        assert_eq!(entry.location_state(&cloud), LocationState::Present);
-        assert_eq!(
-            entry.location_state(&LocationId::local()),
-            LocationState::Present
-        );
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn pull_file_no_route_returns_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let (service, _) = test_service_with_dir(dir.path()).await;
-
-        // test_service_with_dir only has local→cloud, no cloud→local
-        let cloud = LocationId::new("cloud").unwrap();
-        let result = service.pull_file(&cloud, "no-route.json").await;
-        assert!(matches!(result, Err(SyncError::NoRouteAvailable { .. })));
-    }
-
     /// Build a service with pod→cloud route (remote source).
     #[cfg(feature = "sqlite")]
     async fn test_service_with_remote_source(
@@ -1046,15 +1027,17 @@ mod tests {
 
         // Register remotes
         for id in &["pod", "cloud"] {
-            store
-                .register_remote(&RemoteConfig {
+            RemoteStore::register_remote(
+                &store,
+                &RemoteConfig {
                     location_id: LocationId::new(*id).unwrap(),
                     backend: "memory".into(),
                     config: serde_json::json!({}),
                     created_at: chrono::Utc::now(),
-                })
-                .await
-                .unwrap();
+                },
+            )
+            .await
+            .unwrap();
         }
 
         // Route: pod → cloud (remote source with shell)
@@ -1067,7 +1050,13 @@ mod tests {
             mock_shell,
         )];
 
-        let service = SyncService::new(Box::new(store), routes);
+        let store = Arc::new(store);
+        let service = SyncService::new(
+            store.clone() as Arc<dyn FileStore>,
+            store.clone() as Arc<dyn TransferStore>,
+            store.clone() as Arc<dyn RemoteStore>,
+            routes,
+        );
         (service, cloud_backend)
     }
 
@@ -1077,32 +1066,27 @@ mod tests {
         use crate::infra::shell::mock::MockShell;
 
         let dir = tempfile::tempdir().unwrap();
-        // Mock: file exists on pod
         let shell = MockShell::new(vec!["/workspace/output/gen-001.png"]);
         let (service, backend) = test_service_with_remote_source(dir.path(), Box::new(shell)).await;
 
-        // Manually register entry with pod=Present, cloud=Pending
-        let mut locations = HashMap::new();
-        locations.insert(LocationId::new("pod").unwrap(), LocationState::Present);
-        locations.insert(LocationId::new("cloud").unwrap(), LocationState::Pending);
-
-        let opts = RegisterOpts {
-            file_hash: "hash_remote".into(),
-            content_hash: None,
-            file_size: Some(1024),
-            gen_id: None,
-            initial_locations: locations,
-        };
-        service
-            .register("gen-001.png", FileType::Image, opts)
+        // Register file from pod with transfer pod→cloud
+        let file = service
+            .register_file(
+                "gen-001.png".into(),
+                FileType::Image,
+                "hash_remote".into(),
+                None,
+                1024,
+                &LocationId::new("pod").unwrap(),
+            )
             .await
             .unwrap();
+        assert_eq!(file.relative_path(), "gen-001.png");
 
         // Force push to cloud — should use pod→cloud route
-        let cloud = LocationId::new("cloud").unwrap();
-        let batch = service.force(Some(&cloud)).await.unwrap();
-        assert_eq!(batch.pushed, 1);
-        assert_eq!(batch.failed, 0);
+        let result = service.force().await.unwrap();
+        assert_eq!(result.batch.pushed, 1);
+        assert_eq!(result.batch.failed, 0);
 
         // Verify backend received push
         let log = backend.log.lock().await;
@@ -1114,9 +1098,12 @@ mod tests {
             _ => panic!("expected Push op"),
         }
 
-        // Verify state
-        let entry = service.get("gen-001.png").await.unwrap().unwrap();
-        assert_eq!(entry.location_state(&cloud), LocationState::Present);
+        // Verify state via FileView
+        let view = service.get("gen-001.png").await.unwrap().unwrap();
+        assert_eq!(
+            view.presence_state(&LocationId::new("cloud").unwrap()),
+            Some(PresenceState::Present)
+        );
     }
 
     #[cfg(feature = "sqlite")]
@@ -1125,65 +1112,29 @@ mod tests {
         use crate::infra::shell::mock::MockShell;
 
         let dir = tempfile::tempdir().unwrap();
-        // Mock: file does NOT exist on pod
         let shell = MockShell::new(Vec::<String>::new());
         let (service, _backend) =
             test_service_with_remote_source(dir.path(), Box::new(shell)).await;
 
-        // Register entry with pod=Present, cloud=Pending
-        let mut locations = HashMap::new();
-        locations.insert(LocationId::new("pod").unwrap(), LocationState::Present);
-        locations.insert(LocationId::new("cloud").unwrap(), LocationState::Pending);
-
-        let opts = RegisterOpts {
-            file_hash: "hash_missing".into(),
-            content_hash: None,
-            file_size: Some(512),
-            gen_id: None,
-            initial_locations: locations,
-        };
+        // Register file from pod with transfer pod→cloud
         service
-            .register("missing.png", FileType::Image, opts)
+            .register_file(
+                "missing.png".into(),
+                FileType::Image,
+                "hash_missing".into(),
+                None,
+                512,
+                &LocationId::new("pod").unwrap(),
+            )
             .await
             .unwrap();
 
         // Force push — file not found on pod, should fail
-        let cloud = LocationId::new("cloud").unwrap();
-        let batch = service.force(Some(&cloud)).await.unwrap();
-        assert_eq!(batch.pushed, 0);
-        assert_eq!(batch.failed, 1);
-        assert!(batch.errors[0].1.contains("source file not found"));
-
-        // Pod should be marked Absent
-        let entry = service.get("missing.png").await.unwrap().unwrap();
-        assert_eq!(
-            entry.location_state(&LocationId::new("pod").unwrap()),
-            LocationState::Absent
-        );
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn find_route_returns_none_when_no_match() {
-        let dir = tempfile::tempdir().unwrap();
-        let (service, _) = test_service_with_dir(dir.path()).await;
-
-        // Entry with only "nas" present — no route from nas → cloud
-        let entry = SyncEntry::with_locations(
-            "test.png".to_string(),
-            FileType::Image,
-            "hash".into(),
-            None,
-            None,
-            None,
-            HashMap::from([
-                (LocationId::new("nas").unwrap(), LocationState::Present),
-                (LocationId::new("cloud").unwrap(), LocationState::Pending),
-            ]),
-        );
-
-        let cloud = LocationId::new("cloud").unwrap();
-        let route = service.engine().find_route_for_entry(&entry, &cloud);
-        assert!(route.is_none());
+        let result = service.force().await.unwrap();
+        assert_eq!(result.batch.pushed, 0);
+        assert_eq!(result.batch.failed, 1);
+        assert!(result.batch.errors[0]
+            .error
+            .contains("source file not found"));
     }
 }

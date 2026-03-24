@@ -1697,9 +1697,9 @@ impl VdslMcpServer {
         let mut needs_create = is_ephemeral;
 
         if !is_ephemeral {
-            let vol_id = volume_id
-                .as_deref()
-                .expect("volume_id resolved for non-ephemeral");
+            let vol_id = volume_id.as_deref().ok_or_else(|| {
+                McpError::internal_error("volume_id missing for non-ephemeral pod", None)
+            })?;
             let pods = svc.list_pods().await.map_err(Self::to_mcp_error)?;
             let candidate = pods.iter().find(|p| {
                 let name_match = p["name"].as_str() == Some(COMFY_DEFAULTS_NAME);
@@ -4644,7 +4644,8 @@ async fn build_sync_service(
     use crate::infra::runpod_cli::RunPodCli;
     use vdsl_sync::infra::rclone::RcloneBackend;
     use vdsl_sync::infra::sqlite::SqliteSyncStore;
-    use vdsl_sync::{LocationId, SyncService, SyncStore, TransferRoute};
+    use vdsl_sync::infra::store::RemoteConfig;
+    use vdsl_sync::{LocationId, SyncServiceBuilder, TransferRoute};
 
     // Resolve B2 credentials
     let key_id = std::env::var("VDSL_B2_KEY_ID")
@@ -4674,117 +4675,121 @@ async fn build_sync_service(
         }
     };
 
-    // Build RcloneBackend for cloud (B2)
     let rclone_remote = format!(":b2,account={key_id},key={key}:{bucket}");
-
     let cloud_id = LocationId::new("cloud").ok()?;
 
-    // Register cloud remote in store (idempotent)
-    let remote_cfg = vdsl_sync::infra::store::RemoteConfig {
+    // Build via SyncServiceBuilder — remote registration is automatic on build()
+    let store = std::sync::Arc::new(store);
+    let mut builder = SyncServiceBuilder::new(
+        store.clone() as std::sync::Arc<dyn vdsl_sync::FileStore>,
+        store.clone() as std::sync::Arc<dyn vdsl_sync::TransferStore>,
+        store.clone() as std::sync::Arc<dyn vdsl_sync::RemoteStore>,
+    )
+    .remote(RemoteConfig {
         location_id: cloud_id.clone(),
         backend: "rclone".into(),
         config: serde_json::json!({}),
         created_at: chrono::Utc::now(),
-    };
-    if let Err(e) = store.register_remote(&remote_cfg).await {
-        let _ = e;
-    }
+    })
+    .route(TransferRoute::new(
+        LocationId::local(),
+        cloud_id.clone(),
+        work_dir.to_path_buf(),
+        std::path::PathBuf::from("vdsl/output"),
+        Box::new(RcloneBackend::new(&rclone_remote)),
+    ))
+    .route(TransferRoute::pull(
+        cloud_id.clone(),
+        LocationId::local(),
+        std::path::PathBuf::from("vdsl/output"),
+        work_dir.to_path_buf(),
+        Box::new(RcloneBackend::new(&rclone_remote)),
+    ));
 
-    let mut routes = vec![
-        // Route 1: local → cloud (push via local rclone)
-        TransferRoute::new(
-            LocationId::local(),
-            cloud_id.clone(),
-            work_dir.to_path_buf(),
-            std::path::PathBuf::from("vdsl/output"),
-            Box::new(RcloneBackend::new(&rclone_remote)),
-        ),
-        // Route 2: cloud → local (pull via local rclone)
-        TransferRoute::new(
-            cloud_id.clone(),
-            LocationId::local(),
-            std::path::PathBuf::from("vdsl/output"),
-            work_dir.to_path_buf(),
-            Box::new(RcloneBackend::new(&rclone_remote)),
-        ),
-    ];
-
-    // --- Pod routes (when pod_id is available) ---
+    // Pod routes (when pod_id is available)
     if let Some(pid) = pod_id {
         if let Ok(api_key) = resolve_api_key() {
             let pod_id_owned = pid.to_string();
             let ssh_key = Some(resolve_ssh_key(None));
 
-            let pod_loc = match LocationId::new("pod") {
-                Ok(id) => id,
-                Err(_) => {
-                    eprintln!("[WARN] sync: failed to create pod LocationId");
-                    let service = SyncService::new(Box::new(store), routes);
-                    eprintln!(
-                        "[INFO] sync: SyncService initialized (cloud=B2, db={})",
-                        db_path.display()
-                    );
-                    return Some(Arc::new(service));
-                }
-            };
+            if let Ok(pod_loc) = LocationId::new("pod") {
+                let pod_output_root = std::path::PathBuf::from(format!("{}/output", *COMFYUI_BASE));
 
-            // Register pod remote in store (idempotent)
-            let pod_cfg = vdsl_sync::infra::store::RemoteConfig {
-                location_id: pod_loc.clone(),
-                backend: "rclone".into(),
-                config: serde_json::json!({"pod_id": pod_id_owned}),
-                created_at: chrono::Utc::now(),
-            };
-            if let Err(e) = store.register_remote(&pod_cfg).await {
-                let _ = e;
+                // pod→cloud: push from Pod filesystem to B2 (rclone runs on Pod)
+                let pod_shell_for_push_rclone = RunPodCliShell::new(
+                    RunPodCli::new(api_key.clone()),
+                    pod_id_owned.clone(),
+                    ssh_key.clone(),
+                );
+                let pod_shell_for_push_inspect = RunPodCliShell::new(
+                    RunPodCli::new(api_key.clone()),
+                    pod_id_owned.clone(),
+                    ssh_key.clone(),
+                );
+
+                // cloud→pod: pull from B2 to Pod filesystem (rclone runs on Pod)
+                let pod_shell_for_pull_rclone = RunPodCliShell::new(
+                    RunPodCli::new(api_key.clone()),
+                    pod_id_owned.clone(),
+                    ssh_key.clone(),
+                );
+
+                builder = builder
+                    .remote(RemoteConfig {
+                        location_id: pod_loc.clone(),
+                        backend: "rclone".into(),
+                        config: serde_json::json!({"pod_id": pod_id_owned}),
+                        created_at: chrono::Utc::now(),
+                    })
+                    // pod→cloud (push direction)
+                    .route(TransferRoute::with_src_shell(
+                        pod_loc.clone(),
+                        cloud_id.clone(),
+                        pod_output_root.clone(),
+                        std::path::PathBuf::from("vdsl/output"),
+                        Box::new(RcloneBackend::with_shell(
+                            &rclone_remote,
+                            Box::new(pod_shell_for_push_rclone),
+                        )),
+                        Box::new(pod_shell_for_push_inspect),
+                    ))
+                    // cloud→pod (pull direction: B2 → Pod filesystem)
+                    .route(TransferRoute::pull(
+                        cloud_id,
+                        pod_loc,
+                        std::path::PathBuf::from("vdsl/output"),
+                        pod_output_root,
+                        Box::new(RcloneBackend::with_shell(
+                            &rclone_remote,
+                            Box::new(pod_shell_for_pull_rclone),
+                        )),
+                    ));
+
+                eprintln!("[INFO] sync: pod routes added (pod_id={pod_id_owned})");
+            } else {
+                eprintln!("[WARN] sync: failed to create pod LocationId");
             }
-
-            let pod_output_root = std::path::PathBuf::from(format!("{}/output", *COMFYUI_BASE));
-
-            // Route 3: pod → cloud (Pod上のrcloneで直接B2にpush)
-            let pod_shell_for_rclone = RunPodCliShell::new(
-                RunPodCli::new(api_key.clone()),
-                pod_id_owned.clone(),
-                ssh_key.clone(),
-            );
-            let pod_shell_for_inspect = RunPodCliShell::new(
-                RunPodCli::new(api_key.clone()),
-                pod_id_owned.clone(),
-                ssh_key.clone(),
-            );
-            routes.push(TransferRoute::with_src_shell(
-                pod_loc.clone(),
-                cloud_id,
-                pod_output_root.clone(),
-                std::path::PathBuf::from("vdsl/output"),
-                Box::new(RcloneBackend::with_shell(
-                    &rclone_remote,
-                    Box::new(pod_shell_for_rclone),
-                )),
-                Box::new(pod_shell_for_inspect),
-            ));
-
-            // Route 4: local → pod (push via local rclone to pod sftp)
-            // Note: This requires pod sftp access. Using pod_exec + rclone
-            // on the pod side to pull from B2 is more reliable for large files.
-            // For now, local→pod is covered by local→cloud→pod chain.
-
-            eprintln!("[INFO] sync: pod routes added (pod_id={pod_id_owned})",);
         }
     }
 
-    let service = SyncService::new(Box::new(store), routes);
-    eprintln!(
-        "[INFO] sync: SyncService initialized (cloud=B2, routes={}, db={})",
-        if pod_id.is_some() {
-            "local↔cloud+pod→cloud"
-        } else {
-            "local↔cloud"
-        },
-        db_path.display()
-    );
-
-    Some(Arc::new(service))
+    match builder.build().await {
+        Ok(service) => {
+            eprintln!(
+                "[INFO] sync: SyncService initialized (cloud=B2, routes={}, db={})",
+                if pod_id.is_some() {
+                    "local↔cloud+pod↔cloud"
+                } else {
+                    "local↔cloud"
+                },
+                db_path.display()
+            );
+            Some(Arc::new(service))
+        }
+        Err(e) => {
+            eprintln!("[WARN] sync: SyncService build failed: {e}");
+            None
+        }
+    }
 }
 
 /// Parse lua CLI args into code string for mlua execution.

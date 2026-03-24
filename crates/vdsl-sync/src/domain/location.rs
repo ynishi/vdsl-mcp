@@ -1,4 +1,4 @@
-//! Location identifiers and per-location sync state.
+//! Location identifiers and per-location sync summary.
 //!
 //! Locations are string-based for N-remote extensibility.
 //! "local" is reserved as the origin location (developer machine).
@@ -83,67 +83,6 @@ impl std::str::FromStr for LocationId {
 }
 
 // =============================================================================
-// LocationState
-// =============================================================================
-
-/// Sync state of a file at a specific location.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LocationState {
-    /// File confirmed present at this location.
-    Present,
-    /// File needs to be synced to this location.
-    Pending,
-    /// Transfer in progress.
-    Syncing,
-    /// State not yet determined.
-    Unknown,
-    /// File confirmed absent at this location.
-    Absent,
-}
-
-impl LocationState {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Present => "present",
-            Self::Pending => "pending",
-            Self::Syncing => "syncing",
-            Self::Unknown => "unknown",
-            Self::Absent => "absent",
-        }
-    }
-
-    /// Whether this state indicates the file needs sync action.
-    ///
-    /// `Unknown` is treated as needing sync because unverified locations
-    /// should be resolved by attempting a push (fail-safe: sync rather than skip).
-    pub fn needs_sync(&self) -> bool {
-        matches!(self, Self::Pending | Self::Unknown)
-    }
-}
-
-impl fmt::Display for LocationState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for LocationState {
-    type Err = SyncError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "present" => Ok(Self::Present),
-            "pending" => Ok(Self::Pending),
-            "syncing" => Ok(Self::Syncing),
-            "unknown" => Ok(Self::Unknown),
-            "absent" => Ok(Self::Absent),
-            other => Err(SyncError::InvalidLocationState(other.to_string())),
-        }
-    }
-}
-
-// =============================================================================
 // LocationSummary / SyncSummary
 // =============================================================================
 
@@ -153,7 +92,7 @@ pub struct LocationSummary {
     pub present: usize,
     pub pending: usize,
     pub syncing: usize,
-    pub unknown: usize,
+    pub failed: usize,
     pub absent: usize,
 }
 
@@ -162,18 +101,8 @@ impl LocationSummary {
         self.present
             .saturating_add(self.pending)
             .saturating_add(self.syncing)
-            .saturating_add(self.unknown)
+            .saturating_add(self.failed)
             .saturating_add(self.absent)
-    }
-
-    pub fn increment(&mut self, state: LocationState) {
-        match state {
-            LocationState::Present => self.present = self.present.saturating_add(1),
-            LocationState::Pending => self.pending = self.pending.saturating_add(1),
-            LocationState::Syncing => self.syncing = self.syncing.saturating_add(1),
-            LocationState::Unknown => self.unknown = self.unknown.saturating_add(1),
-            LocationState::Absent => self.absent = self.absent.saturating_add(1),
-        }
     }
 }
 
@@ -183,6 +112,14 @@ pub struct SyncSummary {
     pub locations: HashMap<LocationId, LocationSummary>,
     pub total_entries: usize,
     pub total_errors: usize,
+}
+
+impl SyncSummary {
+    /// Serialize to [`serde_json::Value`] for cross-boundary transport.
+    pub fn to_value(&self) -> Result<serde_json::Value, SyncError> {
+        serde_json::to_value(self)
+            .map_err(|e| SyncError::Serialization(format!("SyncSummary: {e}")))
+    }
 }
 
 // =============================================================================
@@ -225,41 +162,6 @@ mod tests {
     fn location_id_non_local() {
         let loc = LocationId::new("pod").unwrap();
         assert!(!loc.is_local());
-    }
-
-    #[test]
-    fn location_state_roundtrip() {
-        for state in [
-            LocationState::Present,
-            LocationState::Pending,
-            LocationState::Syncing,
-            LocationState::Unknown,
-            LocationState::Absent,
-        ] {
-            let s = state.as_str();
-            let parsed: LocationState = s.parse().expect("should parse");
-            assert_eq!(parsed, state);
-        }
-    }
-
-    #[test]
-    fn location_state_needs_sync() {
-        assert!(LocationState::Pending.needs_sync());
-        assert!(LocationState::Unknown.needs_sync());
-        assert!(!LocationState::Present.needs_sync());
-        assert!(!LocationState::Syncing.needs_sync());
-        assert!(!LocationState::Absent.needs_sync());
-    }
-
-    #[test]
-    fn location_summary_increment() {
-        let mut s = LocationSummary::default();
-        s.increment(LocationState::Present);
-        s.increment(LocationState::Present);
-        s.increment(LocationState::Pending);
-        assert_eq!(s.present, 2);
-        assert_eq!(s.pending, 1);
-        assert_eq!(s.total(), 3);
     }
 
     #[test]

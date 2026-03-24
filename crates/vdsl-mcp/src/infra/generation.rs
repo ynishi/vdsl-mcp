@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use vdsl_sync::{FileType, SyncEntry, SyncError, SyncService};
+use vdsl_sync::{FileType, SyncError, SyncService, TrackedFile};
 
 /// Register a generation's output files (by absolute paths).
 ///
@@ -20,13 +20,13 @@ pub async fn register_generation(
     gen_id: &str,
     output: &str,
     recipe: Option<&str>,
-) -> Result<Vec<SyncEntry>, SyncError> {
+) -> Result<Vec<TrackedFile>, SyncError> {
     let mut entries = Vec::new();
 
     match check_file_exists(Path::new(output)).await {
         Ok(()) => {
             let result = svc.notify(output, FileType::Image, Some(gen_id)).await?;
-            entries.push(result.entry);
+            entries.push(result.file);
         }
         Err(SyncError::FileNotFound(_)) => {
             eprintln!("[WARN] output file not found, skipping: {output}");
@@ -40,7 +40,7 @@ pub async fn register_generation(
                 let result = svc
                     .notify(recipe_path, FileType::Recipe, Some(gen_id))
                     .await?;
-                entries.push(result.entry);
+                entries.push(result.file);
             }
             Err(SyncError::FileNotFound(_)) => {
                 eprintln!("[WARN] recipe file not found, skipping: {recipe_path}");

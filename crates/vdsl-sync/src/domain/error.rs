@@ -11,8 +11,11 @@ pub enum SyncError {
     #[error("invalid location: {0}")]
     InvalidLocation(String),
 
-    #[error("invalid location state: {0}")]
-    InvalidLocationState(String),
+    #[error("invalid transfer state: {0}")]
+    InvalidTransferState(String),
+
+    #[error("invalid state transition: {from} → {to}")]
+    InvalidStateTransition { from: String, to: String },
 
     #[error("file not found: {}", .0.display())]
     FileNotFound(PathBuf),
@@ -44,6 +47,12 @@ pub enum SyncError {
 
     #[error("hash computation failed: {0}")]
     Hash(String),
+
+    #[error("serialization error: {0}")]
+    Serialization(String),
+
+    #[error("validation error: {field} — {reason}")]
+    Validation { field: String, reason: String },
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

@@ -1,16 +1,16 @@
-//! E2E test: local <-> pod <-> cloud three-location synchronization.
+//! E2E test: local → pod, local → cloud three-location synchronization.
 //!
 //! Verifies the complete sync lifecycle with route-based transfer:
 //!
-//! 1. **notify** — register a local file, all remotes become `pending`
-//! 2. **force(pod)** — push to pod via local→pod route, pod becomes `present`
-//! 3. **force(cloud)** — push to cloud via local→cloud route, cloud becomes `present`
+//! 1. **notify** — register a local file, remotes become `pending`
+//! 2. **force_route(local, pod)** — push to pod, pod becomes `present`
+//! 3. **force_route(local, cloud)** — push to cloud, cloud becomes `present`
 //! 4. **status** — verify all three locations show `present`
 //! 5. **file modification** — re-notify marks remotes as `pending` again
-//! 6. **force(None)** — push to ALL remotes in one call
+//! 6. **force()** — topology-wide push to ALL remotes
 //! 7. **duplicate detection** — same content at different path is detected
 //! 8. **notify output + recipe** — generation registration pattern
-//! 9. **error recovery** — backend failure → state rollback + retry succeeds
+//! 9. **error recovery** — backend failure → retry via RetryPolicy
 //!
 //! Uses InMemoryBackend (no real network). Runs entirely in-process.
 //!
@@ -23,9 +23,12 @@ use std::sync::Arc;
 
 use vdsl_sync::infra::backend::memory::InMemoryBackend;
 use vdsl_sync::infra::backend::StorageBackend;
+use vdsl_sync::infra::remote_store::RemoteStore;
 use vdsl_sync::infra::sqlite::SqliteSyncStore;
 use vdsl_sync::infra::store::RemoteConfig;
-use vdsl_sync::{FileType, LocationId, LocationState, SyncService, SyncStore, TransferRoute};
+use vdsl_sync::{
+    FileStore, FileType, LocationId, PresenceState, SyncService, TransferRoute, TransferStore,
+};
 
 /// Wrapper so `Arc<InMemoryBackend>` implements `StorageBackend`.
 struct SharedBackend(Arc<InMemoryBackend>);
@@ -63,15 +66,17 @@ async fn build_service(
 
     // Register remotes in store
     for id in &["pod", "cloud"] {
-        store
-            .register_remote(&RemoteConfig {
+        RemoteStore::register_remote(
+            &store,
+            &RemoteConfig {
                 location_id: LocationId::new(*id).unwrap(),
                 backend: "memory".into(),
                 config: serde_json::json!({}),
                 created_at: chrono::Utc::now(),
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
     }
 
     // Route-based: local → pod, local → cloud
@@ -92,7 +97,13 @@ async fn build_service(
         ),
     ];
 
-    let service = SyncService::new(Box::new(store), routes);
+    let store = Arc::new(store);
+    let service = SyncService::new(
+        store.clone() as Arc<dyn FileStore>,
+        store.clone() as Arc<dyn TransferStore>,
+        store.clone() as Arc<dyn RemoteStore>,
+        routes,
+    );
     (service, pod_backend, cloud_backend)
 }
 
@@ -127,17 +138,19 @@ fn build_test_png(idat_data: &[u8], text_chunks: &[(&str, &str)]) -> Vec<u8> {
     buf
 }
 
-fn assert_loc(entry: &vdsl_sync::SyncEntry, loc: &str, expected: LocationState) {
+/// Assert a location's presence state via FileView.
+fn assert_presence(view: &vdsl_sync::FileView, loc: &str, expected: PresenceState) {
     let loc_id = if loc == "local" {
         LocationId::local()
     } else {
         LocationId::new(loc).unwrap()
     };
-    let actual = entry.location_state(&loc_id);
+    let actual = view.presence_state(&loc_id);
     assert_eq!(
-        actual, expected,
-        "expected {loc}={expected}, got {loc}={actual} for '{}'",
-        entry.relative_path
+        actual,
+        Some(expected),
+        "expected {loc}={expected}, got {loc}={actual:?} for '{}'",
+        view.file.relative_path()
     );
 }
 
@@ -145,6 +158,9 @@ fn assert_loc(entry: &vdsl_sync::SyncEntry, loc: &str, expected: LocationState) 
 async fn main() {
     let dir = tempfile::tempdir().unwrap();
     let (service, pod_backend, _cloud_backend) = build_service(dir.path()).await;
+
+    let pod_id = LocationId::new("pod").unwrap();
+    let cloud_id = LocationId::new("cloud").unwrap();
 
     // =========================================================================
     // 1. notify — register a local file
@@ -159,24 +175,29 @@ async fn main() {
         .unwrap();
 
     assert!(!result.is_duplicate, "first file should not be duplicate");
-    assert_eq!(result.entry.relative_path, "output/gen-001.png");
-    assert_loc(&result.entry, "local", LocationState::Present);
-    assert_loc(&result.entry, "pod", LocationState::Pending);
-    assert_loc(&result.entry, "cloud", LocationState::Pending);
+    assert_eq!(result.file.relative_path(), "output/gen-001.png");
+    assert_eq!(result.transfers_created, 2); // local→pod, local→cloud
+
+    let view = service.get("output/gen-001.png").await.unwrap().unwrap();
+    assert_presence(&view, "local", PresenceState::Present);
+    assert_presence(&view, "pod", PresenceState::Pending);
+    assert_presence(&view, "cloud", PresenceState::Pending);
     eprintln!("[PASS] 1. notify — local=present, pod=pending, cloud=pending");
 
     // =========================================================================
-    // 2. force(pod) — push to pod only
+    // 2. force_route(local, pod) — push to pod only
     // =========================================================================
-    let pod_id = LocationId::new("pod").unwrap();
-    let batch = service.force(Some(&pod_id)).await.unwrap();
+    let batch = service
+        .force_route(&LocationId::local(), &pod_id)
+        .await
+        .unwrap();
     assert_eq!(batch.pushed, 1, "should push 1 file to pod");
     assert_eq!(batch.failed, 0, "no failures expected");
 
-    let entry = service.get("output/gen-001.png").await.unwrap().unwrap();
-    assert_loc(&entry, "local", LocationState::Present);
-    assert_loc(&entry, "pod", LocationState::Present);
-    assert_loc(&entry, "cloud", LocationState::Pending);
+    let view = service.get("output/gen-001.png").await.unwrap().unwrap();
+    assert_presence(&view, "local", PresenceState::Present);
+    assert_presence(&view, "pod", PresenceState::Present);
+    assert_presence(&view, "cloud", PresenceState::Pending);
 
     // Verify pod backend received correct remote path
     {
@@ -189,20 +210,22 @@ async fn main() {
             other => panic!("expected Push, got {:?}", other),
         }
     }
-    eprintln!("[PASS] 2. force(pod) — pod=present, cloud still pending");
+    eprintln!("[PASS] 2. force_route(local, pod) — pod=present, cloud still pending");
 
     // =========================================================================
-    // 3. force(cloud) — push to cloud
+    // 3. force_route(local, cloud) — push to cloud
     // =========================================================================
-    let cloud_id = LocationId::new("cloud").unwrap();
-    let batch = service.force(Some(&cloud_id)).await.unwrap();
+    let batch = service
+        .force_route(&LocationId::local(), &cloud_id)
+        .await
+        .unwrap();
     assert_eq!(batch.pushed, 1);
 
-    let entry = service.get("output/gen-001.png").await.unwrap().unwrap();
-    assert_loc(&entry, "local", LocationState::Present);
-    assert_loc(&entry, "pod", LocationState::Present);
-    assert_loc(&entry, "cloud", LocationState::Present);
-    eprintln!("[PASS] 3. force(cloud) — all three locations present");
+    let view = service.get("output/gen-001.png").await.unwrap().unwrap();
+    assert_presence(&view, "local", PresenceState::Present);
+    assert_presence(&view, "pod", PresenceState::Present);
+    assert_presence(&view, "cloud", PresenceState::Present);
+    eprintln!("[PASS] 3. force_route(local, cloud) — all three locations present");
 
     // =========================================================================
     // 4. status — verify aggregated summary
@@ -228,23 +251,26 @@ async fn main() {
         .unwrap();
 
     assert!(!result.is_duplicate);
-    assert_loc(&result.entry, "local", LocationState::Present);
-    assert_loc(&result.entry, "pod", LocationState::Pending);
-    assert_loc(&result.entry, "cloud", LocationState::Pending);
+    assert_eq!(result.transfers_created, 2); // new transfers for modified file
+
+    let view = service.get("output/gen-001.png").await.unwrap().unwrap();
+    assert_presence(&view, "local", PresenceState::Present);
+    assert_presence(&view, "pod", PresenceState::Pending);
+    assert_presence(&view, "cloud", PresenceState::Pending);
     eprintln!("[PASS] 5. file modification — remotes back to pending");
 
     // =========================================================================
-    // 6. force(None) — push to ALL remotes
+    // 6. force() — topology-wide trigger, push ALL pending
     // =========================================================================
-    let batch = service.force(None).await.unwrap();
-    assert_eq!(batch.pushed, 2, "should push to both pod and cloud");
-    assert_eq!(batch.failed, 0);
+    let result = service.force().await.unwrap();
+    assert_eq!(result.batch.pushed, 2, "should push to both pod and cloud");
+    assert_eq!(result.batch.failed, 0);
 
-    let entry = service.get("output/gen-001.png").await.unwrap().unwrap();
-    assert_loc(&entry, "local", LocationState::Present);
-    assert_loc(&entry, "pod", LocationState::Present);
-    assert_loc(&entry, "cloud", LocationState::Present);
-    eprintln!("[PASS] 6. force(None) — all remotes synced in one call");
+    let view = service.get("output/gen-001.png").await.unwrap().unwrap();
+    assert_presence(&view, "local", PresenceState::Present);
+    assert_presence(&view, "pod", PresenceState::Present);
+    assert_presence(&view, "cloud", PresenceState::Present);
+    eprintln!("[PASS] 6. force() — all remotes synced via topology trigger");
 
     // =========================================================================
     // 7. duplicate detection — same content, different path
@@ -293,17 +319,20 @@ async fn main() {
         .await
         .unwrap();
 
-    assert_eq!(output_result.entry.file_type, FileType::Image);
-    assert_eq!(recipe_result.entry.file_type, FileType::Recipe);
-    assert_eq!(output_result.entry.gen_id.as_deref(), Some("gen-002"));
-    assert_eq!(recipe_result.entry.gen_id.as_deref(), Some("gen-002"));
+    assert_eq!(output_result.file.file_type(), FileType::Image);
+    assert_eq!(recipe_result.file.file_type(), FileType::Recipe);
+    assert_eq!(output_result.file.embedded_id(), Some("gen-002"));
+    assert_eq!(recipe_result.file.embedded_id(), Some("gen-002"));
     eprintln!("[PASS] 8. notify output + recipe registered");
 
     // =========================================================================
-    // 9. error recovery — backend failure + retry
+    // 9. error recovery — backend failure + retry via RetryPolicy
     // =========================================================================
-    // First, clear all pending files for pod so only gen-003 is pending
-    let batch = service.force(Some(&pod_id)).await.unwrap();
+    // First, sync all pending files to pod so only gen-003 will be pending
+    let batch = service
+        .force_route(&LocationId::local(), &pod_id)
+        .await
+        .unwrap();
     assert_eq!(batch.failed, 0, "pre-cleanup should succeed");
 
     let err_path = dir.path().join("output/gen-003.png");
@@ -314,30 +343,48 @@ async fn main() {
         .await
         .unwrap();
 
-    // Make pod backend fail on next push (only gen-003 is pending)
+    // Make pod backend fail on next push (only gen-003 is pending for pod)
     *pod_backend.fail_next.lock().await = true;
 
-    let batch = service.force(Some(&pod_id)).await.unwrap();
+    let batch = service
+        .force_route(&LocationId::local(), &pod_id)
+        .await
+        .unwrap();
     assert_eq!(batch.failed, 1, "gen-003 should fail");
     assert_eq!(batch.pushed, 0, "nothing should succeed");
 
-    // Verify error is recorded
-    let entry = service.get("output/gen-003.png").await.unwrap().unwrap();
-    assert_loc(&entry, "pod", LocationState::Pending);
-    assert!(entry.error.is_some(), "error should be recorded");
-
-    // Retry — should succeed now (fail_next was auto-reset)
-    let batch = service.force(Some(&pod_id)).await.unwrap();
-    assert_eq!(batch.failed, 0, "retry should succeed");
-    assert_eq!(batch.pushed, 1);
-
-    let entry = service.get("output/gen-003.png").await.unwrap().unwrap();
-    assert_loc(&entry, "pod", LocationState::Present);
-    assert!(
-        entry.error.is_none(),
-        "error should be cleared after success"
+    // Verify error is recorded — Failed + Transient → Pending (retryable)
+    let view = service.get("output/gen-003.png").await.unwrap().unwrap();
+    let pod_presence = view.presence(&pod_id).unwrap();
+    assert_eq!(
+        pod_presence.state,
+        PresenceState::Pending,
+        "transient failure within retry limit → Pending"
     );
-    eprintln!("[PASS] 9. error recovery — failure recorded, retry succeeds");
+    assert!(pod_presence.error.is_some(), "error should be recorded");
+
+    // Verify transfer is in errors list
+    let errors = service.errors().await.unwrap();
+    let gen003_error = errors
+        .iter()
+        .find(|t| t.dest() == &pod_id)
+        .expect("gen-003 should be in errors");
+    assert_eq!(
+        gen003_error.error_kind(),
+        Some(vdsl_sync::TransferErrorKind::Transient)
+    );
+
+    // Retry via force() — calls retry_failed() internally, then executes
+    // (fail_next was auto-reset by InMemoryBackend)
+    let result = service.force().await.unwrap();
+    // gen-003 to pod should be retried + succeed
+    // gen-003 to cloud should also be pushed (was still queued)
+    assert!(result.batch.pushed >= 1, "retry should succeed");
+    assert_eq!(result.batch.failed, 0);
+
+    let view = service.get("output/gen-003.png").await.unwrap().unwrap();
+    assert_presence(&view, "pod", PresenceState::Present);
+    eprintln!("[PASS] 9. error recovery — failure recorded, retry via force() succeeds");
 
     // =========================================================================
     // Final summary
@@ -351,8 +398,8 @@ async fn main() {
     );
     for (loc, s) in &summary.locations {
         eprintln!(
-            "  {loc}: present={}, pending={}, syncing={}, unknown={}, absent={}",
-            s.present, s.pending, s.syncing, s.unknown, s.absent
+            "  {loc}: present={}, pending={}, syncing={}, absent={}",
+            s.present, s.pending, s.syncing, s.absent
         );
     }
     eprintln!();

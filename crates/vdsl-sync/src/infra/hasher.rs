@@ -50,7 +50,16 @@ impl ContentHasher for Djb2Hasher {
         // When adding new formats, update both here and FileType::from_extension.
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let content_hash = if ext.eq_ignore_ascii_case("png") {
-            Some(png_image_hash(path)?)
+            match png_image_hash(path) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    eprintln!(
+                        "[WARN] png content_hash failed for {}: {e} — falling back to file_hash only",
+                        path.display()
+                    );
+                    None
+                }
+            }
         } else {
             None
         };

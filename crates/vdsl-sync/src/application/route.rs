@@ -1,5 +1,9 @@
 //! TransferRoute — directed transfer route between two locations.
 //!
+//! Lives in the application layer because it holds infrastructure types
+//! ([`StorageBackend`], [`RemoteShell`]). The domain layer only knows
+//! about the edge topology via [`RouteGraph`](crate::domain::graph::RouteGraph).
+//!
 //! Encapsulates "how to move a file from src to dest", including
 //! path resolution for both ends and backend delegation.
 
@@ -9,6 +13,23 @@ use crate::domain::error::SyncError;
 use crate::domain::location::LocationId;
 use crate::infra::backend::StorageBackend;
 use crate::infra::shell::RemoteShell;
+
+/// Direction of file transfer relative to the rclone remote.
+///
+/// - `Push`: src is a "local" filesystem path, dest is a rclone remote path.
+///   `backend.push(src_path, dest_path)` → `rclone copyto <local> <remote>`
+///
+/// - `Pull`: src is a rclone remote path, dest is a "local" filesystem path.
+///   `backend.pull(src_path, dest_path)` → `rclone copyto <remote> <local>`
+///
+/// "Local" here means local to the host running rclone — which may be a Pod
+/// if the backend uses a `RemoteShell`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransferDirection {
+    #[default]
+    Push,
+    Pull,
+}
 
 /// A directed transfer route between two locations.
 ///
@@ -43,10 +64,11 @@ pub struct TransferRoute {
     /// Shell for source-side file operations (existence check, hash).
     /// `None` when src is local (use filesystem directly).
     src_shell: Option<Box<dyn RemoteShell>>,
+    direction: TransferDirection,
 }
 
 impl TransferRoute {
-    /// Create a route with no source shell (local source).
+    /// Create a route with no source shell (local source, push direction).
     pub fn new(
         src: LocationId,
         dest: LocationId,
@@ -61,6 +83,32 @@ impl TransferRoute {
             dest_file_root,
             backend,
             src_shell: None,
+            direction: TransferDirection::Push,
+        }
+    }
+
+    /// Create a pull-direction route with no source shell.
+    ///
+    /// Pull direction: `src_file_root` is a rclone remote path prefix,
+    /// `dest_file_root` is a local filesystem path. `backend.pull()` is called
+    /// instead of `push()`.
+    ///
+    /// Use for cloud→local or cloud→pod routes where the rclone remote is the source.
+    pub fn pull(
+        src: LocationId,
+        dest: LocationId,
+        src_file_root: PathBuf,
+        dest_file_root: PathBuf,
+        backend: Box<dyn StorageBackend>,
+    ) -> Self {
+        Self {
+            src,
+            dest,
+            src_file_root,
+            dest_file_root,
+            backend,
+            src_shell: None,
+            direction: TransferDirection::Pull,
         }
     }
 
@@ -83,6 +131,30 @@ impl TransferRoute {
             dest_file_root,
             backend,
             src_shell: Some(src_shell),
+            direction: TransferDirection::Push,
+        }
+    }
+
+    /// Create a pull-direction route with a source shell.
+    ///
+    /// Combines pull direction with remote source inspection.
+    /// Use for `cloud→pod` where rclone runs on Pod and pulls from B2.
+    pub fn pull_with_src_shell(
+        src: LocationId,
+        dest: LocationId,
+        src_file_root: PathBuf,
+        dest_file_root: PathBuf,
+        backend: Box<dyn StorageBackend>,
+        src_shell: Box<dyn RemoteShell>,
+    ) -> Self {
+        Self {
+            src,
+            dest,
+            src_file_root,
+            dest_file_root,
+            backend,
+            src_shell: Some(src_shell),
+            direction: TransferDirection::Pull,
         }
     }
 
@@ -105,21 +177,36 @@ impl TransferRoute {
     /// Transfer a file along this route.
     ///
     /// Resolves both src and dest full paths from the relative path,
-    /// validates against path traversal, then delegates to backend.push().
+    /// validates against path traversal, then delegates to the backend.
+    ///
+    /// - Push direction: `backend.push(src_local_path, dest_remote_str)`
+    /// - Pull direction: `backend.pull(src_remote_str, dest_local_path)`
     pub async fn transfer(&self, relative_path: &str) -> Result<(), SyncError> {
         Self::validate_relative_path(relative_path)?;
 
         let src_path = self.src_file_root.join(relative_path);
         let dest_path = Self::safe_join(&self.dest_file_root, relative_path);
 
-        let dest_str = dest_path.to_str().ok_or_else(|| {
-            SyncError::TransferFailed(format!(
-                "dest path is not valid UTF-8: {}",
-                dest_path.to_string_lossy()
-            ))
-        })?;
-
-        self.backend.push(&src_path, dest_str).await
+        match self.direction {
+            TransferDirection::Push => {
+                let dest_str = dest_path.to_str().ok_or_else(|| {
+                    SyncError::TransferFailed(format!(
+                        "dest path is not valid UTF-8: {}",
+                        dest_path.to_string_lossy()
+                    ))
+                })?;
+                self.backend.push(&src_path, dest_str).await
+            }
+            TransferDirection::Pull => {
+                let src_str = src_path.to_str().ok_or_else(|| {
+                    SyncError::TransferFailed(format!(
+                        "src path is not valid UTF-8: {}",
+                        src_path.to_string_lossy()
+                    ))
+                })?;
+                self.backend.pull(src_str, &dest_path).await
+            }
+        }
     }
 
     /// The backend held by this route (for list/exists/pull operations).

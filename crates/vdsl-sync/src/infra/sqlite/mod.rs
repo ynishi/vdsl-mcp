@@ -1,6 +1,6 @@
-//! SQLite implementation of [`SyncStore`].
+//! SQLite implementation of file/transfer/remote stores.
 //!
-//! Uses normalized schema: `sync_entries` + `sync_locations` + `sync_remotes`.
+//! Uses normalized schema: `tracked_files` + `transfers` + `sync_remotes`.
 //! Designed for single-writer (sync engine), concurrent readers OK.
 //!
 //! Uses `tokio-rusqlite` for non-blocking async access — each connection
@@ -9,22 +9,24 @@
 mod mapping;
 mod schema;
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::params;
 
-use crate::domain::entry::SyncEntry;
 use crate::domain::error::SyncError;
 use crate::domain::file_type::FileType;
-use crate::domain::location::{LocationId, LocationState, LocationSummary, SyncSummary};
-use crate::infra::store::{RemoteConfig, SyncStore};
+use crate::domain::location::LocationId;
+use crate::domain::tracked_file::TrackedFile;
+use crate::domain::transfer::Transfer;
+use crate::infra::file_store::FileStore;
+use crate::infra::remote_store::RemoteStore;
+use crate::infra::store::RemoteConfig;
+use crate::infra::transfer_store::TransferStore;
 
 use mapping::{
-    parse_loc_state, query_entries, row_to_remote_tuple, save_locations, ts_to_string,
-    tuple_to_remote_config,
+    query_tracked_files, query_transfers, row_to_remote_tuple, ts_to_string, tuple_to_remote_config,
 };
 
 /// SQLite-backed sync store.
@@ -80,156 +82,131 @@ fn map_call_err(e: tokio_rusqlite::Error<SyncError>) -> SyncError {
 }
 
 // =============================================================================
-// SyncStore trait implementation
+// FileStore trait implementation
 // =============================================================================
 
 #[async_trait]
-impl SyncStore for SqliteSyncStore {
-    async fn insert_entry(&self, entry: &SyncEntry) -> Result<(), SyncError> {
-        let entry = entry.clone();
+impl FileStore for SqliteSyncStore {
+    async fn upsert_file(&self, file: &TrackedFile) -> Result<(), SyncError> {
+        let file = file.clone();
         self.conn
             .call(move |conn| {
-                let file_size_i64: Option<i64> = entry
-                    .file_size
-                    .map(|v| {
-                        i64::try_from(v).map_err(|_| {
-                            SyncError::Store(format!(
-                                "file_size exceeds i64::MAX: {v} (entry {})",
-                                entry.id
-                            ))
-                        })
-                    })
-                    .transpose()?;
-                let synced_at_str = entry.synced_at.map(ts_to_string);
-                let updated_at_str = ts_to_string(entry.updated_at);
+                let file_size_i64 = i64::try_from(file.file_size()).map_err(|_| {
+                    SyncError::Store(format!(
+                        "file_size exceeds i64::MAX: {} (file {})",
+                        file.file_size(),
+                        file.id()
+                    ))
+                })?;
+                let registered_at_str = ts_to_string(file.registered_at());
+                let updated_at_str = ts_to_string(file.updated_at());
                 conn.execute(
-                    "INSERT INTO sync_entries (id, relative_path, file_type, file_hash, content_hash, file_size, gen_id, error, synced_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO tracked_files (id, relative_path, file_type, file_hash, content_hash, file_size, embedded_id, registered_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT (relative_path) DO UPDATE SET
+                         file_type = excluded.file_type,
+                         file_hash = excluded.file_hash,
+                         content_hash = excluded.content_hash,
+                         file_size = excluded.file_size,
+                         embedded_id = excluded.embedded_id,
+                         updated_at = excluded.updated_at",
                     params![
-                        entry.id,
-                        entry.relative_path,
-                        entry.file_type.as_str(),
-                        entry.file_hash,
-                        entry.content_hash,
+                        file.id(),
+                        file.relative_path(),
+                        file.file_type().as_str(),
+                        file.file_hash(),
+                        file.content_hash(),
                         file_size_i64,
-                        entry.gen_id,
-                        entry.error,
-                        synced_at_str,
+                        file.embedded_id(),
+                        registered_at_str,
                         updated_at_str,
                     ],
                 )
-                .map_err(|e| SyncError::Store(format!("insert failed: {e}")))?;
-
-                save_locations(conn, &entry.id, &entry.locations, &updated_at_str)?;
+                .map_err(|e| SyncError::Store(format!("upsert_file failed: {e}")))?;
                 Ok(())
             })
             .await
             .map_err(map_call_err)
     }
 
-    async fn update_entry(&self, entry: &SyncEntry) -> Result<(), SyncError> {
-        let entry = entry.clone();
+    async fn get_file_by_path(
+        &self,
+        relative_path: &str,
+    ) -> Result<Option<TrackedFile>, SyncError> {
+        let path = relative_path.to_string();
         self.conn
             .call(move |conn| {
-                let file_size_i64: Option<i64> = entry
-                    .file_size
-                    .map(|v| {
-                        i64::try_from(v).map_err(|_| {
-                            SyncError::Store(format!(
-                                "file_size exceeds i64::MAX: {v} (entry {})",
-                                entry.id
-                            ))
-                        })
-                    })
-                    .transpose()?;
-                let synced_at_str = entry.synced_at.map(ts_to_string);
-                let updated_at_str = ts_to_string(entry.updated_at);
-                conn.execute(
-                    "UPDATE sync_entries SET file_type = ?, file_hash = ?, content_hash = ?, file_size = ?, gen_id = ?, error = ?, synced_at = ?, updated_at = ?
-                     WHERE id = ?",
-                    params![
-                        entry.file_type.as_str(),
-                        entry.file_hash,
-                        entry.content_hash,
-                        file_size_i64,
-                        entry.gen_id,
-                        entry.error,
-                        synced_at_str,
-                        updated_at_str,
-                        entry.id,
-                    ],
-                )
-                .map_err(|e| SyncError::Store(format!("update failed: {e}")))?;
-
-                save_locations(conn, &entry.id, &entry.locations, &updated_at_str)?;
-                Ok(())
-            })
-            .await
-            .map_err(map_call_err)
-    }
-
-    async fn get_by_path(&self, path: &str) -> Result<Option<SyncEntry>, SyncError> {
-        let path = path.to_string();
-        self.conn
-            .call(move |conn| {
-                let entries = query_entries(
+                let files = query_tracked_files(
                     conn,
-                    "SELECT * FROM sync_entries WHERE relative_path = ?",
+                    "SELECT * FROM tracked_files WHERE relative_path = ?",
                     &[&path as &dyn rusqlite::types::ToSql],
                 )?;
-                Ok(entries.into_iter().next())
+                Ok(files.into_iter().next())
             })
             .await
             .map_err(map_call_err)
     }
 
-    async fn find_duplicate(
+    async fn get_file_by_id(&self, id: &str) -> Result<Option<TrackedFile>, SyncError> {
+        let id = id.to_string();
+        self.conn
+            .call(move |conn| {
+                let files = query_tracked_files(
+                    conn,
+                    "SELECT * FROM tracked_files WHERE id = ?",
+                    &[&id as &dyn rusqlite::types::ToSql],
+                )?;
+                Ok(files.into_iter().next())
+            })
+            .await
+            .map_err(map_call_err)
+    }
+
+    async fn find_duplicate_file(
         &self,
         file_hash: &str,
         content_hash: Option<&str>,
         exclude_path: &str,
-    ) -> Result<Option<SyncEntry>, SyncError> {
+    ) -> Result<Option<TrackedFile>, SyncError> {
         let file_hash = file_hash.to_string();
         let content_hash = content_hash.map(|s| s.to_string());
         let exclude_path = exclude_path.to_string();
         self.conn
             .call(move |conn| {
-                // Priority 1: content_hash match (semantic duplicate)
                 if let Some(ref ch) = content_hash {
-                    let entries = query_entries(
+                    let files = query_tracked_files(
                         conn,
-                        "SELECT * FROM sync_entries WHERE content_hash = ? AND relative_path != ?",
+                        "SELECT * FROM tracked_files WHERE content_hash = ? AND relative_path != ?",
                         &[
                             ch as &dyn rusqlite::types::ToSql,
                             &exclude_path as &dyn rusqlite::types::ToSql,
                         ],
                     )?;
-                    if let Some(entry) = entries.into_iter().next() {
-                        return Ok(Some(entry));
+                    if let Some(f) = files.into_iter().next() {
+                        return Ok(Some(f));
                     }
                 }
-                // Priority 2: file_hash match (byte-exact duplicate)
-                let entries = query_entries(
+                let files = query_tracked_files(
                     conn,
-                    "SELECT * FROM sync_entries WHERE file_hash = ? AND relative_path != ?",
+                    "SELECT * FROM tracked_files WHERE file_hash = ? AND relative_path != ?",
                     &[
                         &file_hash as &dyn rusqlite::types::ToSql,
                         &exclude_path as &dyn rusqlite::types::ToSql,
                     ],
                 )?;
-                Ok(entries.into_iter().next())
+                Ok(files.into_iter().next())
             })
             .await
             .map_err(map_call_err)
     }
 
-    async fn delete_entry(&self, path: &str) -> Result<bool, SyncError> {
-        let path = path.to_string();
+    async fn delete_file(&self, relative_path: &str) -> Result<bool, SyncError> {
+        let path = relative_path.to_string();
         self.conn
             .call(move |conn| {
                 let changes = conn
                     .execute(
-                        "DELETE FROM sync_entries WHERE relative_path = ?",
+                        "DELETE FROM tracked_files WHERE relative_path = ?",
                         params![path],
                     )
                     .map_err(|e| SyncError::Store(format!("{e}")))?;
@@ -239,94 +216,14 @@ impl SyncStore for SqliteSyncStore {
             .map_err(map_call_err)
     }
 
-    async fn set_location_state(
-        &self,
-        entry_id: &str,
-        location: &LocationId,
-        state: LocationState,
-    ) -> Result<(), SyncError> {
-        let entry_id = entry_id.to_string();
-        let loc_str = location.as_str().to_string();
-        let state_str = state.as_str().to_string();
-        self.conn
-            .call(move |conn| {
-                let ts = ts_to_string(chrono::Utc::now());
-                conn.execute(
-                    "INSERT INTO sync_locations (entry_id, location_id, state, updated_at)
-                     VALUES (?, ?, ?, ?)
-                     ON CONFLICT (entry_id, location_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at",
-                    params![entry_id, loc_str, state_str, ts],
-                )
-                .map_err(|e| SyncError::Store(format!("{e}")))?;
-                conn.execute(
-                    "UPDATE sync_entries SET updated_at = ? WHERE id = ?",
-                    params![ts, entry_id],
-                )
-                .map_err(|e| SyncError::Store(format!("{e}")))?;
-                Ok(())
-            })
-            .await
-            .map_err(map_call_err)
-    }
-
-    async fn set_error(&self, path: &str, err: Option<&str>) -> Result<(), SyncError> {
-        let path = path.to_string();
-        let err = err.map(|s| s.to_string());
-        self.conn
-            .call(move |conn| {
-                let ts = ts_to_string(chrono::Utc::now());
-                conn.execute(
-                    "UPDATE sync_entries SET error = ?, updated_at = ? WHERE relative_path = ?",
-                    params![err, ts, path],
-                )
-                .map_err(|e| SyncError::Store(format!("{e}")))?;
-                Ok(())
-            })
-            .await
-            .map_err(map_call_err)
-    }
-
-    async fn set_synced_at(&self, path: &str, ts: DateTime<Utc>) -> Result<(), SyncError> {
-        let path = path.to_string();
-        let ts = ts_to_string(ts);
-        self.conn
-            .call(move |conn| {
-                conn.execute(
-                    "UPDATE sync_entries SET synced_at = ?, updated_at = ? WHERE relative_path = ?",
-                    params![ts, ts, path],
-                )
-                .map_err(|e| SyncError::Store(format!("{e}")))?;
-                Ok(())
-            })
-            .await
-            .map_err(map_call_err)
-    }
-
-    async fn pending(&self, dest: &LocationId) -> Result<Vec<SyncEntry>, SyncError> {
-        let dest_str = dest.as_str().to_string();
-        self.conn
-            .call(move |conn| {
-                query_entries(
-                    conn,
-                    "SELECT e.* FROM sync_entries e
-                     INNER JOIN sync_locations l ON e.id = l.entry_id
-                     WHERE l.location_id = ? AND l.state IN ('pending', 'unknown')
-                     ORDER BY e.updated_at",
-                    &[&dest_str as &dyn rusqlite::types::ToSql],
-                )
-            })
-            .await
-            .map_err(map_call_err)
-    }
-
-    async fn list(
+    async fn list_files(
         &self,
         file_type: Option<FileType>,
         limit: Option<usize>,
-    ) -> Result<Vec<SyncEntry>, SyncError> {
+    ) -> Result<Vec<TrackedFile>, SyncError> {
         self.conn
             .call(move |conn| {
-                let mut sql = String::from("SELECT * FROM sync_entries");
+                let mut sql = String::from("SELECT * FROM tracked_files");
                 let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
                 if let Some(ft) = file_type {
@@ -343,80 +240,128 @@ impl SyncStore for SqliteSyncStore {
 
                 let refs: Vec<&dyn rusqlite::types::ToSql> =
                     param_values.iter().map(|p| p.as_ref()).collect();
-                query_entries(conn, &sql, &refs)
+                query_tracked_files(conn, &sql, &refs)
+            })
+            .await
+            .map_err(map_call_err)
+    }
+}
+
+// =============================================================================
+// TransferStore trait implementation
+// =============================================================================
+
+#[async_trait]
+impl TransferStore for SqliteSyncStore {
+    async fn insert_transfer(&self, transfer: &Transfer) -> Result<(), SyncError> {
+        let t = transfer.clone();
+        self.conn
+            .call(move |conn| {
+                let attempt_i64 = i64::from(t.attempt());
+                let created_at_str = ts_to_string(t.created_at());
+                let started_at_str = t.started_at().map(ts_to_string);
+                let finished_at_str = t.finished_at().map(ts_to_string);
+                let error_kind_str = t.error_kind().map(|k| k.to_string());
+                conn.execute(
+                    "INSERT INTO transfers (id, file_id, src, dest, state, error, error_kind, attempt, created_at, started_at, finished_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![
+                        t.id(),
+                        t.file_id(),
+                        t.src().as_str(),
+                        t.dest().as_str(),
+                        t.state().as_str(),
+                        t.error(),
+                        error_kind_str,
+                        attempt_i64,
+                        created_at_str,
+                        started_at_str,
+                        finished_at_str,
+                    ],
+                )
+                .map_err(|e| SyncError::Store(format!("insert_transfer failed: {e}")))?;
+                Ok(())
             })
             .await
             .map_err(map_call_err)
     }
 
-    /// # Read consistency
-    ///
-    /// The three queries (COUNT entries, COUNT errors, GROUP BY locations) run
-    /// inside a single `conn.call` closure, which executes on the dedicated
-    /// background thread. Under WAL mode with a single-writer design, no
-    /// concurrent writes occur during the closure, so the results are consistent.
-    async fn summary(&self) -> Result<SyncSummary, SyncError> {
+    async fn update_transfer(&self, transfer: &Transfer) -> Result<(), SyncError> {
+        let t = transfer.clone();
         self.conn
-            .call(|conn| {
-                let total_entries: usize = conn
-                    .query_row("SELECT COUNT(*) FROM sync_entries", [], |row| row.get(0))
-                    .map_err(|e| SyncError::Store(format!("{e}")))?;
-
-                let total_errors: usize = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM sync_entries WHERE error IS NOT NULL",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .map_err(|e| SyncError::Store(format!("{e}")))?;
-
-                let mut stmt = conn
-                    .prepare("SELECT location_id, state, COUNT(*) FROM sync_locations GROUP BY location_id, state")
-                    .map_err(|e| SyncError::Store(format!("{e}")))?;
-
-                let rows = stmt
-                    .query_map([], |row| {
-                        let loc: String = row.get(0)?;
-                        let state: String = row.get(1)?;
-                        let count: usize = row.get(2)?;
-                        Ok((loc, state, count))
-                    })
-                    .map_err(|e| SyncError::Store(format!("{e}")))?;
-
-                let mut locations: HashMap<LocationId, LocationSummary> = HashMap::new();
-                for row in rows {
-                    let (loc_str, state_str, count) =
-                        row.map_err(|e| SyncError::Store(format!("{e}")))?;
-                    let loc_id = LocationId::new(&loc_str).map_err(|_| {
-                        SyncError::Store(format!("corrupt location_id in DB: {loc_str:?}"))
-                    })?;
-                    let summary = locations.entry(loc_id).or_default();
-                    let state = parse_loc_state(&state_str)?;
-                    match state {
-                        LocationState::Present => summary.present = count,
-                        LocationState::Pending => summary.pending = count,
-                        LocationState::Syncing => summary.syncing = count,
-                        LocationState::Unknown => summary.unknown = count,
-                        LocationState::Absent => summary.absent = count,
-                    }
-                }
-
-                Ok(SyncSummary {
-                    locations,
-                    total_entries,
-                    total_errors,
-                })
+            .call(move |conn| {
+                let started_at_str = t.started_at().map(ts_to_string);
+                let finished_at_str = t.finished_at().map(ts_to_string);
+                let error_kind_str = t.error_kind().map(|k| k.to_string());
+                conn.execute(
+                    "UPDATE transfers SET state = ?, error = ?, error_kind = ?, started_at = ?, finished_at = ?, attempt = ?
+                     WHERE id = ?",
+                    params![
+                        t.state().as_str(),
+                        t.error(),
+                        error_kind_str,
+                        started_at_str,
+                        finished_at_str,
+                        i64::from(t.attempt()),
+                        t.id(),
+                    ],
+                )
+                .map_err(|e| SyncError::Store(format!("update_transfer failed: {e}")))?;
+                Ok(())
             })
             .await
             .map_err(map_call_err)
     }
 
-    async fn errors(&self) -> Result<Vec<SyncEntry>, SyncError> {
+    async fn queued_transfers(&self, dest: &LocationId) -> Result<Vec<Transfer>, SyncError> {
+        let dest_str = dest.as_str().to_string();
         self.conn
-            .call(|conn| {
-                query_entries(
+            .call(move |conn| {
+                query_transfers(
                     conn,
-                    "SELECT * FROM sync_entries WHERE error IS NOT NULL ORDER BY updated_at DESC",
+                    "SELECT t.* FROM transfers t
+                     WHERE t.dest = ? AND t.state = 'queued'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM transfers t2
+                           WHERE t2.file_id = t.file_id
+                             AND t2.dest = t.dest
+                             AND t2.ROWID > t.ROWID
+                       )
+                     ORDER BY t.created_at",
+                    &[&dest_str as &dyn rusqlite::types::ToSql],
+                )
+            })
+            .await
+            .map_err(map_call_err)
+    }
+
+    async fn latest_transfers_by_file(&self, file_id: &str) -> Result<Vec<Transfer>, SyncError> {
+        let file_id = file_id.to_string();
+        self.conn
+            .call(move |conn| {
+                query_transfers(
+                    conn,
+                    "SELECT t.* FROM transfers t
+                     WHERE t.file_id = ?
+                       AND NOT EXISTS (
+                           SELECT 1 FROM transfers t2
+                           WHERE t2.file_id = t.file_id
+                             AND t2.dest = t.dest
+                             AND t2.ROWID > t.ROWID
+                       )",
+                    &[&file_id as &dyn rusqlite::types::ToSql],
+                )
+            })
+            .await
+            .map_err(map_call_err)
+    }
+
+    async fn failed_transfers(&self) -> Result<Vec<Transfer>, SyncError> {
+        self.conn
+            .call(|conn| {
+                query_transfers(
+                    conn,
+                    "SELECT * FROM transfers WHERE state = 'failed' ORDER BY finished_at DESC",
                     &[],
                 )
             })
@@ -424,6 +369,42 @@ impl SyncStore for SqliteSyncStore {
             .map_err(map_call_err)
     }
 
+    async fn prune_completed(&self, before: DateTime<Utc>) -> Result<usize, SyncError> {
+        let before_str = ts_to_string(before);
+        self.conn
+            .call(move |conn| {
+                // 各 file_id × dest の最新Transferは保持し、それより古い completed を削除
+                let deleted = conn
+                    .execute(
+                        "DELETE FROM transfers
+                         WHERE state = 'completed'
+                           AND finished_at < ?1
+                           AND id NOT IN (
+                               SELECT t.id FROM transfers t
+                               INNER JOIN (
+                                   SELECT file_id, dest, MAX(created_at) as max_created
+                                   FROM transfers
+                                   GROUP BY file_id, dest
+                               ) latest ON t.file_id = latest.file_id
+                                           AND t.dest = latest.dest
+                                           AND t.created_at = latest.max_created
+                           )",
+                        params![before_str],
+                    )
+                    .map_err(|e| SyncError::Store(format!("prune_completed failed: {e}")))?;
+                Ok(deleted)
+            })
+            .await
+            .map_err(map_call_err)
+    }
+}
+
+// =============================================================================
+// RemoteStore trait implementation
+// =============================================================================
+
+#[async_trait]
+impl RemoteStore for SqliteSyncStore {
     async fn register_remote(&self, remote: &RemoteConfig) -> Result<(), SyncError> {
         let remote = remote.clone();
         self.conn
@@ -535,345 +516,383 @@ impl SyncStore for SqliteSyncStore {
 mod tests {
     use super::*;
 
-    fn make_entry(path: &str, ft: FileType, locs: Vec<(&str, LocationState)>) -> SyncEntry {
-        let locations: HashMap<LocationId, LocationState> = locs
-            .into_iter()
-            .map(|(id, s)| (LocationId::new(id).expect("valid test location"), s))
-            .collect();
-        SyncEntry {
-            id: uuid::Uuid::new_v4().to_string(),
-            relative_path: path.into(),
-            file_type: ft,
-            file_hash: format!("fh_{}", path.replace('/', "_")),
-            content_hash: None,
-            file_size: None,
-            gen_id: None,
-            locations,
-            error: None,
-            synced_at: None,
-            updated_at: chrono::Utc::now(),
-        }
+    use crate::domain::tracked_file::TrackedFile;
+    use crate::domain::transfer::Transfer;
+    use crate::infra::file_store::FileStore;
+    use crate::infra::transfer_store::TransferStore;
+
+    fn loc(s: &str) -> LocationId {
+        LocationId::new(s).expect("valid test location")
     }
 
-    #[tokio::test]
-    async fn insert_and_get() {
-        let store = SqliteSyncStore::open_in_memory()
-            .await
-            .expect("open in-memory");
-        let entry = make_entry(
-            "/output/test.png",
+    fn sample_tracked_file(path: &str) -> TrackedFile {
+        TrackedFile::from_scan(
+            path.into(),
             FileType::Image,
-            vec![
-                ("local", LocationState::Present),
-                ("cloud", LocationState::Pending),
-            ],
-        );
+            format!("fh_{}", path.replace('/', "_")),
+            None,
+            1024,
+            None,
+        )
+        .expect("valid test data")
+    }
 
-        store.insert_entry(&entry).await.expect("insert");
+    // =========================================================================
+    // FileStore tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn upsert_and_get_file() {
+        let store = SqliteSyncStore::open_in_memory().await.expect("open");
+        let file = sample_tracked_file("output/test.png");
+
+        store.upsert_file(&file).await.expect("upsert");
         let got = store
-            .get_by_path("/output/test.png")
+            .get_file_by_path("output/test.png")
             .await
             .expect("get")
             .expect("found");
 
-        assert_eq!(got.relative_path, "/output/test.png");
-        assert_eq!(got.file_type, FileType::Image);
-        assert_eq!(
-            got.location_state(&LocationId::local()),
-            LocationState::Present
+        assert_eq!(got.relative_path(), "output/test.png");
+        assert_eq!(got.file_type(), FileType::Image);
+        assert_eq!(got.file_size(), 1024);
+    }
+
+    #[tokio::test]
+    async fn upsert_updates_existing() {
+        let store = SqliteSyncStore::open_in_memory().await.expect("open");
+        let mut file = sample_tracked_file("output/up.png");
+        store.upsert_file(&file).await.expect("insert");
+
+        file.update_from_scan(
+            FileType::Image,
+            "new_hash".into(),
+            Some("ch".into()),
+            2048,
+            None,
         );
-        assert_eq!(
-            got.location_state(&LocationId::new("cloud").expect("valid")),
-            LocationState::Pending
-        );
+        store.upsert_file(&file).await.expect("upsert update");
+
+        let got = store
+            .get_file_by_path("output/up.png")
+            .await
+            .expect("get")
+            .expect("found");
+        assert_eq!(got.file_hash(), "new_hash");
+        assert_eq!(got.content_hash(), Some("ch"));
+        assert_eq!(got.file_size(), 2048);
     }
 
     #[tokio::test]
     async fn get_nonexistent() {
         let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let got = store.get_by_path("/no/such/file").await.expect("get");
+        let got = store.get_file_by_path("no/such/file").await.expect("get");
         assert!(got.is_none());
     }
 
     #[tokio::test]
-    async fn update_entry() {
+    async fn delete_file() {
         let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let mut entry = make_entry(
-            "/output/up.png",
-            FileType::Image,
-            vec![("local", LocationState::Present)],
-        );
-        store.insert_entry(&entry).await.expect("insert");
+        let file = sample_tracked_file("output/del.png");
+        store.upsert_file(&file).await.expect("insert");
 
-        entry.file_hash = "abc123".into();
-        entry.content_hash = Some("content_abc".into());
-        entry.locations.insert(
-            LocationId::new("cloud").expect("valid"),
-            LocationState::Pending,
-        );
-        store.update_entry(&entry).await.expect("update");
-
-        let got = store
-            .get_by_path("/output/up.png")
+        assert!(store.delete_file("output/del.png").await.expect("delete"));
+        assert!(!store.delete_file("output/del.png").await.expect("delete2"));
+        assert!(store
+            .get_file_by_path("output/del.png")
             .await
             .expect("get")
-            .expect("found");
-        assert_eq!(got.file_hash, "abc123");
-        assert_eq!(got.content_hash.as_deref(), Some("content_abc"));
-        assert_eq!(
-            got.location_state(&LocationId::new("cloud").expect("valid")),
-            LocationState::Pending
-        );
+            .is_none());
     }
 
     #[tokio::test]
-    async fn delete_entry() {
+    async fn find_duplicate_by_file_hash() {
         let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let entry = make_entry("/output/del.png", FileType::Image, vec![]);
-        store.insert_entry(&entry).await.expect("insert");
-
-        let deleted = store.delete_entry("/output/del.png").await.expect("delete");
-        assert!(deleted);
-
-        let got = store.get_by_path("/output/del.png").await.expect("get");
-        assert!(got.is_none());
-
-        let deleted2 = store
-            .delete_entry("/output/del.png")
-            .await
-            .expect("delete2");
-        assert!(!deleted2);
-    }
-
-    #[tokio::test]
-    async fn duplicate_detection_by_file_hash() {
-        let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let mut e1 = make_entry("/output/a.png", FileType::Image, vec![]);
-        e1.file_hash = "deadbeef".into();
-        store.insert_entry(&e1).await.expect("insert");
+        let file = TrackedFile::from_scan(
+            "output/a.png".into(),
+            FileType::Image,
+            "deadbeef".into(),
+            None,
+            512,
+            None,
+        )
+        .expect("valid test data");
+        store.upsert_file(&file).await.expect("insert");
 
         let dup = store
-            .find_duplicate("deadbeef", None, "/output/b.png")
+            .find_duplicate_file("deadbeef", None, "output/b.png")
             .await
-            .expect("find_duplicate");
-        assert!(dup.is_some());
-        assert_eq!(dup.expect("dup").relative_path, "/output/a.png");
+            .expect("find");
+        assert_eq!(dup.expect("dup").relative_path(), "output/a.png");
 
         let no_dup = store
-            .find_duplicate("deadbeef", None, "/output/a.png")
+            .find_duplicate_file("deadbeef", None, "output/a.png")
             .await
-            .expect("find_duplicate");
+            .expect("find");
         assert!(no_dup.is_none());
     }
 
     #[tokio::test]
-    async fn duplicate_detection_content_hash_priority() {
+    async fn find_duplicate_content_hash_priority() {
         let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let mut e1 = make_entry("/output/a.png", FileType::Image, vec![]);
-        e1.file_hash = "file_aaa".into();
-        e1.content_hash = Some("content_xxx".into());
-        store.insert_entry(&e1).await.expect("insert");
+        let file = TrackedFile::from_scan(
+            "output/a.png".into(),
+            FileType::Image,
+            "file_aaa".into(),
+            Some("content_xxx".into()),
+            512,
+            None,
+        )
+        .expect("valid test data");
+        store.upsert_file(&file).await.expect("insert");
 
-        // content_hash match found even though file_hash differs
         let dup = store
-            .find_duplicate("file_bbb", Some("content_xxx"), "/output/b.png")
+            .find_duplicate_file("file_bbb", Some("content_xxx"), "output/b.png")
             .await
-            .expect("find_duplicate");
-        assert!(dup.is_some());
-        assert_eq!(dup.expect("dup").relative_path, "/output/a.png");
+            .expect("find");
+        assert_eq!(dup.expect("dup").relative_path(), "output/a.png");
     }
 
     #[tokio::test]
-    async fn set_location_state() {
+    async fn list_files_with_filter() {
         let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let entry = make_entry(
-            "/output/loc.png",
-            FileType::Image,
-            vec![("local", LocationState::Present)],
-        );
-        store.insert_entry(&entry).await.expect("insert");
-
         store
-            .set_location_state(
-                &entry.id,
-                &LocationId::new("cloud").expect("valid"),
-                LocationState::Syncing,
+            .upsert_file(&sample_tracked_file("a.png"))
+            .await
+            .expect("insert");
+        store
+            .upsert_file(
+                &TrackedFile::from_scan(
+                    "b.json".into(),
+                    FileType::Recipe,
+                    "fh_b".into(),
+                    None,
+                    64,
+                    None,
+                )
+                .expect("valid test data"),
             )
             .await
-            .expect("set_location_state");
-
-        let got = store
-            .get_by_path("/output/loc.png")
-            .await
-            .expect("get")
-            .expect("found");
-        assert_eq!(
-            got.location_state(&LocationId::new("cloud").expect("valid")),
-            LocationState::Syncing
-        );
-    }
-
-    #[tokio::test]
-    async fn pending_query() {
-        let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        store
-            .insert_entry(&make_entry(
-                "/a.png",
-                FileType::Image,
-                vec![
-                    ("local", LocationState::Present),
-                    ("cloud", LocationState::Pending),
-                ],
-            ))
-            .await
-            .expect("insert a");
-        store
-            .insert_entry(&make_entry(
-                "/b.png",
-                FileType::Image,
-                vec![
-                    ("local", LocationState::Present),
-                    ("cloud", LocationState::Present),
-                ],
-            ))
-            .await
-            .expect("insert b");
-        store
-            .insert_entry(&make_entry(
-                "/c.png",
-                FileType::Image,
-                vec![
-                    ("local", LocationState::Present),
-                    ("cloud", LocationState::Unknown),
-                ],
-            ))
-            .await
-            .expect("insert c");
-
-        let cloud = LocationId::new("cloud").expect("valid");
-        let pending = store.pending(&cloud).await.expect("pending");
-        assert_eq!(pending.len(), 2); // a (pending) + c (unknown)
-    }
-
-    #[tokio::test]
-    async fn list_with_filter() {
-        let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        store
-            .insert_entry(&make_entry("/a.png", FileType::Image, vec![]))
-            .await
             .expect("insert");
         store
-            .insert_entry(&make_entry("/b.json", FileType::Recipe, vec![]))
-            .await
-            .expect("insert");
-        store
-            .insert_entry(&make_entry("/c.png", FileType::Image, vec![]))
+            .upsert_file(&sample_tracked_file("c.png"))
             .await
             .expect("insert");
 
-        let all = store.list(None, None).await.expect("list all");
+        let all = store.list_files(None, None).await.expect("list");
         assert_eq!(all.len(), 3);
 
         let images = store
-            .list(Some(FileType::Image), None)
+            .list_files(Some(FileType::Image), None)
             .await
             .expect("list images");
         assert_eq!(images.len(), 2);
 
-        let limited = store.list(None, Some(1)).await.expect("list limited");
+        let limited = store.list_files(None, Some(1)).await.expect("limited");
         assert_eq!(limited.len(), 1);
     }
 
+    // =========================================================================
+    // TransferStore tests
+    // =========================================================================
+
     #[tokio::test]
-    async fn summary() {
+    async fn insert_and_query_transfer() {
         let store = SqliteSyncStore::open_in_memory().await.expect("open");
+        let file = sample_tracked_file("output/t.png");
+        store.upsert_file(&file).await.expect("insert file");
+
+        let transfer =
+            Transfer::new(file.id().to_string(), loc("local"), loc("cloud")).expect("valid");
         store
-            .insert_entry(&make_entry(
-                "/a.png",
-                FileType::Image,
-                vec![
-                    ("local", LocationState::Present),
-                    ("cloud", LocationState::Pending),
-                    ("pod", LocationState::Unknown),
-                ],
-            ))
+            .insert_transfer(&transfer)
             .await
-            .expect("insert");
-        store
-            .insert_entry(&make_entry(
-                "/b.png",
-                FileType::Image,
-                vec![
-                    ("local", LocationState::Present),
-                    ("cloud", LocationState::Present),
-                    ("pod", LocationState::Present),
-                ],
-            ))
-            .await
-            .expect("insert");
+            .expect("insert transfer");
 
-        let s = store.summary().await.expect("summary");
-        assert_eq!(s.total_entries, 2);
-        assert_eq!(s.total_errors, 0);
-
-        let local_summary = s
-            .locations
-            .get(&LocationId::local())
-            .expect("local summary");
-        assert_eq!(local_summary.present, 2);
-
-        let cloud_summary = s
-            .locations
-            .get(&LocationId::new("cloud").expect("valid"))
-            .expect("cloud summary");
-        assert_eq!(cloud_summary.present, 1);
-        assert_eq!(cloud_summary.pending, 1);
+        let queued = store.queued_transfers(&loc("cloud")).await.expect("queued");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].file_id(), file.id());
+        assert_eq!(queued[0].dest(), &loc("cloud"));
     }
 
     #[tokio::test]
-    async fn errors_query() {
+    async fn update_transfer_state() {
         let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let mut entry = make_entry("/err.png", FileType::Image, vec![]);
-        entry.error = Some("connection refused".into());
-        store.insert_entry(&entry).await.expect("insert");
+        let file = sample_tracked_file("output/s.png");
+        store.upsert_file(&file).await.expect("insert file");
 
+        let mut transfer =
+            Transfer::new(file.id().to_string(), loc("local"), loc("cloud")).expect("valid");
         store
-            .insert_entry(&make_entry("/ok.png", FileType::Image, vec![]))
+            .insert_transfer(&transfer)
             .await
-            .expect("insert");
+            .expect("insert transfer");
 
-        let errs = store.errors().await.expect("errors");
-        assert_eq!(errs.len(), 1);
-        assert_eq!(errs[0].error.as_deref(), Some("connection refused"));
+        transfer.start().expect("start");
+        store
+            .update_transfer(&transfer)
+            .await
+            .expect("update transfer");
+
+        let queued = store.queued_transfers(&loc("cloud")).await.expect("queued");
+        assert_eq!(queued.len(), 0);
+
+        transfer.complete().expect("complete");
+        store
+            .update_transfer(&transfer)
+            .await
+            .expect("update transfer");
+
+        let latest = store
+            .latest_transfers_by_file(file.id())
+            .await
+            .expect("latest");
+        assert_eq!(latest.len(), 1);
+        assert_eq!(
+            latest[0].state(),
+            crate::domain::transfer::TransferState::Completed
+        );
     }
 
     #[tokio::test]
-    async fn set_error_and_clear() {
+    async fn failed_transfers_query() {
         let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        store
-            .insert_entry(&make_entry("/e.png", FileType::Image, vec![]))
-            .await
-            .expect("insert");
+        let file = sample_tracked_file("output/f.png");
+        store.upsert_file(&file).await.expect("insert file");
 
+        let mut transfer =
+            Transfer::new(file.id().to_string(), loc("local"), loc("cloud")).expect("valid");
+        transfer.start().expect("start");
+        transfer
+            .fail(
+                "timeout".into(),
+                crate::domain::retry::TransferErrorKind::Transient,
+            )
+            .expect("fail");
         store
-            .set_error("/e.png", Some("timeout"))
+            .insert_transfer(&transfer)
             .await
-            .expect("set_error");
-        let got = store
-            .get_by_path("/e.png")
-            .await
-            .expect("get")
-            .expect("found");
-        assert_eq!(got.error.as_deref(), Some("timeout"));
+            .expect("insert transfer");
 
-        store.set_error("/e.png", None).await.expect("clear_error");
-        let got2 = store
-            .get_by_path("/e.png")
-            .await
-            .expect("get")
-            .expect("found");
-        assert!(got2.error.is_none());
+        let failed = store.failed_transfers().await.expect("failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].error(), Some("timeout"));
+        assert_eq!(
+            failed[0].error_kind(),
+            Some(crate::domain::retry::TransferErrorKind::Transient)
+        );
     }
+
+    #[tokio::test]
+    async fn latest_transfers_by_file_returns_latest_per_dest() {
+        let store = SqliteSyncStore::open_in_memory().await.expect("open");
+        let file = sample_tracked_file("output/r.png");
+        store.upsert_file(&file).await.expect("insert file");
+
+        let mut t1 =
+            Transfer::new(file.id().to_string(), loc("local"), loc("cloud")).expect("valid");
+        t1.start().expect("start");
+        t1.fail(
+            "err".into(),
+            crate::domain::retry::TransferErrorKind::Transient,
+        )
+        .expect("fail");
+        store.insert_transfer(&t1).await.expect("insert t1");
+
+        let t2 = t1.retry().expect("retry");
+        store.insert_transfer(&t2).await.expect("insert t2");
+
+        let mut t3 = Transfer::new(file.id().to_string(), loc("local"), loc("pod")).expect("valid");
+        t3.start().expect("start");
+        t3.complete().expect("complete");
+        store.insert_transfer(&t3).await.expect("insert t3");
+
+        let latest = store
+            .latest_transfers_by_file(file.id())
+            .await
+            .expect("latest");
+        assert_eq!(latest.len(), 2);
+
+        let cloud = latest
+            .iter()
+            .find(|t| t.dest() == &loc("cloud"))
+            .expect("cloud");
+        assert_eq!(
+            cloud.state(),
+            crate::domain::transfer::TransferState::Queued
+        );
+        assert_eq!(cloud.attempt(), 2);
+
+        let pod = latest
+            .iter()
+            .find(|t| t.dest() == &loc("pod"))
+            .expect("pod");
+        assert_eq!(
+            pod.state(),
+            crate::domain::transfer::TransferState::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn cascade_delete_transfers() {
+        let store = SqliteSyncStore::open_in_memory().await.expect("open");
+        let file = sample_tracked_file("output/cas.png");
+        let file_id = file.id().to_string();
+        store.upsert_file(&file).await.expect("insert file");
+
+        let transfer = Transfer::new(file_id.clone(), loc("local"), loc("cloud")).expect("valid");
+        store
+            .insert_transfer(&transfer)
+            .await
+            .expect("insert transfer");
+
+        store
+            .delete_file("output/cas.png")
+            .await
+            .expect("delete file");
+
+        let count: usize = store
+            .conn
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM transfers WHERE file_id = ?",
+                    params![file_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| SyncError::Store(format!("{e}")))
+            })
+            .await
+            .expect("count");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn queued_returns_only_latest_per_file_dest() {
+        let store = SqliteSyncStore::open_in_memory().await.expect("open");
+        let file = sample_tracked_file("output/q.png");
+        store.upsert_file(&file).await.expect("insert file");
+
+        let mut t1 =
+            Transfer::new(file.id().to_string(), loc("local"), loc("cloud")).expect("valid");
+        t1.start().expect("start");
+        t1.fail(
+            "err".into(),
+            crate::domain::retry::TransferErrorKind::Transient,
+        )
+        .expect("fail");
+        store.insert_transfer(&t1).await.expect("insert t1");
+
+        let t2 = t1.retry().expect("retry");
+        store.insert_transfer(&t2).await.expect("insert t2");
+
+        let queued = store.queued_transfers(&loc("cloud")).await.expect("queued");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].attempt(), 2);
+    }
+
+    // =========================================================================
+    // RemoteStore tests
+    // =========================================================================
 
     #[tokio::test]
     async fn remote_management() {
@@ -899,37 +918,5 @@ mod tests {
 
         let remotes2 = store.list_remotes().await.expect("list2");
         assert!(remotes2.is_empty());
-    }
-
-    #[tokio::test]
-    async fn cascade_delete_locations() {
-        let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let entry = make_entry(
-            "/cascade.png",
-            FileType::Image,
-            vec![
-                ("local", LocationState::Present),
-                ("cloud", LocationState::Pending),
-            ],
-        );
-        let entry_id = entry.id.clone();
-        store.insert_entry(&entry).await.expect("insert");
-
-        store.delete_entry("/cascade.png").await.expect("delete");
-
-        // Verify no orphan location rows
-        let count: usize = store
-            .conn
-            .call(move |conn| {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM sync_locations WHERE entry_id = ?",
-                    params![entry_id],
-                    |row| row.get(0),
-                )
-                .map_err(|e| SyncError::Store(format!("{e}")))
-            })
-            .await
-            .expect("count");
-        assert_eq!(count, 0);
     }
 }

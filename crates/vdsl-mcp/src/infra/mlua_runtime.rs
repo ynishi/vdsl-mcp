@@ -20,7 +20,7 @@
 //! | 4 | PNG | `pngmetagrep-core` + `pngmeta` | `runtime/png.lua` | `read_text(path), inject_text(path,chunks), inject_text_to(src,dst,chunks)` |
 //! | 5 | Registry | `std.http` + `std.json` | `runtime/registry.lua` | `fetch_object_info(url, headers) -> table` |
 //! | 6 | Emit | `std.fs` (via bridge) | `runtime/emit.lua` | `write(name, json_str) -> bool, write_recipe(name, recipe_json)` |
-//! | 7 | Sync | `vdsl-sync SyncService` | `runtime/sync.lua` | `notify(path,type,gen_id?), status(), force(dest?), get(path), pending(dest), register_generation(gen_id,output,recipe?)` |
+//! | 7 | Sync | `vdsl-sync SyncService` | `runtime/sync.lua` | `status(), force(), force_route(src,dest), get(path), pending(dest)` |
 //!
 //! # VM Initialization Sequence (`MluaRuntime::new`)
 //!
@@ -649,50 +649,20 @@ mod inner {
                 //     Each Lua function captures Arc<SyncService> and uses
                 //     tokio Handle::block_on() to call async methods from
                 //     the dedicated Isle thread (non-tokio thread).
+                //
+                //     Serialization uses vdsl-sync's to_value() → json_value_to_lua()
+                //     so field changes in vdsl-sync don't require MCP-side updates.
                 if let Some(svc) = sync_service {
-                    let rt_handle = tokio_handle
-                        .clone()
-                        .expect("SyncService requires tokio runtime");
+                    let rt_handle = match tokio_handle.clone() {
+                        Some(h) => h,
+                        None => {
+                            eprintln!("[WARN] sync: SyncService available but no tokio runtime — sync bridge disabled");
+                            // Skip sync bridge registration entirely; Lua will use MOCK fallback
+                            return Ok(());
+                        }
+                    };
 
                     let sync_table = lua.create_table()?;
-
-                    // notify(absolute_path, file_type, gen_id?) -> table
-                    {
-                        let svc = Arc::clone(&svc);
-                        let handle = rt_handle.clone();
-                        sync_table.set(
-                            "notify",
-                            lua.create_function(
-                                move |lua,
-                                      (path, file_type_str, gen_id): (
-                                    String,
-                                    String,
-                                    Option<String>,
-                                )| {
-                                    let ft: vdsl_sync::FileType = file_type_str
-                                        .parse()
-                                        .map_err(|e: vdsl_sync::SyncError| {
-                                            LuaError::external(e.to_string())
-                                        })?;
-                                    let result = handle
-                                        .block_on(
-                                            svc.notify(&path, ft, gen_id.as_deref()),
-                                        )
-                                        .map_err(|e| LuaError::external(e.to_string()))?;
-
-                                    let tbl = lua.create_table()?;
-                                    tbl.set("is_duplicate", result.is_duplicate)?;
-                                    if let Some(dup) = &result.duplicate_of {
-                                        tbl.set("duplicate_of", dup.as_str())?;
-                                    }
-                                    let entry_tbl =
-                                        sync_entry_to_lua(lua, &result.entry)?;
-                                    tbl.set("entry", entry_tbl)?;
-                                    Ok(tbl)
-                                },
-                            )?,
-                        )?;
-                    }
 
                     // status() -> table
                     {
@@ -704,66 +674,62 @@ mod inner {
                                 let summary = handle
                                     .block_on(svc.status())
                                     .map_err(|e| LuaError::external(e.to_string()))?;
-
-                                let tbl = lua.create_table()?;
-                                tbl.set("total_entries", summary.total_entries)?;
-                                tbl.set("total_errors", summary.total_errors)?;
-                                let locs = lua.create_table()?;
-                                for (loc_id, loc_summary) in &summary.locations {
-                                    let loc_tbl = lua.create_table()?;
-                                    loc_tbl.set("present", loc_summary.present)?;
-                                    loc_tbl.set("pending", loc_summary.pending)?;
-                                    loc_tbl.set("syncing", loc_summary.syncing)?;
-                                    loc_tbl.set("unknown", loc_summary.unknown)?;
-                                    loc_tbl.set("absent", loc_summary.absent)?;
-                                    locs.set(loc_id.as_str(), loc_tbl)?;
-                                }
-                                tbl.set("locations", locs)?;
-                                Ok(tbl)
+                                let val = summary.to_value()
+                                    .map_err(|e| LuaError::external(e.to_string()))?;
+                                json_value_to_lua(lua, &val)
                             })?,
                         )?;
                     }
 
-                    // force(dest?) -> table
+                    // force() -> table
+                    // Processes all pending entries in topology order (cloud before pod).
                     {
                         let svc = Arc::clone(&svc);
                         let handle = rt_handle.clone();
                         sync_table.set(
                             "force",
-                            lua.create_function(move |lua, dest: Option<String>| {
-                                let dest_id = dest
-                                    .map(|d| {
-                                        vdsl_sync::LocationId::new(d).map_err(|e| {
-                                            LuaError::external(e.to_string())
-                                        })
-                                    })
-                                    .transpose()?;
+                            lua.create_function(move |lua, ()| {
                                 let batch = handle
-                                    .block_on(svc.force(dest_id.as_ref()))
+                                    .block_on(svc.force())
                                     .map_err(|e| LuaError::external(e.to_string()))?;
-
-                                let tbl = lua.create_table()?;
-                                tbl.set("pushed", batch.pushed)?;
-                                tbl.set("failed", batch.failed)?;
-                                let errs = lua.create_table()?;
-                                for (i, (path, msg)) in
-                                    batch.errors.iter().enumerate()
-                                {
-                                    let e = lua.create_table()?;
-                                    e.set("path", path.as_str())?;
-                                    e.set("error", msg.as_str())?;
-                                    errs.set(i + 1, e)?;
-                                }
-                                tbl.set("errors", errs)?;
-                                Ok(tbl)
+                                let val = batch.to_value()
+                                    .map_err(|e| LuaError::external(e.to_string()))?;
+                                json_value_to_lua(lua, &val)
                             })?,
+                        )?;
+                    }
+
+                    // force_route(src, dest) -> table
+                    // Explicit source→destination transfer for debugging/maintenance.
+                    {
+                        let svc = Arc::clone(&svc);
+                        let handle = rt_handle.clone();
+                        sync_table.set(
+                            "force_route",
+                            lua.create_function(
+                                move |lua, (src, dest): (String, String)| {
+                                    let src_id =
+                                        vdsl_sync::LocationId::new(src).map_err(|e| {
+                                            LuaError::external(e.to_string())
+                                        })?;
+                                    let dest_id =
+                                        vdsl_sync::LocationId::new(dest).map_err(|e| {
+                                            LuaError::external(e.to_string())
+                                        })?;
+                                    let batch = handle
+                                        .block_on(svc.force_route(&src_id, &dest_id))
+                                        .map_err(|e| LuaError::external(e.to_string()))?;
+                                    let val = batch.to_value()
+                                        .map_err(|e| LuaError::external(e.to_string()))?;
+                                    json_value_to_lua(lua, &val)
+                                },
+                            )?,
                         )?;
                     }
 
                     // get(absolute_path) -> table | nil
                     // Bridge converts absolute path → relative path via
-                    // SyncService::to_relative() so Lua callers use the same
-                    // absolute paths as notify/register_generation.
+                    // SyncService::to_relative().
                     {
                         let svc = Arc::clone(&svc);
                         let handle = rt_handle.clone();
@@ -778,7 +744,9 @@ mod inner {
                                     .map_err(|e| LuaError::external(e.to_string()))?;
                                 match entry {
                                     Some(e) => {
-                                        Ok(LuaValue::Table(sync_entry_to_lua(lua, &e)?))
+                                        let val = e.to_value()
+                                            .map_err(|e| LuaError::external(e.to_string()))?;
+                                        json_value_to_lua(lua, &val)
                                     }
                                     None => Ok(LuaValue::Nil),
                                 }
@@ -800,51 +768,13 @@ mod inner {
                                 let entries = handle
                                     .block_on(svc.pending(&dest_id))
                                     .map_err(|e| LuaError::external(e.to_string()))?;
-                                let result = lua.create_table()?;
-                                for (i, entry) in entries.iter().enumerate() {
-                                    result
-                                        .set(i + 1, sync_entry_to_lua(lua, entry)?)?;
-                                }
-                                Ok(result)
+                                let arr: Vec<serde_json::Value> = entries
+                                    .iter()
+                                    .map(|e| e.to_value())
+                                    .collect::<Result<Vec<_>, _>>()
+                                    .map_err(|e| LuaError::external(e.to_string()))?;
+                                json_value_to_lua(lua, &serde_json::Value::Array(arr))
                             })?,
-                        )?;
-                    }
-
-                    // register_generation(gen_id, output, recipe?) -> { entry, ... }
-                    {
-                        let svc = Arc::clone(&svc);
-                        let handle = rt_handle.clone();
-                        sync_table.set(
-                            "register_generation",
-                            lua.create_function(
-                                move |lua,
-                                      (gen_id, output, recipe): (
-                                    String,
-                                    String,
-                                    Option<String>,
-                                )| {
-                                    let entries = handle
-                                        .block_on(
-                                            crate::infra::generation::register_generation(
-                                                &svc,
-                                                &gen_id,
-                                                &output,
-                                                recipe.as_deref(),
-                                            ),
-                                        )
-                                        .map_err(|e| {
-                                            LuaError::external(e.to_string())
-                                        })?;
-                                    let result = lua.create_table()?;
-                                    for (i, entry) in entries.iter().enumerate() {
-                                        result.set(
-                                            i + 1,
-                                            sync_entry_to_lua(lua, entry)?,
-                                        )?;
-                                    }
-                                    Ok(result)
-                                },
-                            )?,
                         )?;
                     }
 
@@ -998,40 +928,6 @@ mod inner {
         pub fn work_dir(&self) -> &Path {
             &self.work_dir
         }
-    }
-
-    /// Convert a SyncEntry to a Lua table.
-    ///
-    /// Fields: id, relative_path, file_type, file_hash, content_hash,
-    /// file_size, gen_id, locations (table), error, synced_at, updated_at.
-    fn sync_entry_to_lua(lua: &mlua::Lua, entry: &vdsl_sync::SyncEntry) -> LuaResult<LuaTable> {
-        let tbl = lua.create_table()?;
-        tbl.set("id", entry.id.as_str())?;
-        tbl.set("relative_path", entry.relative_path.as_str())?;
-        tbl.set("file_type", entry.file_type.as_str())?;
-        tbl.set("file_hash", entry.file_hash.as_str())?;
-        if let Some(ch) = &entry.content_hash {
-            tbl.set("content_hash", ch.as_str())?;
-        }
-        if let Some(fs) = entry.file_size {
-            tbl.set("file_size", fs)?;
-        }
-        if let Some(gid) = &entry.gen_id {
-            tbl.set("gen_id", gid.as_str())?;
-        }
-        let locs = lua.create_table()?;
-        for (loc_id, state) in &entry.locations {
-            locs.set(loc_id.as_str(), state.as_str())?;
-        }
-        tbl.set("locations", locs)?;
-        if let Some(err) = &entry.error {
-            tbl.set("error", err.as_str())?;
-        }
-        if let Some(sa) = entry.synced_at {
-            tbl.set("synced_at", sa.to_rfc3339())?;
-        }
-        tbl.set("updated_at", entry.updated_at.to_rfc3339())?;
-        Ok(tbl)
     }
 }
 
