@@ -21,8 +21,8 @@ use std::collections::{HashMap, HashSet};
 
 use tracing::trace;
 
+use super::distribute::DistributeAction;
 use super::location::LocationId;
-use super::topology_delta::DistributeAction;
 use super::transfer::TransferKind;
 
 /// 経路トポロジーの抽象。
@@ -306,17 +306,17 @@ mod tests {
     /// local→pod→cloud のチェーン（経路最適化テスト用、コスト付き）
     fn chain_graph() -> RouteGraph {
         let mut g = RouteGraph::new();
-        g.add_with_cost(local(), pod(), EdgeCost::new(1.0, 10));
-        g.add_with_cost(pod(), cloud(), EdgeCost::new(2.0, 10));
+        g.add_with_cost(local(), pod(), EdgeCost::new(1.0, 10).unwrap());
+        g.add_with_cost(pod(), cloud(), EdgeCost::new(2.0, 10).unwrap());
         g
     }
 
     /// local→pod→cloud + local→cloud（直接辺あり、チェーンの方が安い）
     fn chain_with_direct_graph() -> RouteGraph {
         let mut g = RouteGraph::new();
-        g.add_with_cost(local(), pod(), EdgeCost::new(1.0, 10));
-        g.add_with_cost(pod(), cloud(), EdgeCost::new(2.0, 10));
-        g.add_with_cost(local(), cloud(), EdgeCost::new(10.0, 10)); // 高コスト直接辺
+        g.add_with_cost(local(), pod(), EdgeCost::new(1.0, 10).unwrap());
+        g.add_with_cost(pod(), cloud(), EdgeCost::new(2.0, 10).unwrap());
+        g.add_with_cost(local(), cloud(), EdgeCost::new(10.0, 10).unwrap()); // 高コスト直接辺
         g
     }
 
@@ -324,7 +324,7 @@ mod tests {
     // plan_distribution — Phase 3 (Topology中心モデル)
     // =========================================================================
 
-    use crate::domain::topology_delta::{DeleteAction, DistributeAction, SendAction, UpdateAction};
+    use crate::domain::distribute::{DeleteAction, DistributeAction, SendAction, UpdateAction};
 
     fn send_action(file_id: &str, source: LocationId, target: LocationId) -> DistributeAction {
         DistributeAction::Send(SendAction {
@@ -467,11 +467,11 @@ mod tests {
         //
         // Graph: local→pod(1.0), pod→cloud(2.0), local→cloud(5.0), cloud→local(5.0), cloud→pod(2.0)
         let mut g = RouteGraph::new();
-        g.add_with_cost(local(), pod(), EdgeCost::new(1.0, 10));
-        g.add_with_cost(pod(), cloud(), EdgeCost::new(2.0, 10));
-        g.add_with_cost(local(), cloud(), EdgeCost::new(5.0, 10));
-        g.add_with_cost(cloud(), local(), EdgeCost::new(5.0, 10));
-        g.add_with_cost(cloud(), pod(), EdgeCost::new(2.0, 10));
+        g.add_with_cost(local(), pod(), EdgeCost::new(1.0, 10).unwrap());
+        g.add_with_cost(pod(), cloud(), EdgeCost::new(2.0, 10).unwrap());
+        g.add_with_cost(local(), cloud(), EdgeCost::new(5.0, 10).unwrap());
+        g.add_with_cost(cloud(), local(), EdgeCost::new(5.0, 10).unwrap());
+        g.add_with_cost(cloud(), pod(), EdgeCost::new(2.0, 10).unwrap());
 
         let actions = vec![send_action("f1", local(), cloud())];
 
@@ -491,9 +491,9 @@ mod tests {
     fn plan_distribution_no_existing_presences_uses_source() {
         // Without existing_presences, falls back to source-only routing.
         let mut g = RouteGraph::new();
-        g.add_with_cost(local(), pod(), EdgeCost::new(1.0, 10));
-        g.add_with_cost(pod(), cloud(), EdgeCost::new(2.0, 10));
-        g.add_with_cost(local(), cloud(), EdgeCost::new(5.0, 10));
+        g.add_with_cost(local(), pod(), EdgeCost::new(1.0, 10).unwrap());
+        g.add_with_cost(pod(), cloud(), EdgeCost::new(2.0, 10).unwrap());
+        g.add_with_cost(local(), cloud(), EdgeCost::new(5.0, 10).unwrap());
 
         let actions = vec![send_action("f1", local(), cloud())];
 

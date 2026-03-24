@@ -53,13 +53,27 @@ pub struct SyncReport {
 
 /// コンフリクト報告。SDK面の型。
 ///
-/// domain::topology_delta::ConflictEntry から変換して使用する。
+/// domain::distribute::ConflictEntry から変換して使用する。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SyncReportConflict {
     pub file_id: String,
     pub path: String,
     /// コンフリクトしているLocation群。
     pub locations: Vec<String>,
+}
+
+impl From<&crate::domain::distribute::ConflictEntry> for SyncReportConflict {
+    fn from(c: &crate::domain::distribute::ConflictEntry) -> Self {
+        Self {
+            file_id: c.topology_file_id().to_string(),
+            path: c.relative_path().to_string(),
+            locations: c
+                .variants()
+                .iter()
+                .map(|v| v.location_id().to_string())
+                .collect(),
+        }
+    }
 }
 
 /// 転送失敗の詳細。

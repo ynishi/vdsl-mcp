@@ -29,7 +29,8 @@ use crate::domain::location_file::{LocationFile, LocationFileState};
 use crate::domain::plan::{plan_distribution, PlannedTransfer};
 use tracing::{debug, info, trace};
 
-use crate::domain::topology_delta::{distribute_actions, TopologyDelta};
+use crate::domain::distribute::distribute_actions;
+use crate::domain::topology_delta::TopologyDelta;
 use crate::domain::topology_file::TopologyFile;
 use crate::domain::transfer::{Transfer, TransferKind};
 use crate::infra::location_file_store::LocationFileStore;
@@ -55,7 +56,7 @@ pub struct TopologySyncResult {
     ///
     /// 複数Locationで同一ファイルが異なる内容に更新された場合に報告される。
     /// コンフリクトがあるファイルのUpdate転送は抑止される。
-    pub conflicts: Vec<crate::domain::topology_delta::ConflictEntry>,
+    pub conflicts: Vec<crate::domain::distribute::ConflictEntry>,
 }
 
 /// put()の結果。

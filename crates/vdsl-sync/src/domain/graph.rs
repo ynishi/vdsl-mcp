@@ -28,11 +28,17 @@ pub struct EdgeCost {
 }
 
 impl EdgeCost {
-    pub fn new(time_per_gb: f64, priority: u32) -> Self {
-        Self {
+    pub fn new(time_per_gb: f64, priority: u32) -> Result<Self, super::error::DomainError> {
+        if !time_per_gb.is_finite() || time_per_gb < 0.0 {
+            return Err(super::error::DomainError::Validation {
+                field: "time_per_gb".to_string(),
+                reason: format!("must be finite and non-negative, got {time_per_gb}"),
+            });
+        }
+        Ok(Self {
             time_per_gb,
             priority,
-        }
+        })
     }
 
     /// Scalar cost for path comparison.
@@ -601,9 +607,9 @@ mod tests {
         // Required: {pod, cloud}
         // Optimal: local→pod→cloud (cost 3.0) beats local→pod + local→cloud (cost 11.0)
         let mut g = RouteGraph::new();
-        g.add_with_cost(loc("local"), loc("pod"), EdgeCost::new(1.0, 10));
-        g.add_with_cost(loc("pod"), loc("cloud"), EdgeCost::new(2.0, 10));
-        g.add_with_cost(loc("local"), loc("cloud"), EdgeCost::new(10.0, 10));
+        g.add_with_cost(loc("local"), loc("pod"), EdgeCost::new(1.0, 10).unwrap());
+        g.add_with_cost(loc("pod"), loc("cloud"), EdgeCost::new(2.0, 10).unwrap());
+        g.add_with_cost(loc("local"), loc("cloud"), EdgeCost::new(10.0, 10).unwrap());
 
         let required = HashSet::from([loc("pod"), loc("cloud")]);
         let tree = g.optimal_tree(&loc("local"), &required);
@@ -619,9 +625,9 @@ mod tests {
         // Required: {pod, cloud}
         // Each dest needs its own path: local→pod (10.0), local→cloud (1.0)
         let mut g = RouteGraph::new();
-        g.add_with_cost(loc("local"), loc("pod"), EdgeCost::new(10.0, 10));
-        g.add_with_cost(loc("pod"), loc("cloud"), EdgeCost::new(10.0, 10));
-        g.add_with_cost(loc("local"), loc("cloud"), EdgeCost::new(1.0, 10));
+        g.add_with_cost(loc("local"), loc("pod"), EdgeCost::new(10.0, 10).unwrap());
+        g.add_with_cost(loc("pod"), loc("cloud"), EdgeCost::new(10.0, 10).unwrap());
+        g.add_with_cost(loc("local"), loc("cloud"), EdgeCost::new(1.0, 10).unwrap());
 
         let required = HashSet::from([loc("pod"), loc("cloud")]);
         let tree = g.optimal_tree(&loc("local"), &required);
@@ -636,7 +642,7 @@ mod tests {
     #[test]
     fn optimal_tree_single_dest() {
         let mut g = RouteGraph::new();
-        g.add_with_cost(loc("local"), loc("cloud"), EdgeCost::new(5.0, 10));
+        g.add_with_cost(loc("local"), loc("cloud"), EdgeCost::new(5.0, 10).unwrap());
 
         let required = HashSet::from([loc("cloud")]);
         let tree = g.optimal_tree(&loc("local"), &required);
@@ -672,8 +678,8 @@ mod tests {
     fn optimal_tree_dependency_order() {
         // local→pod→cloud: pod edge must come before cloud edge
         let mut g = RouteGraph::new();
-        g.add_with_cost(loc("local"), loc("pod"), EdgeCost::new(1.0, 10));
-        g.add_with_cost(loc("pod"), loc("cloud"), EdgeCost::new(1.0, 10));
+        g.add_with_cost(loc("local"), loc("pod"), EdgeCost::new(1.0, 10).unwrap());
+        g.add_with_cost(loc("pod"), loc("cloud"), EdgeCost::new(1.0, 10).unwrap());
 
         let required = HashSet::from([loc("pod"), loc("cloud")]);
         let tree = g.optimal_tree(&loc("local"), &required);
@@ -690,10 +696,10 @@ mod tests {
         // Required: {cloud, nas, pod}
         // pod is reachable via cloud or nas — tree should pick one
         let mut g = RouteGraph::new();
-        g.add_with_cost(loc("local"), loc("cloud"), EdgeCost::new(1.0, 10));
-        g.add_with_cost(loc("local"), loc("nas"), EdgeCost::new(1.0, 10));
-        g.add_with_cost(loc("cloud"), loc("pod"), EdgeCost::new(1.0, 10));
-        g.add_with_cost(loc("nas"), loc("pod"), EdgeCost::new(5.0, 10));
+        g.add_with_cost(loc("local"), loc("cloud"), EdgeCost::new(1.0, 10).unwrap());
+        g.add_with_cost(loc("local"), loc("nas"), EdgeCost::new(1.0, 10).unwrap());
+        g.add_with_cost(loc("cloud"), loc("pod"), EdgeCost::new(1.0, 10).unwrap());
+        g.add_with_cost(loc("nas"), loc("pod"), EdgeCost::new(5.0, 10).unwrap());
 
         let required = HashSet::from([loc("cloud"), loc("nas"), loc("pod")]);
         let tree = g.optimal_tree(&loc("local"), &required);
@@ -723,11 +729,11 @@ mod tests {
         // Single-source from local: local→cloud = 5.0
         // Multi-source: pod→cloud = 2.0 (cheaper!)
         let mut g = RouteGraph::new();
-        g.add_with_cost(loc("local"), loc("pod"), EdgeCost::new(1.0, 10));
-        g.add_with_cost(loc("pod"), loc("cloud"), EdgeCost::new(2.0, 10));
-        g.add_with_cost(loc("local"), loc("cloud"), EdgeCost::new(5.0, 10));
-        g.add_with_cost(loc("cloud"), loc("local"), EdgeCost::new(5.0, 10));
-        g.add_with_cost(loc("cloud"), loc("pod"), EdgeCost::new(2.0, 10));
+        g.add_with_cost(loc("local"), loc("pod"), EdgeCost::new(1.0, 10).unwrap());
+        g.add_with_cost(loc("pod"), loc("cloud"), EdgeCost::new(2.0, 10).unwrap());
+        g.add_with_cost(loc("local"), loc("cloud"), EdgeCost::new(5.0, 10).unwrap());
+        g.add_with_cost(loc("cloud"), loc("local"), EdgeCost::new(5.0, 10).unwrap());
+        g.add_with_cost(loc("cloud"), loc("pod"), EdgeCost::new(2.0, 10).unwrap());
 
         let sources = HashSet::from([loc("local"), loc("pod")]);
         let targets = HashSet::from([loc("cloud")]);
@@ -741,8 +747,8 @@ mod tests {
     fn multi_source_single_source_fallback() {
         // Single source behaves like original optimal_tree.
         let mut g = RouteGraph::new();
-        g.add_with_cost(loc("local"), loc("pod"), EdgeCost::new(1.0, 10));
-        g.add_with_cost(loc("pod"), loc("cloud"), EdgeCost::new(2.0, 10));
+        g.add_with_cost(loc("local"), loc("pod"), EdgeCost::new(1.0, 10).unwrap());
+        g.add_with_cost(loc("pod"), loc("cloud"), EdgeCost::new(2.0, 10).unwrap());
 
         let sources = HashSet::from([loc("local")]);
         let targets = HashSet::from([loc("pod"), loc("cloud")]);
@@ -775,7 +781,7 @@ mod tests {
     fn multi_source_target_already_in_sources() {
         // If cloud is both a source and a target, no transfer needed.
         let mut g = RouteGraph::new();
-        g.add_with_cost(loc("local"), loc("cloud"), EdgeCost::new(5.0, 10));
+        g.add_with_cost(loc("local"), loc("cloud"), EdgeCost::new(5.0, 10).unwrap());
 
         let sources = HashSet::from([loc("local"), loc("cloud")]);
         let targets = HashSet::from([loc("cloud")]);
@@ -795,10 +801,10 @@ mod tests {
         //
         // Best: local→nas(1.0), pod→cloud(2.0) — each target from different source
         let mut g = RouteGraph::new();
-        g.add_with_cost(loc("local"), loc("nas"), EdgeCost::new(1.0, 10));
-        g.add_with_cost(loc("pod"), loc("cloud"), EdgeCost::new(2.0, 10));
-        g.add_with_cost(loc("local"), loc("cloud"), EdgeCost::new(10.0, 10));
-        g.add_with_cost(loc("pod"), loc("nas"), EdgeCost::new(10.0, 10));
+        g.add_with_cost(loc("local"), loc("nas"), EdgeCost::new(1.0, 10).unwrap());
+        g.add_with_cost(loc("pod"), loc("cloud"), EdgeCost::new(2.0, 10).unwrap());
+        g.add_with_cost(loc("local"), loc("cloud"), EdgeCost::new(10.0, 10).unwrap());
+        g.add_with_cost(loc("pod"), loc("nas"), EdgeCost::new(10.0, 10).unwrap());
 
         let sources = HashSet::from([loc("local"), loc("pod")]);
         let targets = HashSet::from([loc("nas"), loc("cloud")]);

@@ -92,7 +92,7 @@ struct PendingRoute {
 ///     .connect_with_shell(&pod_id, &cloud_id, pod_rclone, pod_shell)
 ///     .connect_pull(&cloud_id, &local_id, rclone_pull)
 ///     .exclude(".git")
-///     .build();
+///     .build()?;
 /// ```
 pub struct SdkImplBuilder {
     topology_files: Arc<dyn TopologyFileStore>,
@@ -203,8 +203,11 @@ impl SdkImplBuilder {
 
     /// スキャン除外パターン追加。
     pub fn exclude(mut self, pattern: &str) -> Self {
-        if let Ok(p) = glob::Pattern::new(pattern) {
-            self.scan_excludes.push(p);
+        match glob::Pattern::new(pattern) {
+            Ok(p) => self.scan_excludes.push(p),
+            Err(e) => {
+                tracing::warn!(pattern = pattern, error = %e, "invalid exclude glob pattern, skipped");
+            }
         }
         self
     }
@@ -215,7 +218,7 @@ impl SdkImplBuilder {
     /// 2. PendingRoute → TransferRoute に変換（file_root 自動解決 + コスト自動推定）
     /// 3. TransferRoute から RouteGraph + TransferEngine を構築
     /// 4. TopologyStore + TopologyScanner を構築
-    pub fn build(self) -> SdkImpl {
+    pub fn build(self) -> Result<SdkImpl, SyncError> {
         use std::collections::HashMap;
 
         let config = self.config.unwrap_or_default();
@@ -236,7 +239,13 @@ impl SdkImplBuilder {
                 let src_loc = loc_map.get(&pr.src)?;
                 let dest_loc = loc_map.get(&pr.dest)?;
 
-                let cost = estimate_route_cost(src_loc.kind(), dest_loc.kind());
+                let cost = match estimate_route_cost(src_loc.kind(), dest_loc.kind()) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(src = ?src_loc.kind(), dest = ?dest_loc.kind(), error = %e, "skipping route: invalid cost");
+                        return None;
+                    }
+                };
 
                 let mut route = TransferRoute::new(
                     pr.src,
@@ -262,13 +271,13 @@ impl SdkImplBuilder {
         let location_ids: Vec<LocationId> =
             self.locations.iter().map(|loc| loc.id().clone()).collect();
 
-        // RouteGraph（TopologyStore 用）
+        // RouteGraph構築（1回のみ。TopologyStore / TransferEngine で共有）
         let mut graph = RouteGraph::new();
         for r in &routes {
             graph.add_with_cost(
                 r.src().clone(),
                 r.dest().clone(),
-                EdgeCost::new(r.time_per_gb(), r.priority()),
+                EdgeCost::new(r.time_per_gb(), r.priority())?,
             );
         }
 
@@ -276,11 +285,11 @@ impl SdkImplBuilder {
             self.topology_files.clone(),
             self.location_files.clone(),
             self.transfer_store.clone(),
-            graph,
+            graph.clone(),
             location_ids,
         );
 
-        let engine = TransferEngine::new(routes, config.concurrency);
+        let engine = TransferEngine::new(graph, routes, config.concurrency);
 
         let scanner = TopologyScanner::new(
             self.topology_files.clone(),
@@ -288,7 +297,7 @@ impl SdkImplBuilder {
             scanners,
         );
 
-        SdkImpl {
+        Ok(SdkImpl {
             scanner,
             topology,
             engine,
@@ -298,7 +307,7 @@ impl SdkImplBuilder {
             locations: self.locations,
             config,
             scan_excludes: self.scan_excludes,
-        }
+        })
     }
 }
 
@@ -307,7 +316,10 @@ impl SdkImplBuilder {
 /// optimal_tree（Dijkstra）がこのコストで最適経路を計算する。
 /// 例: Local→Pod(1.0) + Pod→Cloud(2.0) = 3.0 < Local→Cloud(5.0)
 /// → Pod経由チェーンが自動的に選択される。MCP層での条件分岐は不要。
-fn estimate_route_cost(src: LocationKind, dest: LocationKind) -> EdgeCost {
+fn estimate_route_cost(
+    src: LocationKind,
+    dest: LocationKind,
+) -> Result<EdgeCost, crate::domain::error::DomainError> {
     let (time_per_gb, priority) = match (src, dest) {
         // LAN/SSH: 低コスト（ローカルネットワーク、低レイテンシ）
         (LocationKind::Local, LocationKind::Remote) => (1.0, 10),
@@ -702,15 +714,7 @@ impl SyncStoreSdk for SdkImpl {
             conflicts: plan_result
                 .conflicts
                 .iter()
-                .map(|c| super::sdk::SyncReportConflict {
-                    file_id: c.topology_file_id().to_string(),
-                    path: c.relative_path().to_string(),
-                    locations: c
-                        .variants()
-                        .iter()
-                        .map(|v| v.location_id().to_string())
-                        .collect(),
-                })
+                .map(super::sdk::SyncReportConflict::from)
                 .collect(),
         })
     }
@@ -768,29 +772,13 @@ impl SyncStoreSdk for SdkImpl {
         let outcomes = self.engine.execute_prepared(prepared).await;
         let mut total_transferred = 0usize;
 
-        for outcome in outcomes {
-            let is_completed = outcome.transfer.state() == TransferState::Completed;
-            self.transfer_store
-                .update_transfer(&outcome.transfer)
-                .await?;
-
-            if is_completed {
-                // sync_routeは単一ルートなのでunblock不要だが、
-                // chain先がある場合に備えて実行する
-                self.transfer_store
-                    .unblock_dependents(outcome.transfer.id())
-                    .await?;
-                total_transferred += 1;
-            } else {
-                total_failed += 1;
-                if let Some(err) = outcome.transfer.error() {
-                    all_errors.push(SyncReportError {
-                        path: outcome.relative_path,
-                        error: err.to_string(),
-                    });
-                }
-            }
-        }
+        self.persist_outcomes(
+            &outcomes,
+            &mut total_transferred,
+            &mut total_failed,
+            &mut all_errors,
+        )
+        .await?;
 
         Ok(SyncReport {
             scanned: 0,
@@ -802,15 +790,7 @@ impl SyncStoreSdk for SdkImpl {
             conflicts: plan_result
                 .conflicts
                 .iter()
-                .map(|c| super::sdk::SyncReportConflict {
-                    file_id: c.topology_file_id().to_string(),
-                    path: c.relative_path().to_string(),
-                    locations: c
-                        .variants()
-                        .iter()
-                        .map(|v| v.location_id().to_string())
-                        .collect(),
-                })
+                .map(super::sdk::SyncReportConflict::from)
                 .collect(),
         })
     }
@@ -946,17 +926,41 @@ impl SyncStoreSdk for SdkImpl {
     }
 
     async fn errors(&self) -> Result<Vec<ErrorEntry>, SyncError> {
-        let summary = self.status().await?;
-        Ok(summary.error_entries)
+        let retry_policy = self.config.retry_policy();
+        let failed = self.transfer_store.failed_transfers().await?;
+        Ok(failed
+            .iter()
+            .filter(|t| {
+                let state = PresenceState::from_transfer(t, &retry_policy);
+                state == PresenceState::Failed
+            })
+            .map(ErrorEntry::from_transfer)
+            .collect())
     }
 
     async fn pending(&self, dest: &LocationId) -> Result<Vec<PendingEntry>, SyncError> {
-        let summary = self.status().await?;
-        Ok(summary
-            .pending_entries
-            .into_iter()
-            .filter(|e| &e.dest == dest)
-            .collect())
+        let retry_policy = self.config.retry_policy();
+
+        // Queued/Blocked/InFlight transfers for the target dest
+        let all_pending = self.transfer_store.all_pending_transfers().await?;
+        let mut entries: Vec<PendingEntry> = all_pending
+            .iter()
+            .filter(|t| t.dest() == dest)
+            .map(PendingEntry::from_transfer)
+            .collect();
+
+        // Failed but retryable transfers also count as pending
+        let failed = self.transfer_store.failed_transfers().await?;
+        for t in &failed {
+            if t.dest() == dest {
+                let state = PresenceState::from_transfer(t, &retry_policy);
+                if state == PresenceState::Pending {
+                    entries.push(PendingEntry::from_transfer(t));
+                }
+            }
+        }
+
+        Ok(entries)
     }
 
     // =========================================================================

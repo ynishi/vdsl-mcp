@@ -898,8 +898,16 @@ pub struct VdslSyncGetRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslSyncRouteRequest {
+    /// Source location ID (e.g. "local", "cloud", "pod-xxx").
+    pub src: String,
+    /// Destination location ID (e.g. "local", "cloud", "pod-xxx").
+    pub dest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VdslSyncPollRequest {
-    /// Task ID returned by vdsl_sync.
+    /// Task ID returned by vdsl_sync or vdsl_sync_route.
     pub task_id: String,
 }
 
@@ -3829,6 +3837,35 @@ impl VdslMcpServer {
     }
 
     #[tool(
+        name = "vdsl_sync_route",
+        description = "[sync] Trigger synchronization for a single route (src → dest). \
+            Does NOT scan — only creates transfers for existing tracked files \
+            that need to reach the destination, then executes them. \
+            Non-blocking: spawns a background task and returns a task_id immediately. \
+            Use vdsl_sync_poll with the task_id to check progress.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn sync_route(
+        &self,
+        Parameters(req): Parameters<VdslSyncRouteRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.resolve_or_init_sdk().await?;
+        let src = vdsl_sync::LocationId::new(&req.src)
+            .map_err(|e| McpError::invalid_params(format!("invalid src location: {e}"), None))?;
+        let dest = vdsl_sync::LocationId::new(&req.dest)
+            .map_err(|e| McpError::invalid_params(format!("invalid dest location: {e}"), None))?;
+        let task_id = self.sync_task_mgr.spawn_sync_route(&db, src, dest).await;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "sync_route spawned ({} → {}).\ntask_id: {task_id}\nlog: {}\n\nUse vdsl_sync_poll with this task_id to check progress.",
+            req.src, req.dest, current_log_path()
+        ))]))
+    }
+
+    #[tool(
         name = "vdsl_sync_status",
         description = "[sync] Show sync status: total files, per-location presence counts \
             (present/pending/syncing/failed), and error count. \
@@ -3994,7 +4031,7 @@ impl VdslMcpServer {
         description = "[sync] Poll the status of a background sync task. \
             Returns the current status (pending/running/completed/failed) \
             and result when completed. Use the task_id returned by \
-            vdsl_sync.",
+            vdsl_sync or vdsl_sync_route.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -5054,11 +5091,11 @@ async fn build_sdk(
     // =========================================================================
 
     use crate::infra::pod_shell::RunPodCliShell;
-    use vdsl_sync::infra::rclone::RcloneBackend;
+    use vdsl_sync::RcloneBackend;
 
     let local_root = work_dir.join("output");
     let hasher: std::sync::Arc<dyn vdsl_sync::ContentHasher> =
-        std::sync::Arc::new(vdsl_sync::infra::hasher::Djb2Hasher);
+        std::sync::Arc::new(vdsl_sync::Djb2Hasher);
     let local_loc: std::sync::Arc<dyn vdsl_sync::Location> =
         std::sync::Arc::new(vdsl_sync::LocalLocation::new(local_root, hasher));
 
@@ -5173,7 +5210,7 @@ async fn build_sdk(
         }
     }
 
-    let sdk = builder.build();
+    let sdk = builder.build()?;
 
     tracing::info!(
         routes = route_desc,

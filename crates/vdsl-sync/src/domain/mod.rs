@@ -1,5 +1,6 @@
 pub mod config;
 pub mod digest;
+pub mod distribute;
 pub mod error;
 pub mod file_type;
 pub mod fingerprint;
@@ -13,3 +14,6 @@ pub mod topology_delta;
 pub mod topology_file;
 pub mod transfer;
 pub mod view;
+
+#[cfg(test)]
+pub(crate) mod test_helpers;

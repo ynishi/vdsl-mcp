@@ -11,35 +11,35 @@
 
 pub mod application;
 pub mod domain;
-pub mod fmt;
 pub mod infra;
 
-// Re-exports: Application (primary API)
+// Re-exports: SDK public API face
+//
+// Interface layers (MCP, Lua) depend only on these types.
+// Internal types (domain::*, infra::*) are accessible via direct module paths.
+
+// --- SDK trait + result types ---
 pub use application::error::SyncError;
-pub use application::route::{SrcFile, TransferDirection, TransferRoute};
 pub use application::sdk::{
     PutReport, SyncReport, SyncReportConflict, SyncReportError, SyncStoreSdk,
 };
 pub use application::sdk_impl::{SdkImpl, SdkImplBuilder};
 pub use application::task::{TaskId, TaskStatus};
-pub use application::topology_scanner::{ScanResult, TopologyScanError, TopologyScanner};
-pub use application::topology_store::{
-    TopologyFileView, TopologyPutResult, TopologyStore, TopologySyncResult,
-};
-pub use application::transfer_engine::{BatchError, BatchResult};
-pub use domain::error::DomainError;
+pub use application::topology_store::TopologyFileView;
+
+// --- Domain types used in SDK method signatures ---
 pub use domain::file_type::FileType;
 pub use domain::fingerprint::{FileFingerprint, FingerprintPrecision};
-pub use domain::graph::RouteGraph;
 pub use domain::location::{LocationId, LocationSummary, SyncSummary};
-pub use domain::plan::Topology;
-pub use domain::retry::{RetryPolicy, TransferErrorKind};
-pub use domain::scan::{ScanOutcome, ScanReport};
-pub use domain::transfer::{Transfer, TransferKind, TransferState};
 pub use domain::view::{ErrorEntry, PendingEntry, PresenceState, PresenceView};
-pub use infra::backend::{RemoteFile, StorageBackend};
+
+// --- Builder boundary types (SdkImplBuilder construction) ---
+pub use infra::backend::StorageBackend;
 pub use infra::error::InfraError;
-pub use infra::hasher::{ContentHasher, HashResult};
-pub use infra::location::{CloudLocation, LocalLocation, Location, LocationKind, SshLocation};
-pub use infra::shell::{FileInspection, LocalShell, RemoteShell, ShellOutput};
+pub use infra::hasher::{ContentHasher, Djb2Hasher};
+pub use infra::location::{CloudLocation, LocalLocation, Location, SshLocation};
+pub use infra::location_file_store::LocationFileStore;
+pub use infra::rclone::RcloneBackend;
+pub use infra::shell::{FileInspection, RemoteShell, ShellOutput};
+pub use infra::topology_file_store::TopologyFileStore;
 pub use infra::transfer_store::TransferStore;
