@@ -11,7 +11,6 @@
 //! # Progress reporting
 //!
 //! `sdk.status()` でDB SELECTベースのサマリーを取得する。
-//! Observer/ProgressFnBridgeは不要。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,9 +24,9 @@ struct TaskEntry {
     _handle: tokio::task::JoinHandle<()>,
 }
 
-/// interface層のバックグラウンドSync/Force操作管理。
+/// interface層のバックグラウンドSync操作管理。
 ///
-/// SyncStoreSdk は `sync()`, `sync_route()`, `force_rewrite()` を
+/// SyncStoreSdk は `sync()`, `sync_route()` を
 /// `async fn → Result` で提供する。本構造体がそれらを
 /// `tokio::spawn` でバックグラウンド化し、TaskId/poll で管理する。
 pub struct SyncTaskManager {
@@ -65,17 +64,6 @@ impl SyncTaskManager {
         self.spawn_inner(move || async move {
             sdk.sync_route(&src, &dest).await.map_err(|e| e.to_string())
         })
-        .await
-    }
-
-    /// `SyncStoreSdk::force_rewrite()` をバックグラウンド実行。TaskId を即座に返す。
-    #[deprecated(note = "force_rewrite is deprecated — use sync after clearing target")]
-    #[allow(deprecated)]
-    pub async fn spawn_force(&self, sdk: &Arc<dyn SyncStoreSdk>) -> TaskId {
-        let sdk = Arc::clone(sdk);
-        self.spawn_inner(
-            move || async move { sdk.force_rewrite().await.map_err(|e| e.to_string()) },
-        )
         .await
     }
 

@@ -27,6 +27,8 @@ use crate::domain::graph::RouteGraph;
 use crate::domain::location::LocationId;
 use crate::domain::location_file::{LocationFile, LocationFileState};
 use crate::domain::plan::{plan_distribution, PlannedTransfer};
+use tracing::{debug, info, trace};
+
 use crate::domain::topology_delta::{distribute_actions, TopologyDelta};
 use crate::domain::topology_file::TopologyFile;
 use crate::domain::transfer::{Transfer, TransferKind};
@@ -116,16 +118,30 @@ impl TopologyStore {
     /// 2. Distribute: 全TopologyFile × 全LocationFile → DistributeAction[]
     /// 3. Route: DistributeAction + RouteGraph → PlannedTransfer → Transfer作成
     pub async fn sync(&self, deltas: &[TopologyDelta]) -> Result<TopologySyncResult, SyncError> {
+        info!(delta_count = deltas.len(), "topology_store::sync: start");
+
         // Phase 1: Apply — TopologyDelta → TopologyFile/LocationFile更新
         let ingest_origins = self.apply_ingest(deltas).await?;
+        info!(
+            origins = ingest_origins.len(),
+            "topology_store::sync: phase1 apply done"
+        );
 
         // Phase 2: Distribute
         let active_tfs = self.topology_files.list_active(None, None).await?;
         let active_tf_refs: Vec<&TopologyFile> = active_tfs.iter().collect();
         let file_ids: Vec<&str> = active_tfs.iter().map(|tf| tf.id()).collect();
+        debug!(
+            active_files = active_tfs.len(),
+            "topology_store::sync: loaded active topology_files"
+        );
 
         let lf_map = self.location_files.list_by_files(&file_ids).await?;
         let lf_ref_map = to_ref_map(&lf_map);
+        debug!(
+            location_file_groups = lf_map.len(),
+            "topology_store::sync: loaded location_files"
+        );
 
         let dist_result = distribute_actions(
             &active_tf_refs,
@@ -133,9 +149,18 @@ impl TopologyStore {
             &self.locations,
             &ingest_origins,
         );
+        info!(
+            actions = dist_result.actions.len(),
+            conflicts = dist_result.conflicts.len(),
+            "topology_store::sync: phase2 distribute done"
+        );
 
         // 削除済みファイル → 各LocationFileのdestへDelete Transfer直接発行
         let deleted_tfs = self.topology_files.list_deleted().await?;
+        trace!(
+            deleted_tfs = deleted_tfs.len(),
+            "topology_store::sync: checking deleted topology_files for delete transfers"
+        );
         let mut delete_transfers_created = 0;
         let pending_dests = self.collect_pending_dests().await?;
         for dtf in &deleted_tfs {
@@ -145,6 +170,11 @@ impl TopologyStore {
             for lf in &lfs {
                 let dest = lf.location_id().clone();
                 if pending.contains(&dest) {
+                    trace!(
+                        file_id = %dtf.id(),
+                        dest = %dest,
+                        "topology_store::sync: delete transfer skipped (pending)"
+                    );
                     continue;
                 }
                 let src = self
@@ -154,20 +184,63 @@ impl TopologyStore {
                     .cloned()
                     .unwrap_or_else(|| dest.clone());
                 if src == dest {
+                    trace!(
+                        file_id = %dtf.id(),
+                        dest = %dest,
+                        "topology_store::sync: delete transfer skipped (single location)"
+                    );
                     continue;
                 }
+                trace!(
+                    file_id = %dtf.id(),
+                    src = %src,
+                    dest = %dest,
+                    "topology_store::sync: creating delete transfer"
+                );
                 let transfer = Transfer::new_delete(dtf.id().to_string(), src, dest)?;
                 self.transfers.insert_transfer(&transfer).await?;
                 delete_transfers_created += 1;
             }
         }
+        if delete_transfers_created > 0 {
+            debug!(
+                count = delete_transfers_created,
+                "topology_store::sync: delete transfers created"
+            );
+        }
 
         let distributed = dist_result.actions.len();
 
         // Phase 3: Route → Transfer作成（Send/Updateのみ）
-        let planned = plan_distribution(&dist_result.actions, &self.graph, &pending_dests);
+        // 既存データ保持locationをMulti-source Dijkstraに渡す
+        // Stale/Missing/Syncing のLocationFileはsource eligible ではないため除外
+        let existing_presences: HashMap<String, HashSet<LocationId>> = lf_map
+            .iter()
+            .map(|(file_id, lfs)| {
+                let locs: HashSet<LocationId> = lfs
+                    .iter()
+                    .filter(|lf| lf.state().is_source_eligible())
+                    .map(|lf| lf.location_id().clone())
+                    .collect();
+                (file_id.clone(), locs)
+            })
+            .collect();
+        let planned = plan_distribution(
+            &dist_result.actions,
+            &self.graph,
+            &pending_dests,
+            &existing_presences,
+        );
+        debug!(
+            planned_count = planned.len(),
+            "topology_store::sync: phase3 route planned"
+        );
 
         let transfers_created = self.create_transfers(&planned).await? + delete_transfers_created;
+        info!(
+            transfers_created = transfers_created,
+            "topology_store::sync: phase3 route done"
+        );
 
         Ok(TopologySyncResult {
             scanned: 0, // 呼び出し元がセット
@@ -216,7 +289,7 @@ impl TopologyStore {
         let dist_result = distribute_actions(
             &active_tf_refs,
             &lf_ref_map,
-            &[dest.clone()],
+            std::slice::from_ref(dest),
             &ingest_origins,
         );
 
@@ -280,14 +353,14 @@ impl TopologyStore {
 
         let (tf, is_new) = if let Some(mut tf) = existing {
             // 既存 → canonical_hash昇格 + LocationFile更新
-            tf.promote_canonical_hash(&fingerprint);
+            tf.promote_canonical_digest(&fingerprint);
             self.topology_files.upsert(&tf).await?;
             (tf, false)
         } else {
             // 新規作成
             let mut tf = TopologyFile::new(relative_path.to_string(), file_type)
-                .map_err(|e| SyncError::Domain(e))?;
-            tf.promote_canonical_hash(&fingerprint);
+                .map_err(SyncError::Domain)?;
+            tf.promote_canonical_digest(&fingerprint);
             self.topology_files.upsert(&tf).await?;
             (tf, true)
         };
@@ -307,7 +380,7 @@ impl TopologyStore {
                         fingerprint.clone(),
                         embedded_id,
                     )
-                    .map_err(|e| SyncError::Domain(e))?;
+                    .map_err(SyncError::Domain)?;
                 self.location_files.upsert(&lf).await?;
             }
         }
@@ -329,7 +402,18 @@ impl TopologyStore {
             .filter(|a| !a.is_delete())
             .cloned()
             .collect();
-        let planned = plan_distribution(&sync_actions, &self.graph, &pending_dests);
+        let existing_presences: HashMap<String, HashSet<LocationId>> = {
+            let locs: HashSet<LocationId> = lfs.iter().map(|lf| lf.location_id().clone()).collect();
+            let mut m = HashMap::new();
+            m.insert(tf.id().to_string(), locs);
+            m
+        };
+        let planned = plan_distribution(
+            &sync_actions,
+            &self.graph,
+            &pending_dests,
+            &existing_presences,
+        );
 
         let transfers_created = self.create_transfers(&planned).await?;
 
@@ -446,6 +530,11 @@ impl TopologyStore {
 
     /// TopologyDelta群をApply: TopologyFile/LocationFile更新。
     ///
+    /// delta適用順序を正規化する:
+    ///   Renamed(0) → ContentChanged(1) → Discovered(2) → Vanished(3)
+    ///
+    /// Renameが先に処理されることで、Rename先pathとDiscoveredのpath衝突を防ぐ。
+    ///
     /// 返り値: file_id → ingest origin LocationId集合（Distribute用）。
     async fn apply_ingest(
         &self,
@@ -453,12 +542,48 @@ impl TopologyStore {
     ) -> Result<HashMap<String, HashSet<LocationId>>, SyncError> {
         let mut ingest_origins: HashMap<String, HashSet<LocationId>> = HashMap::new();
 
-        for delta in deltas {
+        // delta適用順を正規化: Renamed → ContentChanged → Discovered → Vanished
+        let mut sorted_deltas: Vec<&TopologyDelta> = deltas.iter().collect();
+        sorted_deltas.sort_by_key(|d| match d {
+            TopologyDelta::Renamed(_) => 0,
+            TopologyDelta::ContentChanged(_) => 1,
+            TopologyDelta::Discovered(_) => 2,
+            TopologyDelta::Vanished(_) => 3,
+        });
+
+        let total = sorted_deltas.len();
+        let log_interval = (total / 10).max(1);
+
+        for (i, delta) in sorted_deltas.iter().enumerate() {
+            if i % log_interval == 0 {
+                info!(progress = i, total = total, "apply_ingest: processing");
+            }
             match delta {
                 TopologyDelta::Discovered(d) => {
-                    let mut tf = TopologyFile::new(d.relative_path.clone(), d.file_type)
-                        .map_err(|e| SyncError::Domain(e))?;
-                    tf.promote_canonical_hash(&d.fingerprint);
+                    // 既存TopologyFileがあれば再利用（複数Locationが同一ファイルを
+                    // Discoveredとして報告するケース）。なければ新規作成。
+                    let existing = self.topology_files.get_by_path(&d.relative_path).await?;
+                    let is_new = existing.is_none();
+                    let mut tf = if let Some(existing) = existing {
+                        trace!(
+                            path = %d.relative_path,
+                            tf_id = %existing.id(),
+                            origin = %d.origin,
+                            "apply_ingest: Discovered — reusing existing TopologyFile"
+                        );
+                        existing
+                    } else {
+                        trace!(
+                            path = %d.relative_path,
+                            origin = %d.origin,
+                            size = d.fingerprint.size,
+                            content_digest = ?d.fingerprint.content_digest,
+                            "apply_ingest: Discovered — creating new TopologyFile"
+                        );
+                        TopologyFile::new(d.relative_path.clone(), d.file_type)
+                            .map_err(SyncError::Domain)?
+                    };
+                    tf.promote_canonical_digest(&d.fingerprint);
                     self.topology_files.upsert(&tf).await?;
 
                     let lf = tf
@@ -468,8 +593,17 @@ impl TopologyStore {
                             d.fingerprint.clone(),
                             d.embedded_id.clone(),
                         )
-                        .map_err(|e| SyncError::Domain(e))?;
+                        .map_err(SyncError::Domain)?;
                     self.location_files.upsert(&lf).await?;
+
+                    if is_new {
+                        debug!(
+                            path = %d.relative_path,
+                            tf_id = %tf.id(),
+                            origin = %d.origin,
+                            "apply_ingest: NEW file registered"
+                        );
+                    }
 
                     ingest_origins
                         .entry(tf.id().to_string())
@@ -477,10 +611,18 @@ impl TopologyStore {
                         .insert(d.origin.clone());
                 }
                 TopologyDelta::ContentChanged(c) => {
+                    trace!(
+                        path = %c.relative_path,
+                        tf_id = %c.topology_file_id,
+                        origin = %c.origin,
+                        old_size = c.old_fingerprint.size,
+                        new_size = c.new_fingerprint.size,
+                        "apply_ingest: ContentChanged"
+                    );
                     // TopologyFile: canonical_hash昇格
                     if let Some(mut tf) = self.topology_files.get_by_id(&c.topology_file_id).await?
                     {
-                        tf.promote_canonical_hash(&c.new_fingerprint);
+                        tf.promote_canonical_digest(&c.new_fingerprint);
                         self.topology_files.upsert(&tf).await?;
                     }
 
@@ -505,7 +647,7 @@ impl TopologyStore {
                                         c.new_fingerprint.clone(),
                                         c.embedded_id.clone(),
                                     )
-                                    .map_err(|e| SyncError::Domain(e))?;
+                                    .map_err(SyncError::Domain)?;
                                 self.location_files.upsert(&lf).await?;
                             }
                         }
@@ -531,10 +673,17 @@ impl TopologyStore {
                         .insert(c.origin.clone());
                 }
                 TopologyDelta::Renamed(r) => {
+                    trace!(
+                        tf_id = %r.topology_file_id,
+                        old_path = %r.old_path,
+                        new_path = %r.new_path,
+                        origin = %r.origin,
+                        "apply_ingest: Renamed"
+                    );
                     if let Some(mut tf) = self.topology_files.get_by_id(&r.topology_file_id).await?
                     {
                         tf.update_path(r.new_path.clone());
-                        tf.promote_canonical_hash(&r.fingerprint);
+                        tf.promote_canonical_digest(&r.fingerprint);
                         self.topology_files.upsert(&tf).await?;
                     }
 
@@ -559,7 +708,7 @@ impl TopologyStore {
                                         r.fingerprint.clone(),
                                         r.embedded_id.clone(),
                                     )
-                                    .map_err(|e| SyncError::Domain(e))?;
+                                    .map_err(SyncError::Domain)?;
                                 self.location_files.upsert(&lf).await?;
                             }
                         }
@@ -571,6 +720,12 @@ impl TopologyStore {
                         .insert(r.origin.clone());
                 }
                 TopologyDelta::Vanished(v) => {
+                    trace!(
+                        path = %v.relative_path,
+                        tf_id = %v.topology_file_id,
+                        origin = %v.origin,
+                        "apply_ingest: Vanished"
+                    );
                     // LocationFile: mark_missing
                     let existing_lf = self
                         .location_files
@@ -585,6 +740,11 @@ impl TopologyStore {
             }
         }
 
+        info!(
+            processed = total,
+            origins = ingest_origins.len(),
+            "apply_ingest: done"
+        );
         Ok(ingest_origins)
     }
 
@@ -598,7 +758,15 @@ impl TopologyStore {
         // depends_on_index → 実Transfer IDのマッピング
         let mut transfer_ids: Vec<String> = Vec::with_capacity(planned.len());
 
-        for (_i, pt) in planned.iter().enumerate() {
+        for pt in planned.iter() {
+            trace!(
+                file_id = %pt.file_id,
+                src = %pt.src,
+                dest = %pt.dest,
+                kind = ?pt.kind,
+                depends_on = ?pt.depends_on_index,
+                "create_transfers: creating transfer"
+            );
             let transfer = if let Some(dep_idx) = pt.depends_on_index {
                 let dep_id = &transfer_ids[dep_idx];
                 Transfer::with_dependency(
@@ -616,6 +784,7 @@ impl TopologyStore {
             created += 1;
         }
 
+        trace!(created = created, "create_transfers: done");
         Ok(created)
     }
 
@@ -986,18 +1155,6 @@ mod tests {
         ) -> Result<HashMap<LocationId, usize>, SyncError> {
             Ok(HashMap::new())
         }
-
-        async fn requeue_all(
-            &self,
-            _file_ids: &[String],
-            _routes: &[(LocationId, LocationId)],
-        ) -> Result<usize, SyncError> {
-            Ok(0)
-        }
-
-        async fn purge_non_completed(&self) -> Result<usize, SyncError> {
-            Ok(0)
-        }
     }
 
     // =========================================================================
@@ -1009,10 +1166,11 @@ mod tests {
     }
 
     fn fp(hash: &str, size: u64) -> FileFingerprint {
+        use crate::domain::digest::{ByteDigest, ContentDigest};
         FileFingerprint {
-            file_hash: Some(hash.to_string()),
-            content_hash: None,
-            meta_hash: None,
+            byte_digest: Some(ByteDigest::Djb2(hash.to_string())),
+            content_digest: Some(ContentDigest(hash.to_string())),
+            meta_digest: None,
             size,
             modified_at: None,
         }

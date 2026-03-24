@@ -506,12 +506,147 @@ impl StorageBackend for RcloneBackend {
         }
     }
 
+    /// Batch delete using `rclone delete --files-from`.
+    ///
+    /// Single rclone process for N deletes: one auth handshake, internal
+    /// parallelism via `--transfers`. Significantly faster than N individual
+    /// `rclone deletefile` calls.
+    async fn delete_batch(
+        &self,
+        remote_root: &str,
+        relative_paths: &[String],
+    ) -> HashMap<String, Result<(), SyncError>> {
+        if relative_paths.is_empty() {
+            return HashMap::new();
+        }
+
+        // Validate remote_root
+        let remote_full = match self.remote_path(remote_root) {
+            Ok(r) => r,
+            Err(_) => {
+                return Self::all_batch_err(
+                    relative_paths,
+                    &format!("invalid remote_root for batch delete: {remote_root}"),
+                );
+            }
+        };
+
+        // Delete is fast (no data transfer), use shorter per-file timeout
+        let batch_timeout = self.timeout_secs + (relative_paths.len() as u64 * 2);
+
+        let file_list = relative_paths.join("\n");
+        let list_filename = format!("vdsl-del-batch-{}.txt", uuid::Uuid::new_v4().as_simple());
+        let script = format!(
+            "cat <<'__VDSL_EOF__' > /tmp/{list_filename}\n\
+             {file_list}\n\
+             __VDSL_EOF__\n\
+             rclone delete {remote_full} \
+               --files-from /tmp/{list_filename} --transfers 8; \
+             _rc=$?; rm -f /tmp/{list_filename}; exit $_rc"
+        );
+
+        let result = self.shell.exec_script(&script, Some(batch_timeout)).await;
+
+        match result {
+            Ok(output) if output.success => {
+                relative_paths.iter().map(|p| (p.clone(), Ok(()))).collect()
+            }
+            Ok(output) => {
+                let err_msg = format!(
+                    "rclone failed (exit {}): {}",
+                    output
+                        .exit_code
+                        .map_or("signal".to_string(), |c| c.to_string()),
+                    output.stderr.trim()
+                );
+                Self::all_batch_err(relative_paths, &format!("batch delete failed: {err_msg}"))
+            }
+            Err(e) => Self::all_batch_err(relative_paths, &format!("batch delete failed: {e}")),
+        }
+    }
+
     fn supports_batch(&self) -> bool {
         true
     }
 
     fn backend_type(&self) -> &str {
         "rclone"
+    }
+
+    async fn ensure(&self) -> Result<(), SyncError> {
+        // Step 1: rclone バイナリの存在確認
+        let check = self.shell.exec(&["which", "rclone"], Some(10)).await;
+        let rclone_found = matches!(&check, Ok(out) if out.success);
+
+        if !rclone_found {
+            // Step 2: インストール試行（.deb直接ダウンロード — unzip依存なし）
+            tracing::info!("rclone not found, attempting install via .deb package");
+            let install_script = concat!(
+                "curl -sL https://downloads.rclone.org/rclone-current-linux-amd64.deb -o /tmp/rclone.deb",
+                " && dpkg -i /tmp/rclone.deb",
+                " && rm -f /tmp/rclone.deb",
+            );
+            let install_result = self.shell.exec_script(install_script, Some(120)).await;
+
+            match &install_result {
+                Ok(out) if out.success => {
+                    tracing::info!("rclone installed successfully via .deb");
+                }
+                Ok(out) => {
+                    // dpkg失敗 → install.sh にフォールバック
+                    tracing::debug!(
+                        exit_code = out.exit_code,
+                        stderr = out.stderr.trim(),
+                        "dpkg install failed, falling back to install.sh"
+                    );
+                    let fallback = self
+                        .shell
+                        .exec_script("curl -sL https://rclone.org/install.sh | bash", Some(120))
+                        .await;
+                    match &fallback {
+                        Ok(o) if o.success => {
+                            tracing::info!("rclone installed successfully via install.sh");
+                        }
+                        Ok(o) => {
+                            return Err(SyncError::Init(format!(
+                                "rclone install failed (exit {}): {}",
+                                o.exit_code.unwrap_or(-1),
+                                o.stderr.trim()
+                            )));
+                        }
+                        Err(e) => {
+                            return Err(SyncError::Init(format!(
+                                "rclone install.sh exec failed: {e}"
+                            )));
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(SyncError::Init(format!(
+                        "rclone .deb install exec failed: {e}"
+                    )));
+                }
+            }
+
+            // Step 3: インストール後の再確認
+            let recheck = self.shell.exec(&["which", "rclone"], Some(10)).await;
+            match &recheck {
+                Ok(out) if out.success => {}
+                _ => {
+                    return Err(SyncError::Init(
+                        "rclone still not found after install attempt".to_string(),
+                    ));
+                }
+            }
+        }
+
+        // Step 4: 接続テスト（rclone lsf でバケットルートにアクセス）
+        let remote = self.remote.expose_secret();
+        self.exec_rclone_with_timeout(&["lsf", "--max-depth", "1", remote], 30)
+            .await
+            .map_err(|e| SyncError::Init(format!("rclone connectivity test failed: {e}")))?;
+
+        Ok(())
     }
 }
 

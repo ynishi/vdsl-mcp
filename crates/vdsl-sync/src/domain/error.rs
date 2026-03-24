@@ -21,4 +21,9 @@ pub enum DomainError {
 
     #[error("validation error: {field} — {reason}")]
     Validation { field: String, reason: String },
+
+    /// 異なるダイジェストアルゴリズム間の比較試行。
+    /// ByteDigest::matches_same_algo() で検出される。
+    #[error("digest algorithm mismatch: cannot compare {left} with {right}")]
+    DigestAlgorithmMismatch { left: String, right: String },
 }

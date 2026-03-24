@@ -116,16 +116,51 @@ pub trait StorageBackend: Send + Sync {
         results
     }
 
+    /// Delete multiple files in a single batch operation.
+    ///
+    /// `remote_root` is the remote base directory, `relative_paths` are paths
+    /// relative to it. Uses `rclone delete --files-from` for rclone backends.
+    ///
+    /// Returns a map of relative_path → Ok/Err for per-file status tracking.
+    /// Default implementation falls back to sequential `delete()` calls.
+    async fn delete_batch(
+        &self,
+        remote_root: &str,
+        relative_paths: &[String],
+    ) -> HashMap<String, Result<(), SyncError>> {
+        let mut results = HashMap::with_capacity(relative_paths.len());
+        for rel in relative_paths {
+            let remote_path = if remote_root.is_empty() {
+                rel.clone()
+            } else {
+                format!("{remote_root}/{rel}")
+            };
+            let result = self.delete(&remote_path).await;
+            results.insert(rel.clone(), result);
+        }
+        results
+    }
+
     /// Whether this backend supports efficient batch push/pull.
     ///
-    /// When true, callers should prefer `push_batch`/`pull_batch` over individual calls.
-    /// Default: false (sequential fallback).
+    /// When true, callers should prefer `push_batch`/`pull_batch`/`delete_batch`
+    /// over individual calls. Default: false (sequential fallback).
     fn supports_batch(&self) -> bool {
         false
     }
 
     /// Backend type name for display and config matching.
     fn backend_type(&self) -> &str;
+
+    /// 外部ツールの到達確認 + 確保。
+    ///
+    /// - rclone: バイナリ存在確認 → なければインストール → 接続テスト
+    /// - memory: 常にOk
+    ///
+    /// デフォルト実装: `list("")` で接続テスト（バイナリが存在しなければここで失敗する）。
+    async fn ensure(&self) -> Result<(), SyncError> {
+        self.list("").await.map(|_| ())
+    }
 }
 
 /// In-memory backend for testing.
@@ -268,11 +303,21 @@ pub mod memory {
                 .push_batch(src_root, dest_root, relative_paths)
                 .await
         }
+        async fn delete_batch(
+            &self,
+            remote_root: &str,
+            relative_paths: &[String],
+        ) -> HashMap<String, Result<(), SyncError>> {
+            (**self).delete_batch(remote_root, relative_paths).await
+        }
         fn supports_batch(&self) -> bool {
             (**self).supports_batch()
         }
         fn backend_type(&self) -> &str {
             (**self).backend_type()
+        }
+        async fn ensure(&self) -> Result<(), SyncError> {
+            (**self).ensure().await
         }
     }
 }

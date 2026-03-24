@@ -80,7 +80,11 @@ impl TopologyScanner {
     /// 1. LocationScanner毎にscan() → ScannedFile[]
     /// 2. DB上のTopologyFile/LocationFileを取得
     /// 3. ScannedFile × TopologyFile マッチング → TopologyDelta生成
-    pub async fn scan_all(&self, excludes: &[glob::Pattern]) -> Result<ScanResult, SyncError> {
+    pub async fn scan_all(
+        &self,
+        excludes: &[glob::Pattern],
+        skip_locations: &std::collections::HashSet<crate::domain::location::LocationId>,
+    ) -> Result<ScanResult, SyncError> {
         let mut all_scanned: Vec<ScannedFile> = Vec::new();
         let mut all_errors: Vec<TopologyScanError> = Vec::new();
         let mut scan_report = ScanReport::new();
@@ -91,6 +95,21 @@ impl TopologyScanner {
         // Phase 1: Location毎にスキャン
         for (idx, scanner) in self.scanners.iter().enumerate() {
             let loc_id = scanner.location_id().clone();
+
+            if skip_locations.contains(&loc_id) {
+                tracing::warn!(
+                    location = %loc_id,
+                    "topology_scan: skipping location (ensure failed)"
+                );
+                scan_report.record(
+                    loc_id,
+                    ScanOutcome::Failed {
+                        error: "skipped: ensure failed".to_string(),
+                    },
+                );
+                continue;
+            }
+
             tracing::info!(
                 location = %loc_id,
                 index = idx,
@@ -245,6 +264,13 @@ fn match_and_classify(
             ScanMatch::ByHash => {
                 matched_tf_ids.insert(tf.id().to_string());
                 if tf.relative_path() != entry.relative_path {
+                    tracing::debug!(
+                        scan_path = %entry.relative_path,
+                        tf_path = %tf.relative_path(),
+                        tf_id = %tf.id(),
+                        origin = %entry.origin,
+                        "match_and_classify: ByHash → Renamed"
+                    );
                     return Some(TopologyDelta::Renamed(
                         crate::domain::topology_delta::RenamedFile {
                             topology_file_id: tf.id().to_string(),
@@ -257,11 +283,24 @@ fn match_and_classify(
                         },
                     ));
                 }
+                tracing::trace!(
+                    path = %entry.relative_path,
+                    tf_id = %tf.id(),
+                    origin = %entry.origin,
+                    "match_and_classify: ByHash + same path → unchanged"
+                );
                 return None;
             }
             ScanMatch::ByPath => {
                 matched_tf_ids.insert(tf.id().to_string());
                 if fingerprint_changed(tf, &entry.fingerprint) {
+                    tracing::debug!(
+                        path = %entry.relative_path,
+                        tf_id = %tf.id(),
+                        origin = %entry.origin,
+                        size = entry.fingerprint.size,
+                        "match_and_classify: ByPath → ContentChanged"
+                    );
                     return Some(TopologyDelta::ContentChanged(ContentChangedFile {
                         topology_file_id: tf.id().to_string(),
                         relative_path: entry.relative_path.clone(),
@@ -272,12 +311,26 @@ fn match_and_classify(
                         embedded_id: entry.embedded_id.clone(),
                     }));
                 }
+                tracing::trace!(
+                    path = %entry.relative_path,
+                    tf_id = %tf.id(),
+                    origin = %entry.origin,
+                    "match_and_classify: ByPath + fingerprint unchanged → skip"
+                );
                 return None;
             }
             ScanMatch::NoMatch => continue,
         }
     }
 
+    tracing::debug!(
+        path = %entry.relative_path,
+        origin = %entry.origin,
+        size = entry.fingerprint.size,
+        content_digest = ?entry.fingerprint.content_digest,
+        "match_and_classify: Discovered (no match in {} topology_files)",
+        all_tfs.len()
+    );
     Some(TopologyDelta::Discovered(DiscoveredFile {
         id: uuid::Uuid::new_v4().to_string(),
         relative_path: entry.relative_path.clone(),
@@ -290,10 +343,7 @@ fn match_and_classify(
 
 /// TopologyFileのcanonical_hashとスキャンfingerprintを比較。
 fn fingerprint_changed(tf: &TopologyFile, scan_fp: &FileFingerprint) -> bool {
-    let scan_canonical = scan_fp
-        .content_hash
-        .as_deref()
-        .or(scan_fp.file_hash.as_deref());
+    let scan_canonical = scan_fp.content_digest.as_ref().map(|d| d.0.as_str());
     match (tf.canonical_hash(), scan_canonical) {
         (Some(db), Some(scan)) => db != scan,
         (None, Some(_)) => true,
@@ -305,9 +355,11 @@ fn fingerprint_changed(tf: &TopologyFile, scan_fp: &FileFingerprint) -> bool {
 /// TopologyFileからfingerprint近似値を構築（ContentChangedのold_fingerprint用）。
 fn extract_tf_fingerprint(tf: &TopologyFile) -> FileFingerprint {
     FileFingerprint {
-        file_hash: tf.canonical_hash().map(|s| s.to_string()),
-        content_hash: None,
-        meta_hash: None,
+        byte_digest: None,
+        content_digest: tf
+            .canonical_hash()
+            .map(|s| crate::domain::digest::ContentDigest(s.to_string())),
+        meta_digest: None,
         size: 0,
         modified_at: None,
     }

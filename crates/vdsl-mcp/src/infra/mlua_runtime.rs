@@ -65,7 +65,6 @@ mod inner {
     use std::sync::{Arc, Mutex};
 
     use crate::infra::sync_tasks::SyncTaskManager;
-    use vdsl_sync::SyncStoreSdk;
 
     /// rusqlite Connection wrapped for mlua UserData.
     ///

@@ -18,17 +18,11 @@ use rusqlite::params;
 use crate::application::error::SyncError;
 use crate::domain::file_type::FileType;
 use crate::domain::location::LocationId;
-use crate::domain::tracked_file::TrackedFile;
 use crate::domain::transfer::Transfer;
 use crate::infra::error::InfraError;
-use crate::infra::file_store::FileStore;
-use crate::infra::remote_store::RemoteStore;
-use crate::infra::store::RemoteConfig;
 use crate::infra::transfer_store::TransferStore;
 
-use mapping::{
-    query_tracked_files, query_transfers, row_to_remote_tuple, ts_to_string, tuple_to_remote_config,
-};
+use mapping::{query_transfers, ts_to_string};
 
 /// SQLite-backed sync store.
 ///
@@ -98,249 +92,8 @@ fn map_call_err(e: tokio_rusqlite::Error<SyncError>) -> SyncError {
 }
 
 // =============================================================================
-// FileStore trait implementation
+// FileStore — REMOVED (replaced by TopologyFileStore + LocationFileStore)
 // =============================================================================
-
-#[async_trait]
-impl FileStore for SqliteSyncStore {
-    async fn upsert_file(&self, file: &TrackedFile) -> Result<(), SyncError> {
-        let file = file.clone();
-        self.conn
-            .call(move |conn| {
-                let file_size_i64 = i64::try_from(file.file_size()).map_err(|_| {
-                    InfraError::Store { op: "sqlite", reason: format!(
-                        "file_size exceeds i64::MAX: {} (file {})",
-                        file.file_size(),
-                        file.id()
-                    ) }
-                })?;
-                let modified_at_str = file.modified_at().map(ts_to_string);
-                let registered_at_str = ts_to_string(file.registered_at());
-                let updated_at_str = ts_to_string(file.updated_at());
-                let deleted_at_str = file.deleted_at().map(ts_to_string);
-                conn.execute(
-                    "INSERT INTO tracked_files (id, relative_path, file_type, file_hash, content_hash, file_size, embedded_id, modified_at, registered_at, updated_at, deleted_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                     ON CONFLICT (relative_path) DO UPDATE SET
-                         file_type = excluded.file_type,
-                         file_hash = excluded.file_hash,
-                         content_hash = excluded.content_hash,
-                         file_size = excluded.file_size,
-                         embedded_id = excluded.embedded_id,
-                         modified_at = excluded.modified_at,
-                         updated_at = excluded.updated_at,
-                         deleted_at = excluded.deleted_at",
-                    params![
-                        file.id(),
-                        file.relative_path(),
-                        file.file_type().as_str(),
-                        file.file_hash(),
-                        file.content_hash(),
-                        file_size_i64,
-                        file.embedded_id(),
-                        modified_at_str,
-                        registered_at_str,
-                        updated_at_str,
-                        deleted_at_str,
-                    ],
-                )
-                .map_err(|e| InfraError::Store { op: "sqlite", reason: format!("upsert_file failed: {e}") })?;
-                Ok(())
-            })
-            .await
-            .map_err(map_call_err)
-    }
-
-    async fn get_file_by_path(
-        &self,
-        relative_path: &str,
-    ) -> Result<Option<TrackedFile>, SyncError> {
-        let path = relative_path.to_string();
-        self.conn
-            .call(move |conn| {
-                let files = query_tracked_files(
-                    conn,
-                    "SELECT * FROM tracked_files WHERE relative_path = ?",
-                    &[&path as &dyn rusqlite::types::ToSql],
-                )?;
-                Ok(files.into_iter().next())
-            })
-            .await
-            .map_err(map_call_err)
-    }
-
-    async fn get_file_by_id(&self, id: &str) -> Result<Option<TrackedFile>, SyncError> {
-        let id = id.to_string();
-        self.conn
-            .call(move |conn| {
-                let files = query_tracked_files(
-                    conn,
-                    "SELECT * FROM tracked_files WHERE id = ?",
-                    &[&id as &dyn rusqlite::types::ToSql],
-                )?;
-                Ok(files.into_iter().next())
-            })
-            .await
-            .map_err(map_call_err)
-    }
-
-    async fn find_duplicate_file(
-        &self,
-        file_hash: &str,
-        content_hash: Option<&str>,
-        exclude_path: &str,
-    ) -> Result<Option<TrackedFile>, SyncError> {
-        let file_hash = file_hash.to_string();
-        let content_hash = content_hash.map(|s| s.to_string());
-        let exclude_path = exclude_path.to_string();
-        self.conn
-            .call(move |conn| {
-                if let Some(ref ch) = content_hash {
-                    let files = query_tracked_files(
-                        conn,
-                        "SELECT * FROM tracked_files WHERE content_hash = ? AND relative_path != ?",
-                        &[
-                            ch as &dyn rusqlite::types::ToSql,
-                            &exclude_path as &dyn rusqlite::types::ToSql,
-                        ],
-                    )?;
-                    if let Some(f) = files.into_iter().next() {
-                        return Ok(Some(f));
-                    }
-                }
-                let files = query_tracked_files(
-                    conn,
-                    "SELECT * FROM tracked_files WHERE file_hash = ? AND relative_path != ?",
-                    &[
-                        &file_hash as &dyn rusqlite::types::ToSql,
-                        &exclude_path as &dyn rusqlite::types::ToSql,
-                    ],
-                )?;
-                Ok(files.into_iter().next())
-            })
-            .await
-            .map_err(map_call_err)
-    }
-
-    async fn delete_file(&self, relative_path: &str) -> Result<bool, SyncError> {
-        let path = relative_path.to_string();
-        self.conn
-            .call(move |conn| {
-                let changes = conn
-                    .execute(
-                        "DELETE FROM tracked_files WHERE relative_path = ?",
-                        params![path],
-                    )
-                    .map_err(|e| InfraError::Store {
-                        op: "sqlite",
-                        reason: format!("{e}"),
-                    })?;
-                Ok(changes > 0)
-            })
-            .await
-            .map_err(map_call_err)
-    }
-
-    async fn list_files(
-        &self,
-        file_type: Option<FileType>,
-        limit: Option<usize>,
-    ) -> Result<Vec<TrackedFile>, SyncError> {
-        self.conn
-            .call(move |conn| {
-                let mut sql = String::from("SELECT * FROM tracked_files");
-                let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-                if let Some(ft) = file_type {
-                    sql.push_str(" WHERE file_type = ?");
-                    param_values.push(Box::new(ft.as_str().to_string()));
-                }
-                sql.push_str(" ORDER BY updated_at DESC");
-                if let Some(n) = limit {
-                    sql.push_str(" LIMIT ?");
-                    let n_i64 = i64::try_from(n).map_err(|_| InfraError::Store {
-                        op: "sqlite",
-                        reason: format!("limit exceeds i64::MAX: {n}"),
-                    })?;
-                    param_values.push(Box::new(n_i64));
-                }
-
-                let refs: Vec<&dyn rusqlite::types::ToSql> =
-                    param_values.iter().map(|p| p.as_ref()).collect();
-                query_tracked_files(conn, &sql, &refs)
-            })
-            .await
-            .map_err(map_call_err)
-    }
-
-    async fn count_files(&self) -> Result<usize, SyncError> {
-        self.conn
-            .call(|conn| {
-                let count: usize = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM tracked_files WHERE deleted_at IS NULL",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .map_err(|e| InfraError::Store {
-                        op: "sqlite",
-                        reason: format!("count_files failed: {e}"),
-                    })?;
-                Ok(count)
-            })
-            .await
-            .map_err(map_call_err)
-    }
-
-    async fn list_all_paths(&self) -> Result<Vec<String>, SyncError> {
-        self.conn
-            .call(|conn| {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT relative_path FROM tracked_files WHERE deleted_at IS NULL ORDER BY relative_path",
-                    )
-                    .map_err(|e| InfraError::Store { op: "sqlite", reason: format!("{e}") })?;
-                let rows = stmt
-                    .query_map([], |row| row.get::<_, String>(0))
-                    .map_err(|e| InfraError::Store { op: "sqlite", reason: format!("{e}") })?;
-                let mut paths = Vec::new();
-                for row in rows {
-                    paths.push(row.map_err(|e| InfraError::Store { op: "sqlite", reason: format!("{e}") })?);
-                }
-                Ok(paths)
-            })
-            .await
-            .map_err(map_call_err)
-    }
-
-    async fn list_all_ids(&self) -> Result<Vec<String>, SyncError> {
-        self.conn
-            .call(|conn| {
-                let mut stmt = conn
-                    .prepare("SELECT id FROM tracked_files WHERE deleted_at IS NULL ORDER BY id")
-                    .map_err(|e| InfraError::Store {
-                        op: "sqlite",
-                        reason: format!("{e}"),
-                    })?;
-                let rows = stmt
-                    .query_map([], |row| row.get::<_, String>(0))
-                    .map_err(|e| InfraError::Store {
-                        op: "sqlite",
-                        reason: format!("{e}"),
-                    })?;
-                let mut ids = Vec::new();
-                for row in rows {
-                    ids.push(row.map_err(|e| InfraError::Store {
-                        op: "sqlite",
-                        reason: format!("{e}"),
-                    })?);
-                }
-                Ok(ids)
-            })
-            .await
-            .map_err(map_call_err)
-    }
-}
 
 // =============================================================================
 // TransferStore trait implementation
@@ -579,27 +332,13 @@ impl TransferStore for SqliteSyncStore {
     ) -> Result<std::collections::HashMap<LocationId, usize>, SyncError> {
         self.conn
             .call(|conn| {
-                // src（送出元＝ファイル存在）と completed dest を UNION し、
-                // location × file_id の重複を排除してカウント
+                // location_filesのactive件数をlocation別にカウント
                 let mut stmt = conn
                     .prepare(
-                        "WITH latest AS (
-                             SELECT t.src, t.dest, t.state, t.file_id
-                             FROM transfers t
-                             WHERE NOT EXISTS (
-                                 SELECT 1 FROM transfers t2
-                                 WHERE t2.file_id = t.file_id
-                                   AND t2.dest = t.dest
-                                   AND t2.ROWID > t.ROWID
-                             )
-                         )
-                         SELECT location, COUNT(DISTINCT file_id) as file_count
-                         FROM (
-                             SELECT src AS location, file_id FROM latest
-                             UNION
-                             SELECT dest AS location, file_id FROM latest WHERE state = 'completed'
-                         )
-                         GROUP BY location",
+                        "SELECT location_id, COUNT(DISTINCT file_id) as file_count
+                         FROM location_files
+                         WHERE state = 'active'
+                         GROUP BY location_id",
                     )
                     .map_err(|e| InfraError::Store {
                         op: "sqlite",
@@ -723,228 +462,11 @@ impl TransferStore for SqliteSyncStore {
             .await
             .map_err(map_call_err)
     }
-
-    async fn requeue_all(
-        &self,
-        file_ids: &[String],
-        routes: &[(LocationId, LocationId)],
-    ) -> Result<usize, SyncError> {
-        // Build route pairs as owned strings for the closure.
-        let route_pairs: Vec<(String, String)> = routes
-            .iter()
-            .map(|(s, d)| (s.as_str().to_string(), d.as_str().to_string()))
-            .collect();
-        let file_ids = file_ids.to_vec();
-
-        self.conn
-            .call(move |conn| {
-                let tx = conn
-                    .transaction()
-                    .map_err(|e| InfraError::Store { op: "sqlite", reason: format!("requeue_all tx: {e}") })?;
-
-                let mut inserted: usize = 0;
-                for file_id in &file_ids {
-                    for (src, dest) in &route_pairs {
-                        // Skip if a completed transfer already exists for this file×route.
-                        let has_completed: bool = tx
-                            .query_row(
-                                "SELECT EXISTS(
-                                    SELECT 1 FROM transfers
-                                    WHERE file_id = ?1 AND src = ?2 AND dest = ?3
-                                      AND state = 'completed'
-                                )",
-                                params![file_id, src, dest],
-                                |row| row.get(0),
-                            )
-                            .map_err(|e| InfraError::Store {
-                                op: "sqlite",
-                                reason: format!("requeue_all check: {e}"),
-                            })?;
-
-                        if has_completed {
-                            continue;
-                        }
-
-                        let src_loc = LocationId::new(src).map_err(|e| InfraError::Store {
-                            op: "sqlite",
-                            reason: format!("requeue_all: {e}"),
-                        })?;
-                        let dest_loc = LocationId::new(dest).map_err(|e| InfraError::Store {
-                            op: "sqlite",
-                            reason: format!("requeue_all: {e}"),
-                        })?;
-                        let t = Transfer::new(file_id.clone(), src_loc, dest_loc).map_err(|e| {
-                            InfraError::Store {
-                                op: "sqlite",
-                                reason: format!("requeue_all: {e}"),
-                            }
-                        })?;
-                        let created_at_str = ts_to_string(t.created_at());
-                        tx.execute(
-                            "INSERT INTO transfers (id, file_id, src, dest, kind, state, error, error_kind, attempt, created_at, started_at, finished_at)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, 0, ?7, NULL, NULL)",
-                            params![
-                                t.id(),
-                                t.file_id(),
-                                t.src().as_str(),
-                                t.dest().as_str(),
-                                t.kind().as_str(),
-                                t.state().as_str(),
-                                created_at_str,
-                            ],
-                        )
-                        .map_err(|e| InfraError::Store { op: "sqlite", reason: format!("requeue_all insert: {e}") })?;
-                        inserted += 1;
-                    }
-                }
-
-                tx.commit()
-                    .map_err(|e| InfraError::Store { op: "sqlite", reason: format!("requeue_all commit: {e}") })?;
-                Ok(inserted)
-            })
-            .await
-            .map_err(map_call_err)
-    }
-
-    async fn purge_non_completed(&self) -> Result<usize, SyncError> {
-        self.conn
-            .call(|conn| {
-                let deleted = conn
-                    .execute(
-                        "DELETE FROM transfers WHERE state NOT IN ('completed', 'cancelled')",
-                        [],
-                    )
-                    .map_err(|e| InfraError::Store {
-                        op: "sqlite",
-                        reason: format!("purge_non_completed: {e}"),
-                    })?;
-                Ok(deleted)
-            })
-            .await
-            .map_err(map_call_err)
-    }
 }
 
 // =============================================================================
-// RemoteStore trait implementation
+// RemoteStore — REMOVED (replaced by Location infra)
 // =============================================================================
-
-#[async_trait]
-impl RemoteStore for SqliteSyncStore {
-    async fn register_remote(&self, remote: &RemoteConfig) -> Result<(), SyncError> {
-        let remote = remote.clone();
-        self.conn
-            .call(move |conn| {
-                let config_json = serde_json::to_string(&remote.config)
-                    .map_err(|e| InfraError::Store { op: "sqlite", reason: format!("config serialize: {e}") })?;
-                let created_at_str = ts_to_string(remote.created_at);
-                conn.execute(
-                    "INSERT INTO sync_remotes (location_id, backend, config, created_at)
-                     VALUES (?, ?, ?, ?)
-                     ON CONFLICT (location_id) DO UPDATE SET backend = excluded.backend, config = excluded.config",
-                    params![
-                        remote.location_id.as_str(),
-                        remote.backend,
-                        config_json,
-                        created_at_str,
-                    ],
-                )
-                .map_err(|e| InfraError::Store { op: "sqlite", reason: format!("{e}") })?;
-                Ok(())
-            })
-            .await
-            .map_err(map_call_err)
-    }
-
-    async fn get_remote(
-        &self,
-        location_id: &LocationId,
-    ) -> Result<Option<RemoteConfig>, SyncError> {
-        let loc_str = location_id.as_str().to_string();
-        self.conn
-            .call(move |conn| {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT location_id, backend, config, created_at
-                         FROM sync_remotes WHERE location_id = ?",
-                    )
-                    .map_err(|e| InfraError::Store {
-                        op: "sqlite",
-                        reason: format!("{e}"),
-                    })?;
-                let mut rows = stmt
-                    .query_map(params![loc_str], row_to_remote_tuple)
-                    .map_err(|e| InfraError::Store {
-                        op: "sqlite",
-                        reason: format!("{e}"),
-                    })?;
-                match rows.next() {
-                    Some(row) => {
-                        let (loc, backend, config_str, created_at_str) =
-                            row.map_err(|e| InfraError::Store {
-                                op: "sqlite",
-                                reason: format!("{e}"),
-                            })?;
-                        Ok(Some(tuple_to_remote_config(
-                            loc,
-                            backend,
-                            config_str,
-                            created_at_str,
-                        )?))
-                    }
-                    None => Ok(None),
-                }
-            })
-            .await
-            .map_err(map_call_err)
-    }
-
-    async fn list_remotes(&self) -> Result<Vec<RemoteConfig>, SyncError> {
-        self.conn
-            .call(|conn| {
-                let mut stmt = conn
-                    .prepare("SELECT location_id, backend, config, created_at FROM sync_remotes ORDER BY location_id")
-                    .map_err(|e| InfraError::Store { op: "sqlite", reason: format!("{e}") })?;
-                let rows = stmt
-                    .query_map([], row_to_remote_tuple)
-                    .map_err(|e| InfraError::Store { op: "sqlite", reason: format!("{e}") })?;
-
-                let mut remotes = Vec::new();
-                for row in rows {
-                    let (loc, backend, config_str, created_at_str) =
-                        row.map_err(|e| InfraError::Store { op: "sqlite", reason: format!("{e}") })?;
-                    remotes.push(tuple_to_remote_config(
-                        loc,
-                        backend,
-                        config_str,
-                        created_at_str,
-                    )?);
-                }
-                Ok(remotes)
-            })
-            .await
-            .map_err(map_call_err)
-    }
-
-    async fn remove_remote(&self, location_id: &LocationId) -> Result<bool, SyncError> {
-        let loc_str = location_id.as_str().to_string();
-        self.conn
-            .call(move |conn| {
-                let changes = conn
-                    .execute(
-                        "DELETE FROM sync_remotes WHERE location_id = ?",
-                        params![loc_str],
-                    )
-                    .map_err(|e| InfraError::Store {
-                        op: "sqlite",
-                        reason: format!("{e}"),
-                    })?;
-                Ok(changes > 0)
-            })
-            .await
-            .map_err(map_call_err)
-    }
-}
 
 // =============================================================================
 // TopologyFileStore trait implementation
@@ -963,7 +485,16 @@ impl TopologyFileStore for SqliteSyncStore {
             .call(move |conn| {
                 let registered_at_str = ts_to_string(file.registered_at());
                 let deleted_at_str = file.deleted_at().map(ts_to_string);
-                conn.execute(
+                let params = params![
+                    file.id(),
+                    file.relative_path(),
+                    file.canonical_hash(),
+                    file.file_type().as_str(),
+                    registered_at_str,
+                    deleted_at_str,
+                ];
+
+                let result = conn.execute(
                     "INSERT INTO topology_files (id, relative_path, canonical_hash, file_type, registered_at, deleted_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT (id) DO UPDATE SET
@@ -972,20 +503,63 @@ impl TopologyFileStore for SqliteSyncStore {
                          file_type = excluded.file_type,
                          registered_at = excluded.registered_at,
                          deleted_at = excluded.deleted_at",
-                    params![
-                        file.id(),
-                        file.relative_path(),
-                        file.canonical_hash(),
-                        file.file_type().as_str(),
-                        registered_at_str,
-                        deleted_at_str,
-                    ],
-                )
-                .map_err(|e| InfraError::Store {
-                    op: "sqlite",
-                    reason: format!("upsert topology_file failed: {e}"),
-                })?;
-                Ok(())
+                    params,
+                );
+
+                match result {
+                    Ok(_) => Ok(()),
+                    Err(rusqlite::Error::SqliteFailure(err, _))
+                        if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+                    {
+                        // path衝突: 同一relative_pathの別IDが存在。
+                        // 既存レコードをsoft delete（Rename後の旧pathに新ファイルが来た等）。
+                        tracing::warn!(
+                            id = file.id(),
+                            path = file.relative_path(),
+                            "topology_file upsert: path conflict — retiring existing record"
+                        );
+                        let now_rfc3339 = ts_to_string(chrono::Utc::now());
+                        conn.execute(
+                            "UPDATE topology_files SET deleted_at = ?
+                             WHERE relative_path = ?2 AND id != ?3 AND deleted_at IS NULL",
+                            params![now_rfc3339, file.relative_path(), file.id()],
+                        )
+                        .map_err(|e| InfraError::Store {
+                            op: "sqlite",
+                            reason: format!("retire conflicting topology_file failed: {e}"),
+                        })?;
+
+                        // リトライ
+                        conn.execute(
+                            "INSERT INTO topology_files (id, relative_path, canonical_hash, file_type, registered_at, deleted_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                             ON CONFLICT (id) DO UPDATE SET
+                                 relative_path = excluded.relative_path,
+                                 canonical_hash = excluded.canonical_hash,
+                                 file_type = excluded.file_type,
+                                 registered_at = excluded.registered_at,
+                                 deleted_at = excluded.deleted_at",
+                            params![
+                                file.id(),
+                                file.relative_path(),
+                                file.canonical_hash(),
+                                file.file_type().as_str(),
+                                registered_at_str,
+                                deleted_at_str,
+                            ],
+                        )
+                        .map_err(|e| InfraError::Store {
+                            op: "sqlite",
+                            reason: format!("upsert topology_file retry failed: {e}"),
+                        })?;
+                        Ok(())
+                    }
+                    Err(e) => Err(InfraError::Store {
+                        op: "sqlite",
+                        reason: format!("upsert topology_file failed: {e}"),
+                    }
+                    .into()),
+                }
             })
             .await
             .map_err(map_call_err)
@@ -1175,9 +749,9 @@ impl LocationFileStore for SqliteSyncStore {
                         file.file_id(),
                         file.location_id().as_str(),
                         file.relative_path(),
-                        file.fingerprint().file_hash,
-                        file.fingerprint().content_hash,
-                        file.fingerprint().meta_hash,
+                        file.fingerprint().byte_digest.as_ref().map(|d| d.to_prefixed_string()),
+                        file.fingerprint().content_digest.as_ref().map(|d| d.0.clone()),
+                        file.fingerprint().meta_digest.as_ref().map(|d| d.0.clone()),
                         size_i64,
                         modified_at_str,
                         file.state().as_str(),
@@ -1331,181 +905,29 @@ impl LocationFileStore for SqliteSyncStore {
 mod tests {
     use super::*;
 
-    use crate::domain::tracked_file::TrackedFile;
+    use crate::domain::topology_file::TopologyFile;
     use crate::domain::transfer::Transfer;
-    use crate::infra::file_store::FileStore;
+    use crate::infra::topology_file_store::TopologyFileStore;
     use crate::infra::transfer_store::TransferStore;
 
     fn loc(s: &str) -> LocationId {
         LocationId::new(s).expect("valid test location")
     }
 
-    fn sample_tracked_file(path: &str) -> TrackedFile {
-        TrackedFile::from_scan(
-            path.into(),
-            FileType::Image,
-            format!("fh_{}", path.replace('/', "_")),
-            None,
-            1024,
-            None,
-        )
-        .expect("valid test data")
+    /// Create a test TopologyFile and insert it into the store.
+    /// Returns the TopologyFile (for use as FK target in transfers).
+    async fn insert_test_topology_file(store: &SqliteSyncStore, path: &str) -> TopologyFile {
+        let tf =
+            TopologyFile::new(path.to_string(), FileType::Image).expect("valid test topology file");
+        TopologyFileStore::upsert(&*store, &tf)
+            .await
+            .expect("insert topology file");
+        tf
     }
 
     // =========================================================================
-    // FileStore tests
+    // (FileStore tests removed — replaced by TopologyFileStore)
     // =========================================================================
-
-    #[tokio::test]
-    async fn upsert_and_get_file() {
-        let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let file = sample_tracked_file("output/test.png");
-
-        store.upsert_file(&file).await.expect("upsert");
-        let got = store
-            .get_file_by_path("output/test.png")
-            .await
-            .expect("get")
-            .expect("found");
-
-        assert_eq!(got.relative_path(), "output/test.png");
-        assert_eq!(got.file_type(), FileType::Image);
-        assert_eq!(got.file_size(), 1024);
-    }
-
-    #[tokio::test]
-    async fn upsert_updates_existing() {
-        let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let mut file = sample_tracked_file("output/up.png");
-        store.upsert_file(&file).await.expect("insert");
-
-        file.update_from_scan(
-            FileType::Image,
-            "new_hash".into(),
-            Some("ch".into()),
-            2048,
-            None,
-        );
-        store.upsert_file(&file).await.expect("upsert update");
-
-        let got = store
-            .get_file_by_path("output/up.png")
-            .await
-            .expect("get")
-            .expect("found");
-        assert_eq!(got.file_hash(), "new_hash");
-        assert_eq!(got.content_hash(), Some("ch"));
-        assert_eq!(got.file_size(), 2048);
-    }
-
-    #[tokio::test]
-    async fn get_nonexistent() {
-        let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let got = store.get_file_by_path("no/such/file").await.expect("get");
-        assert!(got.is_none());
-    }
-
-    #[tokio::test]
-    async fn delete_file() {
-        let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let file = sample_tracked_file("output/del.png");
-        store.upsert_file(&file).await.expect("insert");
-
-        assert!(store.delete_file("output/del.png").await.expect("delete"));
-        assert!(!store.delete_file("output/del.png").await.expect("delete2"));
-        assert!(store
-            .get_file_by_path("output/del.png")
-            .await
-            .expect("get")
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn find_duplicate_by_file_hash() {
-        let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let file = TrackedFile::from_scan(
-            "output/a.png".into(),
-            FileType::Image,
-            "deadbeef".into(),
-            None,
-            512,
-            None,
-        )
-        .expect("valid test data");
-        store.upsert_file(&file).await.expect("insert");
-
-        let dup = store
-            .find_duplicate_file("deadbeef", None, "output/b.png")
-            .await
-            .expect("find");
-        assert_eq!(dup.expect("dup").relative_path(), "output/a.png");
-
-        let no_dup = store
-            .find_duplicate_file("deadbeef", None, "output/a.png")
-            .await
-            .expect("find");
-        assert!(no_dup.is_none());
-    }
-
-    #[tokio::test]
-    async fn find_duplicate_content_hash_priority() {
-        let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let file = TrackedFile::from_scan(
-            "output/a.png".into(),
-            FileType::Image,
-            "file_aaa".into(),
-            Some("content_xxx".into()),
-            512,
-            None,
-        )
-        .expect("valid test data");
-        store.upsert_file(&file).await.expect("insert");
-
-        let dup = store
-            .find_duplicate_file("file_bbb", Some("content_xxx"), "output/b.png")
-            .await
-            .expect("find");
-        assert_eq!(dup.expect("dup").relative_path(), "output/a.png");
-    }
-
-    #[tokio::test]
-    async fn list_files_with_filter() {
-        let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        store
-            .upsert_file(&sample_tracked_file("a.png"))
-            .await
-            .expect("insert");
-        store
-            .upsert_file(
-                &TrackedFile::from_scan(
-                    "b.json".into(),
-                    FileType::Asset,
-                    "fh_b".into(),
-                    None,
-                    64,
-                    None,
-                )
-                .expect("valid test data"),
-            )
-            .await
-            .expect("insert");
-        store
-            .upsert_file(&sample_tracked_file("c.png"))
-            .await
-            .expect("insert");
-
-        let all = store.list_files(None, None).await.expect("list");
-        assert_eq!(all.len(), 3);
-
-        let images = store
-            .list_files(Some(FileType::Image), None)
-            .await
-            .expect("list images");
-        assert_eq!(images.len(), 2);
-
-        let limited = store.list_files(None, Some(1)).await.expect("limited");
-        assert_eq!(limited.len(), 1);
-    }
 
     // =========================================================================
     // TransferStore tests
@@ -1514,8 +936,7 @@ mod tests {
     #[tokio::test]
     async fn insert_and_query_transfer() {
         let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let file = sample_tracked_file("output/t.png");
-        store.upsert_file(&file).await.expect("insert file");
+        let file = insert_test_topology_file(&store, "output/t.png").await;
 
         let transfer =
             Transfer::new(file.id().to_string(), loc("local"), loc("cloud")).expect("valid");
@@ -1533,8 +954,7 @@ mod tests {
     #[tokio::test]
     async fn update_transfer_state() {
         let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let file = sample_tracked_file("output/s.png");
-        store.upsert_file(&file).await.expect("insert file");
+        let file = insert_test_topology_file(&store, "output/s.png").await;
 
         let mut transfer =
             Transfer::new(file.id().to_string(), loc("local"), loc("cloud")).expect("valid");
@@ -1572,8 +992,7 @@ mod tests {
     #[tokio::test]
     async fn failed_transfers_query() {
         let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let file = sample_tracked_file("output/f.png");
-        store.upsert_file(&file).await.expect("insert file");
+        let file = insert_test_topology_file(&store, "output/f.png").await;
 
         let mut transfer =
             Transfer::new(file.id().to_string(), loc("local"), loc("cloud")).expect("valid");
@@ -1601,8 +1020,7 @@ mod tests {
     #[tokio::test]
     async fn failed_transfers_excludes_retried() {
         let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let file = sample_tracked_file("output/retry.png");
-        store.upsert_file(&file).await.expect("insert file");
+        let file = insert_test_topology_file(&store, "output/retry.png").await;
 
         // T1: Failed (attempt=1)
         let mut t1 =
@@ -1639,8 +1057,7 @@ mod tests {
     #[tokio::test]
     async fn latest_transfers_by_file_returns_latest_per_dest() {
         let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let file = sample_tracked_file("output/r.png");
-        store.upsert_file(&file).await.expect("insert file");
+        let file = insert_test_topology_file(&store, "output/r.png").await;
 
         let mut t1 =
             Transfer::new(file.id().to_string(), loc("local"), loc("cloud")).expect("valid");
@@ -1687,46 +1104,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cascade_delete_transfers() {
-        let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let file = sample_tracked_file("output/cas.png");
-        let file_id = file.id().to_string();
-        store.upsert_file(&file).await.expect("insert file");
-
-        let transfer = Transfer::new(file_id.clone(), loc("local"), loc("cloud")).expect("valid");
-        store
-            .insert_transfer(&transfer)
-            .await
-            .expect("insert transfer");
-
-        store
-            .delete_file("output/cas.png")
-            .await
-            .expect("delete file");
-
-        let count: usize = store
-            .conn
-            .call(move |conn| {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM transfers WHERE file_id = ?",
-                    params![file_id],
-                    |row| row.get(0),
-                )
-                .map_err(|e| InfraError::Store {
-                    op: "sqlite",
-                    reason: format!("{e}"),
-                })
-            })
-            .await
-            .expect("count");
-        assert_eq!(count, 0);
-    }
-
-    #[tokio::test]
     async fn queued_returns_only_latest_per_file_dest() {
         let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let file = sample_tracked_file("output/q.png");
-        store.upsert_file(&file).await.expect("insert file");
+        let file = insert_test_topology_file(&store, "output/q.png").await;
 
         let mut t1 =
             Transfer::new(file.id().to_string(), loc("local"), loc("cloud")).expect("valid");
@@ -1747,36 +1127,6 @@ mod tests {
     }
 
     // =========================================================================
-    // RemoteStore tests
-    // =========================================================================
-
-    #[tokio::test]
-    async fn remote_management() {
-        let store = SqliteSyncStore::open_in_memory().await.expect("open");
-
-        let remote = RemoteConfig {
-            location_id: LocationId::new("cloud").expect("valid"),
-            backend: "rclone".into(),
-            config: serde_json::json!({"bucket": "my-bucket"}),
-            created_at: chrono::Utc::now(),
-        };
-        store.register_remote(&remote).await.expect("register");
-
-        let remotes = store.list_remotes().await.expect("list");
-        assert_eq!(remotes.len(), 1);
-        assert_eq!(remotes[0].backend, "rclone");
-
-        let removed = store
-            .remove_remote(&LocationId::new("cloud").expect("valid"))
-            .await
-            .expect("remove");
-        assert!(removed);
-
-        let remotes2 = store.list_remotes().await.expect("list2");
-        assert!(remotes2.is_empty());
-    }
-
-    // =========================================================================
     // unblock_dependents tests
     // =========================================================================
 
@@ -1785,8 +1135,7 @@ mod tests {
         use crate::domain::transfer::TransferKind;
 
         let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let file = sample_tracked_file("output/chain.png");
-        store.upsert_file(&file).await.expect("insert file");
+        let file = insert_test_topology_file(&store, "output/chain.png").await;
 
         // T1: local→cloud (Queued — 先行transfer)
         let t1 =
@@ -1833,8 +1182,7 @@ mod tests {
         use crate::domain::transfer::TransferKind;
 
         let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let file = sample_tracked_file("output/nonblock.png");
-        store.upsert_file(&file).await.expect("insert file");
+        let file = insert_test_topology_file(&store, "output/nonblock.png").await;
 
         // T1: local→cloud (Queued)
         let t1 =
@@ -1882,10 +1230,8 @@ mod tests {
         use crate::domain::transfer::TransferKind;
 
         let store = SqliteSyncStore::open_in_memory().await.expect("open");
-        let file_a = sample_tracked_file("output/multi_a.png");
-        let file_b = sample_tracked_file("output/multi_b.png");
-        store.upsert_file(&file_a).await.expect("insert a");
-        store.upsert_file(&file_b).await.expect("insert b");
+        let file_a = insert_test_topology_file(&store, "output/multi_a.png").await;
+        let file_b = insert_test_topology_file(&store, "output/multi_b.png").await;
 
         // T1: local→cloud (shared dependency)
         let t1 =

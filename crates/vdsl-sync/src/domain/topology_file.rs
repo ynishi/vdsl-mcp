@@ -6,20 +6,26 @@
 //! # 画像ファイル = Entity モデル
 //!
 //! Content（ピクセルデータ）がEntityのIdentity。
-//! `canonical_hash` は content_hash（最高精度）を正規化したもので、
+//! `canonical_digest` は ContentDigest を正規化したもので、
 //! location非依存のEntity同一性判定に使用する。
+//!
+//! # 型安全性
+//!
+//! `canonical_digest` は [`ContentDigest`] 型。
+//! [`ByteDigest`](super::digest::ByteDigest) からの混入は型レベルで不可能。
 //!
 //! # スキャン結果とのマッチング
 //!
 //! [`matches_scan()`](TopologyFile::matches_scan) が多段フォールバックで
 //! スキャン結果を既知TopologyFileに紐付ける:
-//! 1. canonical_hash一致 → 同一Entity（rename検出対応）
+//! 1. canonical_digest一致 → 同一Entity（rename検出対応）
 //! 2. relative_path一致 → 同一パス（最も一般的）
 //! 3. 全不一致 → 新規ファイル
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::digest::ContentDigest;
 use super::error::DomainError;
 use super::file_type::FileType;
 use super::fingerprint::FileFingerprint;
@@ -30,7 +36,7 @@ use super::fingerprint::FileFingerprint;
 /// マッチ精度の高い順: ByHash > ByPath。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanMatch {
-    /// canonical_hash一致。同一Entity。
+    /// canonical_digest一致。同一Entity。
     /// pathが異なればrename検出。
     ByHash,
     /// relative_path一致。同一パス。
@@ -49,7 +55,7 @@ impl ScanMatch {
 ///
 /// # 設計原則
 ///
-/// - ファイルの「身元」+ content_hashベースのcanonical_hash
+/// - ファイルの「身元」+ ContentDigestベースのcanonical_digest
 /// - location状態は持たない — [`LocationFile`] が管理
 /// - 転送状態は持たない — [`Transfer`](super::transfer::Transfer) が管理
 ///
@@ -59,7 +65,7 @@ impl ScanMatch {
 /// |---|---|
 /// | `id` | UUID v4。全locationで共通の識別子 |
 /// | `relative_path` | sync_rootからの相対パス（正規パス） |
-/// | `canonical_hash` | location非依存の正規hash。content_hash優先 |
+/// | `canonical_digest` | location非依存の正規ContentDigest。ByteDigest混入不可 |
 /// | `file_type` | 拡張子から判定 |
 /// | `registered_at` | 初回検出日時 |
 /// | `deleted_at` | 削除検出日時。Noneなら生存中 |
@@ -67,11 +73,10 @@ impl ScanMatch {
 pub struct TopologyFile {
     id: String,
     relative_path: String,
-    /// location非依存の正規hash。
-    /// content_hash（ピクセルデータ）を優先し、なければfile_hashをフォールバック。
-    /// Cloud/NetStorageではNone（hash取得不可）。
+    /// location非依存の正規ContentDigest。
+    /// ContentDigest型のみ受け入れ — ByteDigest混入はコンパイルエラー。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    canonical_hash: Option<String>,
+    canonical_digest: Option<ContentDigest>,
     file_type: FileType,
     registered_at: DateTime<Utc>,
     /// ファイルが削除検出された日時。Noneなら生存中。
@@ -99,7 +104,7 @@ impl TopologyFile {
         Ok(Self {
             id: uuid::Uuid::new_v4().to_string(),
             relative_path,
-            canonical_hash: None,
+            canonical_digest: None,
             file_type,
             registered_at: Utc::now(),
             deleted_at: None,
@@ -110,7 +115,7 @@ impl TopologyFile {
     pub(crate) fn reconstitute(
         id: String,
         relative_path: String,
-        canonical_hash: Option<String>,
+        canonical_digest: Option<ContentDigest>,
         file_type: FileType,
         registered_at: DateTime<Utc>,
         deleted_at: Option<DateTime<Utc>>,
@@ -118,7 +123,7 @@ impl TopologyFile {
         Self {
             id,
             relative_path,
-            canonical_hash,
+            canonical_digest,
             file_type,
             registered_at,
             deleted_at,
@@ -141,30 +146,30 @@ impl TopologyFile {
         self.deleted_at = None;
     }
 
-    /// canonical_hashを昇格更新する。
+    /// canonical_digestを昇格更新する。
     ///
-    /// LocationFileのfingerprintからcontent_hash（最優先）またはfile_hashを
-    /// 抽出し、現在のcanonical_hashより精度が高ければ上書きする。
+    /// LocationFileのfingerprintからContentDigestを抽出し、
+    /// 現在のcanonical_digestと異なれば上書きする。
     ///
-    /// 精度の序列: content_hash > file_hash > None
+    /// **ByteDigestはContentDigestと型が異なるため混入不可能。**
     ///
     /// # Returns
     ///
     /// 更新があった場合true。
-    pub fn promote_canonical_hash(&mut self, fingerprint: &FileFingerprint) -> bool {
-        let candidate = Self::extract_canonical(fingerprint);
-        match (&self.canonical_hash, &candidate) {
+    pub fn promote_canonical_digest(&mut self, fingerprint: &FileFingerprint) -> bool {
+        let candidate = &fingerprint.content_digest;
+        match (&self.canonical_digest, candidate) {
             // 新候補がNone → 昇格なし
             (_, None) => false,
-            // 現在None → 任意の値で昇格
-            (None, Some(_)) => {
-                self.canonical_hash = candidate;
+            // 現在None → 任意のContentDigestで昇格
+            (None, Some(cd)) => {
+                self.canonical_digest = Some(cd.clone());
                 true
             }
-            // 両方Some → content_hash優先（content_hashがあれば上書き）
-            (Some(_), Some(_)) => {
-                if fingerprint.content_hash.is_some() && self.canonical_hash != candidate {
-                    self.canonical_hash = candidate;
+            // 両方Some → 値が異なれば更新
+            (Some(old), Some(new)) => {
+                if old != new {
+                    self.canonical_digest = Some(new.clone());
                     true
                 } else {
                     false
@@ -190,8 +195,13 @@ impl TopologyFile {
         &self.relative_path
     }
 
+    pub fn canonical_digest(&self) -> Option<&ContentDigest> {
+        self.canonical_digest.as_ref()
+    }
+
+    /// canonical_hashの文字列表現（後方互換）。
     pub fn canonical_hash(&self) -> Option<&str> {
-        self.canonical_hash.as_deref()
+        self.canonical_digest.as_ref().map(|cd| cd.as_str())
     }
 
     pub fn file_type(&self) -> FileType {
@@ -243,7 +253,7 @@ impl TopologyFile {
     /// スキャン結果とのマッチング。
     ///
     /// 多段フォールバックで同一ファイルを判定する:
-    /// 1. canonical_hash一致 → ByHash（rename検出対応）
+    /// 1. canonical_digest一致 → ByHash（rename検出対応）
     /// 2. relative_path一致 → ByPath（最も一般的）
     /// 3. 全不一致 → NoMatch
     ///
@@ -252,11 +262,10 @@ impl TopologyFile {
     /// - `scan_path`: スキャン結果のrelative_path
     /// - `scan_fingerprint`: スキャン結果のfingerprint
     pub fn matches_scan(&self, scan_path: &str, scan_fingerprint: &FileFingerprint) -> ScanMatch {
-        // 1. canonical_hash一致チェック（content_hash優先）
-        if let Some(ref canonical) = self.canonical_hash {
-            let scan_canonical = Self::extract_canonical(scan_fingerprint);
-            if let Some(ref sc) = scan_canonical {
-                if canonical == sc {
+        // 1. canonical_digest一致チェック（ContentDigest同士の比較）
+        if let Some(ref canonical) = self.canonical_digest {
+            if let Some(ref scan_cd) = scan_fingerprint.content_digest {
+                if canonical == scan_cd {
                     return ScanMatch::ByHash;
                 }
             }
@@ -266,16 +275,6 @@ impl TopologyFile {
             return ScanMatch::ByPath;
         }
         ScanMatch::NoMatch
-    }
-
-    // =========================================================================
-    // Internal
-    // =========================================================================
-
-    /// fingerprintからcanonical_hash候補を抽出する。
-    /// content_hash > file_hash の優先順。
-    fn extract_canonical(fp: &FileFingerprint) -> Option<String> {
-        fp.content_hash.clone().or_else(|| fp.file_hash.clone())
     }
 }
 
@@ -296,12 +295,17 @@ impl PartialEq<super::location_file::LocationFile> for TopologyFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::digest::ByteDigest;
 
-    fn make_fp(file_hash: Option<&str>, content_hash: Option<&str>, size: u64) -> FileFingerprint {
+    fn make_fp(
+        byte_digest: Option<ByteDigest>,
+        content_digest: Option<&str>,
+        size: u64,
+    ) -> FileFingerprint {
         FileFingerprint {
-            file_hash: file_hash.map(|s| s.to_string()),
-            content_hash: content_hash.map(|s| s.to_string()),
-            meta_hash: None,
+            byte_digest,
+            content_digest: content_digest.map(|s| ContentDigest(s.to_string())),
+            meta_digest: None,
             size,
             modified_at: None,
         }
@@ -319,7 +323,7 @@ mod tests {
         assert_eq!(f.file_type(), FileType::Image);
         assert!(!f.id().is_empty());
         assert!(!f.is_deleted());
-        assert!(f.canonical_hash().is_none());
+        assert!(f.canonical_digest().is_none());
     }
 
     #[test]
@@ -353,56 +357,63 @@ mod tests {
     }
 
     // =========================================================================
-    // promote_canonical_hash
+    // promote_canonical_digest
     // =========================================================================
 
     #[test]
-    fn promote_from_none_to_file_hash() {
+    fn promote_from_none_to_content_digest() {
         let mut f = TopologyFile::new("a.png".into(), FileType::Image).unwrap();
-        assert!(f.canonical_hash().is_none());
-        let fp = make_fp(Some("djb2_abc"), None, 1024);
-        assert!(f.promote_canonical_hash(&fp));
-        assert_eq!(f.canonical_hash(), Some("djb2_abc"));
-    }
-
-    #[test]
-    fn promote_from_file_hash_to_content_hash() {
-        let mut f = TopologyFile::new("a.png".into(), FileType::Image).unwrap();
-        // file_hashで初期化
-        let fp1 = make_fp(Some("djb2_abc"), None, 1024);
-        f.promote_canonical_hash(&fp1);
-        assert_eq!(f.canonical_hash(), Some("djb2_abc"));
-        // content_hashで昇格
-        let fp2 = make_fp(Some("djb2_abc"), Some("pixel_xyz"), 1024);
-        assert!(f.promote_canonical_hash(&fp2));
+        assert!(f.canonical_digest().is_none());
+        let fp = make_fp(
+            Some(ByteDigest::Djb2("djb2_abc".into())),
+            Some("pixel_xyz"),
+            1024,
+        );
+        assert!(f.promote_canonical_digest(&fp));
         assert_eq!(f.canonical_hash(), Some("pixel_xyz"));
     }
 
     #[test]
-    fn promote_no_downgrade_from_content_to_file_hash() {
+    fn promote_no_content_digest_no_change() {
         let mut f = TopologyFile::new("a.png".into(), FileType::Image).unwrap();
-        // content_hashで初期化
-        let fp1 = make_fp(Some("h1"), Some("pixel_xyz"), 1024);
-        f.promote_canonical_hash(&fp1);
-        assert_eq!(f.canonical_hash(), Some("pixel_xyz"));
-        // file_hashのみのfingerprintでは降格しない
-        let fp2 = make_fp(Some("h2"), None, 2048);
-        assert!(!f.promote_canonical_hash(&fp2));
-        assert_eq!(f.canonical_hash(), Some("pixel_xyz"));
+        // byte_digestのみ、content_digestなし → 昇格なし（型安全: ByteDigest混入不可）
+        let fp = make_fp(Some(ByteDigest::Djb2("djb2_abc".into())), None, 1024);
+        assert!(!f.promote_canonical_digest(&fp));
+        assert!(f.canonical_digest().is_none());
+    }
+
+    #[test]
+    fn promote_content_digest_updates() {
+        let mut f = TopologyFile::new("a.png".into(), FileType::Image).unwrap();
+        let fp1 = make_fp(None, Some("pixel_v1"), 1024);
+        f.promote_canonical_digest(&fp1);
+        assert_eq!(f.canonical_hash(), Some("pixel_v1"));
+        // 新しいcontent_digestで上書き
+        let fp2 = make_fp(None, Some("pixel_v2"), 1024);
+        assert!(f.promote_canonical_digest(&fp2));
+        assert_eq!(f.canonical_hash(), Some("pixel_v2"));
+    }
+
+    #[test]
+    fn promote_same_content_digest_no_change() {
+        let mut f = TopologyFile::new("a.png".into(), FileType::Image).unwrap();
+        let fp = make_fp(None, Some("pixel_xyz"), 1024);
+        f.promote_canonical_digest(&fp);
+        assert!(!f.promote_canonical_digest(&fp));
     }
 
     #[test]
     fn promote_none_fingerprint_no_change() {
         let mut f = TopologyFile::new("a.png".into(), FileType::Image).unwrap();
         let fp = FileFingerprint {
-            file_hash: None,
-            content_hash: None,
-            meta_hash: None,
+            byte_digest: None,
+            content_digest: None,
+            meta_digest: None,
             size: 100,
             modified_at: None,
         };
-        assert!(!f.promote_canonical_hash(&fp));
-        assert!(f.canonical_hash().is_none());
+        assert!(!f.promote_canonical_digest(&fp));
+        assert!(f.canonical_digest().is_none());
     }
 
     // =========================================================================
@@ -412,11 +423,11 @@ mod tests {
     #[test]
     fn matches_scan_by_hash() {
         let mut f = TopologyFile::new("output/001.png".into(), FileType::Image).unwrap();
-        let fp = make_fp(Some("h1"), Some("pixel_abc"), 1024);
-        f.promote_canonical_hash(&fp);
+        let fp = make_fp(Some(ByteDigest::Djb2("h1".into())), Some("pixel_abc"), 1024);
+        f.promote_canonical_digest(&fp);
 
-        // 同一content_hash、異なるpath → ByHash（rename検出）
-        let scan_fp = make_fp(Some("h2"), Some("pixel_abc"), 2048);
+        // 同一content_digest、異なるpath → ByHash（rename検出）
+        let scan_fp = make_fp(Some(ByteDigest::Djb2("h2".into())), Some("pixel_abc"), 2048);
         assert_eq!(
             f.matches_scan("output/renamed.png", &scan_fp),
             ScanMatch::ByHash
@@ -426,8 +437,8 @@ mod tests {
     #[test]
     fn matches_scan_by_path() {
         let f = TopologyFile::new("output/001.png".into(), FileType::Image).unwrap();
-        // canonical_hashなし、path一致
-        let scan_fp = make_fp(Some("h1"), None, 1024);
+        // canonical_digestなし、path一致
+        let scan_fp = make_fp(Some(ByteDigest::Djb2("h1".into())), None, 1024);
         assert_eq!(
             f.matches_scan("output/001.png", &scan_fp),
             ScanMatch::ByPath
@@ -437,11 +448,15 @@ mod tests {
     #[test]
     fn matches_scan_by_path_when_hash_differs() {
         let mut f = TopologyFile::new("output/001.png".into(), FileType::Image).unwrap();
-        let fp = make_fp(Some("h1"), Some("pixel_abc"), 1024);
-        f.promote_canonical_hash(&fp);
+        let fp = make_fp(Some(ByteDigest::Djb2("h1".into())), Some("pixel_abc"), 1024);
+        f.promote_canonical_digest(&fp);
 
-        // hash不一致だがpath一致 → ByPath（コンテンツ変更）
-        let scan_fp = make_fp(Some("h2"), Some("pixel_different"), 2048);
+        // content_digest不一致だがpath一致 → ByPath（コンテンツ変更）
+        let scan_fp = make_fp(
+            Some(ByteDigest::Djb2("h2".into())),
+            Some("pixel_different"),
+            2048,
+        );
         assert_eq!(
             f.matches_scan("output/001.png", &scan_fp),
             ScanMatch::ByPath
@@ -451,11 +466,10 @@ mod tests {
     #[test]
     fn matches_scan_no_match() {
         let mut f = TopologyFile::new("output/001.png".into(), FileType::Image).unwrap();
-        let fp = make_fp(Some("h1"), Some("pixel_abc"), 1024);
-        f.promote_canonical_hash(&fp);
+        let fp = make_fp(Some(ByteDigest::Djb2("h1".into())), Some("pixel_abc"), 1024);
+        f.promote_canonical_digest(&fp);
 
-        // hash不一致 + path不一致 → NoMatch
-        let scan_fp = make_fp(Some("h3"), Some("pixel_xyz"), 4096);
+        let scan_fp = make_fp(Some(ByteDigest::Djb2("h3".into())), Some("pixel_xyz"), 4096);
         assert_eq!(
             f.matches_scan("output/other.png", &scan_fp),
             ScanMatch::NoMatch
@@ -465,11 +479,10 @@ mod tests {
     #[test]
     fn matches_scan_cloud_no_hash() {
         let f = TopologyFile::new("output/001.png".into(), FileType::Image).unwrap();
-        // Cloud: hashなし → hash比較スキップ、path一致で判定
         let scan_fp = FileFingerprint {
-            file_hash: None,
-            content_hash: None,
-            meta_hash: None,
+            byte_digest: None,
+            content_digest: None,
+            meta_digest: None,
             size: 2048,
             modified_at: None,
         };
@@ -482,11 +495,10 @@ mod tests {
     #[test]
     fn matches_scan_cloud_no_hash_no_path() {
         let f = TopologyFile::new("output/001.png".into(), FileType::Image).unwrap();
-        // Cloud: hashなし + path不一致 → NoMatch
         let scan_fp = FileFingerprint {
-            file_hash: None,
-            content_hash: None,
-            meta_hash: None,
+            byte_digest: None,
+            content_digest: None,
+            meta_digest: None,
             size: 2048,
             modified_at: None,
         };
@@ -517,7 +529,7 @@ mod tests {
         let f = TopologyFile::reconstitute(
             "id-1".into(),
             "path.png".into(),
-            Some("pixel_abc".into()),
+            Some(ContentDigest("pixel_abc".into())),
             FileType::Image,
             now,
             None,
@@ -536,8 +548,8 @@ mod tests {
     #[test]
     fn serde_roundtrip() {
         let mut f = TopologyFile::new("test.png".into(), FileType::Image).unwrap();
-        let fp = make_fp(Some("h1"), Some("pixel_abc"), 1024);
-        f.promote_canonical_hash(&fp);
+        let fp = make_fp(Some(ByteDigest::Djb2("h1".into())), Some("pixel_abc"), 1024);
+        f.promote_canonical_digest(&fp);
 
         let json = serde_json::to_value(&f).unwrap();
         let restored: TopologyFile = serde_json::from_value(json).unwrap();
@@ -547,12 +559,12 @@ mod tests {
     }
 
     #[test]
-    fn serde_omits_none_canonical_hash() {
+    fn serde_omits_none_canonical_digest() {
         let f = TopologyFile::new("test.png".into(), FileType::Image).unwrap();
         let json = serde_json::to_value(&f).unwrap();
         assert!(
-            json.get("canonical_hash").is_none(),
-            "None canonical_hash must be omitted"
+            json.get("canonical_digest").is_none(),
+            "None canonical_digest must be omitted"
         );
     }
 }

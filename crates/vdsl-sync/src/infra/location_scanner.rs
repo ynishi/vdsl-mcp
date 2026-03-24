@@ -112,19 +112,42 @@ impl LocationScanner for LocalScanner {
 
     async fn scan(&self, excludes: &[glob::Pattern]) -> Result<LocationScanResult, InfraError> {
         if !self.root.is_dir() {
+            tracing::warn!(
+                location = %self.location_id,
+                root = %self.root.display(),
+                "local_scan: root is not a directory"
+            );
             return Ok(LocationScanResult {
                 files: Vec::new(),
                 errors: Vec::new(),
             });
         }
 
+        tracing::debug!(
+            location = %self.location_id,
+            root = %self.root.display(),
+            excludes = excludes.len(),
+            "local_scan: listing files"
+        );
         let files = list_local_files(&self.root).await?;
+        tracing::debug!(
+            location = %self.location_id,
+            raw_files = files.len(),
+            "local_scan: walkdir done"
+        );
 
         let mut scanned = Vec::new();
         let mut errors = Vec::new();
+        let mut excluded = 0usize;
 
         for (relative_path, size, modified_at) in files {
             if excludes.iter().any(|p| p.matches(&relative_path)) {
+                excluded += 1;
+                tracing::trace!(
+                    path = %relative_path,
+                    location = %self.location_id,
+                    "local_scan: excluded by pattern"
+                );
                 continue;
             }
 
@@ -137,9 +160,13 @@ impl LocationScanner for LocalScanner {
                         relative_path,
                         file_type,
                         fingerprint: FileFingerprint {
-                            file_hash: Some(hash_result.file_hash),
-                            content_hash: hash_result.content_hash,
-                            meta_hash: None,
+                            byte_digest: Some(crate::domain::digest::ByteDigest::Djb2(
+                                hash_result.file_hash,
+                            )),
+                            content_digest: hash_result
+                                .content_hash
+                                .map(crate::domain::digest::ContentDigest),
+                            meta_digest: None,
                             size: file_size.unwrap_or(size),
                             modified_at,
                         },
@@ -148,6 +175,12 @@ impl LocationScanner for LocalScanner {
                     });
                 }
                 Err(e) => {
+                    tracing::warn!(
+                        path = %abs_path.display(),
+                        location = %self.location_id,
+                        error = %e,
+                        "local_scan: hash failed"
+                    );
                     errors.push(ScanError {
                         path: abs_path.display().to_string(),
                         error: format!("hash failed: {e}"),
@@ -155,6 +188,14 @@ impl LocationScanner for LocalScanner {
                 }
             }
         }
+
+        tracing::info!(
+            location = %self.location_id,
+            scanned = scanned.len(),
+            excluded = excluded,
+            errors = errors.len(),
+            "local_scan: complete"
+        );
 
         Ok(LocationScanResult {
             files: scanned,
@@ -261,9 +302,9 @@ impl LocationScanner for SshScanner {
             .map(|fi| ScannedFile {
                 file_type: infer_file_type(&fi.relative_path),
                 fingerprint: FileFingerprint {
-                    file_hash: Some(fi.sha256),
-                    content_hash: None,
-                    meta_hash: None,
+                    byte_digest: Some(crate::domain::digest::ByteDigest::Sha256(fi.sha256)),
+                    content_digest: None,
+                    meta_digest: None,
                     size: fi.size,
                     modified_at: None,
                 },
@@ -332,9 +373,9 @@ impl LocationScanner for CloudScanner {
             .map(|f| ScannedFile {
                 file_type: infer_file_type(&f.path),
                 fingerprint: FileFingerprint {
-                    file_hash: None,
-                    content_hash: None,
-                    meta_hash: None,
+                    byte_digest: None,
+                    content_digest: None,
+                    meta_digest: None,
                     size: f.size.unwrap_or(0),
                     modified_at: f.modified_at,
                 },
@@ -431,7 +472,7 @@ async fn list_local_files(
             let size = metadata.as_ref().map_or(0, |m| m.len());
             let modified_at: Option<DateTime<Utc>> = metadata
                 .and_then(|m| m.modified().ok())
-                .map(|t| DateTime::<Utc>::from(t));
+                .map(DateTime::<Utc>::from);
 
             result.push((relative, size, modified_at));
         }

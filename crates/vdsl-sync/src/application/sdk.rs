@@ -25,7 +25,7 @@ use crate::domain::view::{ErrorEntry, PendingEntry};
 // SDK Result types
 // =============================================================================
 
-/// sync/sync_route/force_rewrite の結果。
+/// sync/sync_route の結果。
 ///
 /// 旧BatchResult/SyncResult/FacadeSyncResultを統合した単一型。
 /// Serialize対応でMCP層がそのまま返せる。
@@ -105,12 +105,6 @@ pub trait SyncStoreSdk: Send + Sync {
         src: &LocationId,
         dest: &LocationId,
     ) -> Result<SyncReport, SyncError>;
-
-    /// 全件再転送（メンテナンス操作）。
-    ///
-    /// ターゲットを空にして通常syncで代替可能。コンフリクト検出機構の導入後に除去予定。
-    #[deprecated(note = "use sync after clearing target — force_rewrite semantics are incomplete")]
-    async fn force_rewrite(&self) -> Result<SyncReport, SyncError>;
 
     // =========================================================================
     // Command — ファイル操作

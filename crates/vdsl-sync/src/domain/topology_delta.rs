@@ -28,6 +28,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use tracing::trace;
+
+use super::digest::CrossLocationIdentity;
 use super::file_type::FileType;
 use super::fingerprint::FileFingerprint;
 use super::location::LocationId;
@@ -57,7 +60,6 @@ pub enum TopologyDelta {
 
 /// 新規ファイル。Topologyに未登録のファイルが検出された。
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Apply/Distribute フェーズで使用予定
 pub struct DiscoveredFile {
     /// スキャン時に生成した仮ID（UUID v4）。Apply時にTopologyFile.idとなる。
     pub(crate) id: String,
@@ -71,7 +73,6 @@ pub struct DiscoveredFile {
 
 /// 既知ファイルのコンテンツ変更。
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Apply/Distribute フェーズで使用予定
 pub struct ContentChangedFile {
     /// TopologyFile上の既存ID。
     pub(crate) topology_file_id: String,
@@ -86,7 +87,6 @@ pub struct ContentChangedFile {
 
 /// rename検出。canonical_hash一致 + path不一致。
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Apply/Distribute フェーズで使用予定
 pub struct RenamedFile {
     /// TopologyFile上の既存ID。
     pub(crate) topology_file_id: String,
@@ -128,7 +128,6 @@ pub enum DistributeAction {
 
 /// Locationへファイルを新規送信。
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Transfer計画生成で使用予定
 pub struct SendAction {
     pub(crate) topology_file_id: String,
     pub(crate) relative_path: String,
@@ -141,7 +140,6 @@ pub struct SendAction {
 
 /// Locationのファイルを最新版に更新。
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Transfer計画生成で使用予定
 pub struct UpdateAction {
     pub(crate) topology_file_id: String,
     pub(crate) relative_path: String,
@@ -305,6 +303,7 @@ impl TopologyDelta {
     /// - `scan_file_type` — スキャン結果のfile_type
     /// - `scan_origin` — スキャンを実行したLocation
     /// - `scan_embedded_id` — スキャン結果のembedded_id
+    #[allow(clippy::too_many_arguments)]
     pub fn from_scan_match(
         scan_match: ScanMatch,
         topology_file: Option<&super::topology_file::TopologyFile>,
@@ -393,9 +392,9 @@ fn check_content_change(
                 relative_path: scan_path.to_string(),
                 file_type: scan_file_type,
                 old_fingerprint: FileFingerprint {
-                    file_hash: None,
-                    content_hash: None,
-                    meta_hash: None,
+                    byte_digest: None,
+                    content_digest: None,
+                    meta_digest: None,
                     size: 0,
                     modified_at: None,
                 },
@@ -405,7 +404,7 @@ fn check_content_change(
             }))
         }
         Some(existing_fp) => {
-            if existing_fp.matches(scan_fingerprint) {
+            if existing_fp.matches_within_location(scan_fingerprint) {
                 // fingerprint一致 → 変更なし
                 None
             } else {
@@ -526,6 +525,12 @@ pub fn distribute_actions(
     target_locations: &[LocationId],
     ingest_origins: &HashMap<String, HashSet<LocationId>>,
 ) -> DistributeResult {
+    trace!(
+        topology_files = topology_files.len(),
+        target_locations = target_locations.len(),
+        ingest_origins = ingest_origins.len(),
+        "distribute_actions: start"
+    );
     let mut actions = Vec::new();
     let mut conflicts = Vec::new();
 
@@ -553,7 +558,7 @@ pub fn distribute_actions(
                     continue;
                 }
                 // コンフリクト時はLocationFile不在(Send)のみ生成。Update はskip
-                if lf_by_location.get(target).is_none() {
+                if !lf_by_location.contains_key(target) {
                     actions.push(DistributeAction::Send(SendAction {
                         topology_file_id: file_id.to_string(),
                         relative_path: tf.relative_path().to_string(),
@@ -571,8 +576,21 @@ pub fn distribute_actions(
         let source = pick_source(file_id, origins, location_files);
         let Some(source) = source else {
             // sourceが特定できない = どこにもActiveな実体がない → skip
+            trace!(
+                file_id = %file_id,
+                path = %tf.relative_path(),
+                origins = ?origins.iter().map(|o| o.to_string()).collect::<Vec<_>>(),
+                "distribute_actions: no source found, skip"
+            );
             continue;
         };
+        trace!(
+            file_id = %file_id,
+            path = %tf.relative_path(),
+            source = %source,
+            origins = ?origins.iter().map(|o| o.to_string()).collect::<Vec<_>>(),
+            "distribute_actions: processing file"
+        );
 
         // このファイルの全LocationFileをlocation_idで引けるようにする
         let empty_lfs: Vec<&LocationFile> = Vec::new();
@@ -600,8 +618,15 @@ pub fn distribute_actions(
                     if lf.state() == super::location_file::LocationFileState::Syncing {
                         continue;
                     }
-                    // fingerprint比較
+                    // fingerprint比較 (同一location内比較)
                     if lf.has_changed(&latest_fingerprint(file_id, origins, location_files)) {
+                        trace!(
+                            file_id = %file_id,
+                            target = %target,
+                            source = %source,
+                            lf_state = ?lf.state(),
+                            "distribute_actions: Update (fingerprint changed)"
+                        );
                         actions.push(DistributeAction::Update(UpdateAction {
                             topology_file_id: file_id.to_string(),
                             relative_path: tf.relative_path().to_string(),
@@ -613,6 +638,13 @@ pub fn distribute_actions(
                 }
                 None => {
                     // LocationFile不在 → Send
+                    trace!(
+                        file_id = %file_id,
+                        target = %target,
+                        source = %source,
+                        path = %tf.relative_path(),
+                        "distribute_actions: Send (no LocationFile at target)"
+                    );
                     actions.push(DistributeAction::Send(SendAction {
                         topology_file_id: file_id.to_string(),
                         relative_path: tf.relative_path().to_string(),
@@ -625,6 +657,11 @@ pub fn distribute_actions(
         }
     }
 
+    trace!(
+        actions = actions.len(),
+        conflicts = conflicts.len(),
+        "distribute_actions: done"
+    );
     DistributeResult { actions, conflicts }
 }
 
@@ -694,11 +731,12 @@ fn detect_conflict(
         return None;
     }
 
-    // 全fingerprint一致チェック: 最初のfingerprintと全て比較
-    let base_fp = &variants[0].fingerprint;
+    // 全fingerprint一致チェック: CrossLocationIdentityで比較
+    // （cross-location比較のため ByteDigest ではなく ContentDigest/size で判定）
+    let base_identity = CrossLocationIdentity::from_fingerprint(&variants[0].fingerprint);
     let all_match = variants[1..]
         .iter()
-        .all(|v| base_fp.matches(&v.fingerprint));
+        .all(|v| base_identity.matches(&CrossLocationIdentity::from_fingerprint(&v.fingerprint)));
     if all_match {
         return None;
     }
@@ -759,9 +797,9 @@ fn latest_fingerprint(
     }
     // 到達しないはずだが安全なフォールバック
     FileFingerprint {
-        file_hash: None,
-        content_hash: None,
-        meta_hash: None,
+        byte_digest: None,
+        content_digest: None,
+        meta_digest: None,
         size: 0,
         modified_at: None,
     }
@@ -785,20 +823,22 @@ mod tests {
     }
 
     fn local_fp(hash: &str, size: u64) -> FileFingerprint {
+        use crate::domain::digest::ByteDigest;
         FileFingerprint {
-            file_hash: Some(hash.to_string()),
-            content_hash: None,
-            meta_hash: None,
+            byte_digest: Some(ByteDigest::Djb2(hash.to_string())),
+            content_digest: None,
+            meta_digest: None,
             size,
             modified_at: None,
         }
     }
 
     fn content_fp(file_hash: &str, content_hash: &str, size: u64) -> FileFingerprint {
+        use crate::domain::digest::{ByteDigest, ContentDigest};
         FileFingerprint {
-            file_hash: Some(file_hash.to_string()),
-            content_hash: Some(content_hash.to_string()),
-            meta_hash: None,
+            byte_digest: Some(ByteDigest::Djb2(file_hash.to_string())),
+            content_digest: Some(ContentDigest(content_hash.to_string())),
+            meta_digest: None,
             size,
             modified_at: None,
         }
@@ -806,9 +846,9 @@ mod tests {
 
     fn cloud_fp(size: u64) -> FileFingerprint {
         FileFingerprint {
-            file_hash: None,
-            content_hash: None,
-            meta_hash: None,
+            byte_digest: None,
+            content_digest: None,
+            meta_digest: None,
             size,
             modified_at: None,
         }
@@ -944,7 +984,7 @@ mod tests {
     fn by_hash_different_path_produces_renamed() {
         let mut tf = TopologyFile::new("old/path.png".into(), FileType::Image).unwrap();
         let fp = content_fp("h1", "pixel_abc", 1024);
-        tf.promote_canonical_hash(&fp);
+        tf.promote_canonical_digest(&fp);
 
         let scan_fp = content_fp("h2", "pixel_abc", 2048);
         let delta = TopologyDelta::from_scan_match(
@@ -990,8 +1030,14 @@ mod tests {
         let d = delta.unwrap();
         assert!(d.is_content_changed());
         if let TopologyDelta::ContentChanged(c) = &d {
-            assert_eq!(c.old_fingerprint.file_hash.as_deref(), Some("old_hash"));
-            assert_eq!(c.new_fingerprint.file_hash.as_deref(), Some("new_hash"));
+            assert_eq!(
+                c.old_fingerprint.byte_digest.as_ref().map(|d| d.as_str()),
+                Some("old_hash")
+            );
+            assert_eq!(
+                c.new_fingerprint.byte_digest.as_ref().map(|d| d.as_str()),
+                Some("new_hash")
+            );
         }
     }
 
@@ -1049,7 +1095,7 @@ mod tests {
     fn by_hash_same_path_unchanged_produces_none() {
         let mut tf = TopologyFile::new("output/001.png".into(), FileType::Image).unwrap();
         let fp = content_fp("h1", "pixel_abc", 1024);
-        tf.promote_canonical_hash(&fp);
+        tf.promote_canonical_digest(&fp);
 
         let existing_lf_fp = content_fp("h1", "pixel_abc", 1024);
         let scan_fp = content_fp("h1", "pixel_abc", 1024);

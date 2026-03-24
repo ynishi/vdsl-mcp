@@ -15,10 +15,14 @@
 //! - `kind()` → 拠点の物理的分類（コスト推定に使用）
 //! - `file_root()` → ファイルのベースパス
 //! - `scanner()` → この拠点のスキャン能力（LocationScanner）
+//! - `ensure()` → 到達確認 + 外部ツールの確保（rclone等）
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
+use crate::application::error::SyncError;
 use crate::domain::location::LocationId;
 use crate::infra::location_scanner::LocationScanner;
 
@@ -55,6 +59,7 @@ pub enum LocationKind {
 /// `Location` trait 実装を `SdkImplBuilder::location()` に渡すことで、
 /// Scanner と Route の整合性が保証される。
 /// `kind()` は `SdkImplBuilder::build()` でルートコストの自動推定に使用される。
+#[async_trait]
 pub trait Location: Send + Sync {
     /// この拠点の識別子。
     fn id(&self) -> &LocationId;
@@ -75,6 +80,16 @@ pub trait Location: Send + Sync {
     ///
     /// 各実装が自分のスキャン方法に応じたLocationScannerを構築して返す。
     fn scanner(&self) -> Arc<dyn LocationScanner>;
+
+    /// 拠点の到達可能性を検証し、必要な外部ツールを確保する。
+    ///
+    /// sync開始前に全Locationに対して呼ばれる。
+    /// - Local: file_rootの存在確認（なければ作成）
+    /// - SSH: SSH接続テスト
+    /// - Cloud: rcloneバイナリ確認 + バケット接続テスト
+    ///
+    /// 失敗時は早期エラーで、数分かかるscanを無駄にしない。
+    async fn ensure(&self) -> Result<(), SyncError>;
 }
 
 // =============================================================================
@@ -103,6 +118,7 @@ impl LocalLocation {
     }
 }
 
+#[async_trait]
 impl Location for LocalLocation {
     fn id(&self) -> &LocationId {
         &self.id
@@ -122,6 +138,24 @@ impl Location for LocalLocation {
             self.root.clone(),
             self.hasher.clone(),
         ))
+    }
+
+    async fn ensure(&self) -> Result<(), SyncError> {
+        if !self.root.exists() {
+            std::fs::create_dir_all(&self.root).map_err(|e| {
+                SyncError::Init(format!(
+                    "local file_root '{}' does not exist and could not be created: {e}",
+                    self.root.display()
+                ))
+            })?;
+        }
+        if !self.root.is_dir() {
+            return Err(SyncError::Init(format!(
+                "local file_root '{}' exists but is not a directory",
+                self.root.display()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -147,6 +181,7 @@ impl SshLocation {
     }
 }
 
+#[async_trait]
 impl Location for SshLocation {
     fn id(&self) -> &LocationId {
         &self.id
@@ -166,6 +201,19 @@ impl Location for SshLocation {
             self.root.clone(),
             self.shell.clone(),
         ))
+    }
+
+    async fn ensure(&self) -> Result<(), SyncError> {
+        let output = self.shell.exec(&["echo", "pong"], Some(10)).await?;
+        if !output.success {
+            return Err(SyncError::Init(format!(
+                "SSH location '{}' unreachable (exit {}): {}",
+                self.id,
+                output.exit_code.unwrap_or(-1),
+                output.stderr.trim()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -192,6 +240,7 @@ impl CloudLocation {
     }
 }
 
+#[async_trait]
 impl Location for CloudLocation {
     fn id(&self) -> &LocationId {
         &self.id
@@ -211,5 +260,11 @@ impl Location for CloudLocation {
             self.root.clone(),
             self.backend.clone(),
         ))
+    }
+
+    async fn ensure(&self) -> Result<(), SyncError> {
+        self.backend.ensure().await.map_err(|e| {
+            SyncError::Init(format!("cloud location '{}' ensure failed: {e}", self.id))
+        })
     }
 }

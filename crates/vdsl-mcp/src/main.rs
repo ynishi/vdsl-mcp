@@ -7,10 +7,13 @@ use tracing_subscriber::{fmt, EnvFilter};
 /// All application logging MUST go to a file, not stdout/stderr.
 ///
 /// Configuration:
-/// - `VDSL_LOG_DIR`: Log directory (default: `/tmp/vdsl-mcp`)
+/// - `VDSL_LOG_DIR`: Log directory (default: `~/.vdsl/logs`)
 /// - `RUST_LOG`: Filter directives (default: `vdsl_mcp=info,vdsl_sync=info`)
 fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
-    let log_dir = std::env::var("VDSL_LOG_DIR").unwrap_or_else(|_| "/tmp/vdsl-mcp".into());
+    let log_dir = std::env::var("VDSL_LOG_DIR").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        format!("{home}/.vdsl/logs")
+    });
 
     // Ensure log directory exists
     let _ = std::fs::create_dir_all(&log_dir);

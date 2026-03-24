@@ -35,7 +35,3 @@ test-utils = []
 tokio = { workspace = true }
 tempfile = { workspace = true }
 async-trait = { workspace = true }
-
-[[example]]
-name = "e2e_three_location_sync"
-required-features = ["sqlite", "test-utils"]

@@ -1,5 +1,5 @@
 pub mod config;
-pub mod delta;
+pub mod digest;
 pub mod error;
 pub mod file_type;
 pub mod fingerprint;
@@ -7,11 +7,9 @@ pub mod graph;
 pub mod location;
 pub mod location_file;
 pub mod plan;
-pub mod recovery;
 pub mod retry;
 pub mod scan;
 pub mod topology_delta;
 pub mod topology_file;
-pub mod tracked_file;
 pub mod transfer;
 pub mod view;

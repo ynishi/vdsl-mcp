@@ -85,24 +85,4 @@ pub trait TransferStore: Send + Sync {
     async fn present_counts_by_location(
         &self,
     ) -> Result<std::collections::HashMap<LocationId, usize>, SyncError>;
-
-    /// 全TrackedFileの全destinationについてQueued Transferを作成。
-    ///
-    /// `force_full_rewrite` 用。既にCompletedが存在するfile×routeはスキップし、
-    /// 未完了のもののみキューに入れる。
-    /// 返り値は作成したTransfer件数。
-    #[deprecated(note = "force_rewrite is deprecated — requeue_all will be removed")]
-    async fn requeue_all(
-        &self,
-        file_ids: &[String],
-        routes: &[(LocationId, LocationId)],
-    ) -> Result<usize, SyncError>;
-
-    /// Completed以外の全Transfer（failed/queued/blocked/in_flight）を一括削除。
-    ///
-    /// `force_full_rewrite` のクリーンスレート確保用。
-    /// 累積した失敗レコードを除去し、requeue_allで正確に再キューする。
-    /// 返り値は削除した件数。
-    #[deprecated(note = "force_rewrite is deprecated — purge_non_completed will be removed")]
-    async fn purge_non_completed(&self) -> Result<usize, SyncError>;
 }

@@ -210,24 +210,110 @@ impl RouteGraph {
         result
     }
 
-    /// Dijkstra's algorithm from `origin`.
+    /// Compute the optimal transfer tree from multiple sources.
     ///
-    /// Returns (distances, predecessors) where:
-    /// - distances: HashMap<LocationId, f64> — shortest distance from origin
-    /// - predecessors: HashMap<LocationId, LocationId> — previous node on shortest path
+    /// All locations in `sources` already have the data. Finds the minimum-cost
+    /// edges to deliver to all `required_dests` (excluding any that are already
+    /// in `sources`).
+    ///
+    /// Uses multi-source Dijkstra: all sources start at distance 0.
+    /// This picks the cheapest source→dest path across all sources.
+    ///
+    /// Example: sources={local, pod}, targets={cloud}
+    ///   pod→cloud(2.0) < local→cloud(5.0) → picks pod→cloud.
+    pub fn optimal_tree_multi_source(
+        &self,
+        sources: &HashSet<LocationId>,
+        required_dests: &HashSet<LocationId>,
+    ) -> Vec<(LocationId, LocationId)> {
+        if sources.is_empty() || required_dests.is_empty() {
+            return Vec::new();
+        }
+
+        // Filter out targets that are already sources (they already have data)
+        let actual_dests: HashSet<LocationId> = required_dests
+            .iter()
+            .filter(|d| !sources.contains(d))
+            .cloned()
+            .collect();
+
+        if actual_dests.is_empty() {
+            return Vec::new();
+        }
+
+        // Multi-source Dijkstra
+        let (dist, prev) = self.dijkstra_multi_source(sources);
+
+        // Trace back from each required dest
+        let mut tree_edges: HashSet<(LocationId, LocationId)> = HashSet::new();
+        for dest in &actual_dests {
+            let mut current = dest.clone();
+            while let Some(predecessor) = prev.get(&current) {
+                tree_edges.insert((predecessor.clone(), current.clone()));
+                current = predecessor.clone();
+            }
+        }
+
+        // Topological sort: BFS from all sources through tree_edges only
+        let mut result = Vec::with_capacity(tree_edges.len());
+        let mut visited: HashSet<LocationId> = sources.clone();
+        let mut queue: VecDeque<LocationId> = sources.iter().cloned().collect();
+
+        while let Some(node) = queue.pop_front() {
+            let mut outgoing: Vec<_> = tree_edges
+                .iter()
+                .filter(|(src, _)| src == &node)
+                .cloned()
+                .collect();
+
+            outgoing.sort_by(|(_, d1), (_, d2)| {
+                let c1 = dist.get(d1).copied().unwrap_or(f64::INFINITY);
+                let c2 = dist.get(d2).copied().unwrap_or(f64::INFINITY);
+                c1.partial_cmp(&c2).unwrap_or(Ordering::Equal)
+            });
+
+            for (src, dest) in outgoing {
+                if visited.insert(dest.clone()) {
+                    result.push((src, dest.clone()));
+                    queue.push_back(dest);
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Dijkstra's algorithm from a single origin.
+    ///
+    /// Returns (distances, predecessors).
     fn dijkstra(
         &self,
         origin: &LocationId,
+    ) -> (HashMap<LocationId, f64>, HashMap<LocationId, LocationId>) {
+        let sources = HashSet::from([origin.clone()]);
+        self.dijkstra_multi_source(&sources)
+    }
+
+    /// Multi-source Dijkstra's algorithm.
+    ///
+    /// All sources start at distance 0. Returns (distances, predecessors) where:
+    /// - distances: HashMap<LocationId, f64> — shortest distance from any source
+    /// - predecessors: HashMap<LocationId, LocationId> — previous node on shortest path
+    fn dijkstra_multi_source(
+        &self,
+        sources: &HashSet<LocationId>,
     ) -> (HashMap<LocationId, f64>, HashMap<LocationId, LocationId>) {
         let mut dist: HashMap<LocationId, f64> = HashMap::new();
         let mut prev: HashMap<LocationId, LocationId> = HashMap::new();
         let mut heap = BinaryHeap::new();
 
-        dist.insert(origin.clone(), 0.0);
-        heap.push(DijkstraEntry {
-            cost: 0.0,
-            node: origin.clone(),
-        });
+        for source in sources {
+            dist.insert(source.clone(), 0.0);
+            heap.push(DijkstraEntry {
+                cost: 0.0,
+                node: source.clone(),
+            });
+        }
 
         while let Some(DijkstraEntry { cost, node }) = heap.pop() {
             // Skip if we've already found a better path
@@ -314,6 +400,14 @@ impl super::plan::Topology for RouteGraph {
         required_dests: &HashSet<LocationId>,
     ) -> Vec<(LocationId, LocationId)> {
         self.optimal_tree(origin, required_dests)
+    }
+
+    fn optimal_tree_multi_source(
+        &self,
+        sources: &HashSet<LocationId>,
+        required_dests: &HashSet<LocationId>,
+    ) -> Vec<(LocationId, LocationId)> {
+        self.optimal_tree_multi_source(sources, required_dests)
     }
 }
 
@@ -613,5 +707,106 @@ mod tests {
         assert!(edges.contains(&(loc("cloud"), loc("pod"))));
         // nas→pod should NOT be included (duplicate, more expensive)
         assert!(!edges.contains(&(loc("nas"), loc("pod"))));
+    }
+
+    // =========================================================================
+    // optimal_tree_multi_source tests
+    // =========================================================================
+
+    #[test]
+    fn multi_source_picks_cheaper_relay() {
+        // Real scenario: local and pod both have data, need to reach cloud.
+        // Routes: local→pod(1.0), pod→cloud(2.0), local→cloud(5.0), cloud→local(5.0), cloud→pod(2.0)
+        // Sources: {local, pod} (both already have the file)
+        // Targets: {cloud}
+        //
+        // Single-source from local: local→cloud = 5.0
+        // Multi-source: pod→cloud = 2.0 (cheaper!)
+        let mut g = RouteGraph::new();
+        g.add_with_cost(loc("local"), loc("pod"), EdgeCost::new(1.0, 10));
+        g.add_with_cost(loc("pod"), loc("cloud"), EdgeCost::new(2.0, 10));
+        g.add_with_cost(loc("local"), loc("cloud"), EdgeCost::new(5.0, 10));
+        g.add_with_cost(loc("cloud"), loc("local"), EdgeCost::new(5.0, 10));
+        g.add_with_cost(loc("cloud"), loc("pod"), EdgeCost::new(2.0, 10));
+
+        let sources = HashSet::from([loc("local"), loc("pod")]);
+        let targets = HashSet::from([loc("cloud")]);
+        let tree = g.optimal_tree_multi_source(&sources, &targets);
+
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0], (loc("pod"), loc("cloud")));
+    }
+
+    #[test]
+    fn multi_source_single_source_fallback() {
+        // Single source behaves like original optimal_tree.
+        let mut g = RouteGraph::new();
+        g.add_with_cost(loc("local"), loc("pod"), EdgeCost::new(1.0, 10));
+        g.add_with_cost(loc("pod"), loc("cloud"), EdgeCost::new(2.0, 10));
+
+        let sources = HashSet::from([loc("local")]);
+        let targets = HashSet::from([loc("pod"), loc("cloud")]);
+        let tree = g.optimal_tree_multi_source(&sources, &targets);
+
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree[0], (loc("local"), loc("pod")));
+        assert_eq!(tree[1], (loc("pod"), loc("cloud")));
+    }
+
+    #[test]
+    fn multi_source_empty_sources() {
+        let mut g = RouteGraph::new();
+        g.add(loc("local"), loc("cloud"));
+
+        let tree = g.optimal_tree_multi_source(&HashSet::new(), &HashSet::from([loc("cloud")]));
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn multi_source_empty_targets() {
+        let mut g = RouteGraph::new();
+        g.add(loc("local"), loc("cloud"));
+
+        let tree = g.optimal_tree_multi_source(&HashSet::from([loc("local")]), &HashSet::new());
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn multi_source_target_already_in_sources() {
+        // If cloud is both a source and a target, no transfer needed.
+        let mut g = RouteGraph::new();
+        g.add_with_cost(loc("local"), loc("cloud"), EdgeCost::new(5.0, 10));
+
+        let sources = HashSet::from([loc("local"), loc("cloud")]);
+        let targets = HashSet::from([loc("cloud")]);
+        let tree = g.optimal_tree_multi_source(&sources, &targets);
+
+        assert!(
+            tree.is_empty(),
+            "target already has data, no transfer needed"
+        );
+    }
+
+    #[test]
+    fn multi_source_multiple_targets_different_best_sources() {
+        // local has data, pod has data.
+        // Routes: local→nas(1.0), pod→cloud(2.0), local→cloud(10.0), pod→nas(10.0)
+        // sources={local, pod}, targets={nas, cloud}
+        //
+        // Best: local→nas(1.0), pod→cloud(2.0) — each target from different source
+        let mut g = RouteGraph::new();
+        g.add_with_cost(loc("local"), loc("nas"), EdgeCost::new(1.0, 10));
+        g.add_with_cost(loc("pod"), loc("cloud"), EdgeCost::new(2.0, 10));
+        g.add_with_cost(loc("local"), loc("cloud"), EdgeCost::new(10.0, 10));
+        g.add_with_cost(loc("pod"), loc("nas"), EdgeCost::new(10.0, 10));
+
+        let sources = HashSet::from([loc("local"), loc("pod")]);
+        let targets = HashSet::from([loc("nas"), loc("cloud")]);
+        let tree = g.optimal_tree_multi_source(&sources, &targets);
+
+        assert_eq!(tree.len(), 2);
+        let edges: HashSet<_> = tree.into_iter().collect();
+        assert!(edges.contains(&(loc("local"), loc("nas"))));
+        assert!(edges.contains(&(loc("pod"), loc("cloud"))));
     }
 }

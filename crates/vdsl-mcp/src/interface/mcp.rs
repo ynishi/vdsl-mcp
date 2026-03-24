@@ -899,7 +899,7 @@ pub struct VdslSyncGetRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VdslSyncPollRequest {
-    /// Task ID returned by vdsl_sync or vdsl_sync_force.
+    /// Task ID returned by vdsl_sync.
     pub task_id: String,
 }
 
@@ -3823,7 +3823,8 @@ impl VdslMcpServer {
         let db = self.resolve_or_init_sdk().await?;
         let task_id = self.sync_task_mgr.spawn_sync(&db).await;
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "sync spawned.\ntask_id: {task_id}\n\nUse vdsl_sync_poll with this task_id to check progress."
+            "sync spawned.\ntask_id: {task_id}\nlog: {}\n\nUse vdsl_sync_poll with this task_id to check progress.",
+            current_log_path()
         ))]))
     }
 
@@ -3989,37 +3990,11 @@ impl VdslMcpServer {
     }
 
     #[tool(
-        name = "vdsl_sync_force",
-        description = "[sync] Force full rewrite: re-queue ALL tracked files to ALL destinations \
-            regardless of current transfer state, then execute. \
-            WARNING: This is a LAST-RESORT maintenance operation. Do NOT use for normal sync — \
-            use vdsl_sync instead. Only use when: (1) remote storage lost/corrupted and needs \
-            full reconstruction, (2) DB state is inconsistent and cannot be repaired otherwise, \
-            (3) explicit user request with understanding of the cost (full re-transfer of all files). \
-            Transfers all files even if already present at destination. \
-            Spawns as a background task and returns a task_id for polling. \
-            NOT available in Lua scripts.",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
-            open_world_hint = true
-        )
-    )]
-    #[allow(deprecated)]
-    async fn sync_force(&self) -> Result<CallToolResult, McpError> {
-        let db = self.resolve_or_init_sdk().await?;
-        let task_id = self.sync_task_mgr.spawn_force(&db).await;
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "force_full_rewrite spawned.\ntask_id: {task_id}\n\nUse vdsl_sync_poll with this task_id to check progress."
-        ))]))
-    }
-
-    #[tool(
         name = "vdsl_sync_poll",
         description = "[sync] Poll the status of a background sync task. \
             Returns the current status (pending/running/completed/failed) \
             and result when completed. Use the task_id returned by \
-            vdsl_sync or vdsl_sync_force.",
+            vdsl_sync.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -4038,18 +4013,21 @@ impl VdslMcpServer {
                 req.task_id
             ))])),
             Some(vdsl_sync::TaskStatus::Pending) => {
-                Ok(CallToolResult::success(vec![Content::text(
-                    "Status: pending",
-                )]))
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Status: pending\nlog: {}",
+                    current_log_path()
+                ))]))
             }
             Some(vdsl_sync::TaskStatus::Running(phase)) => {
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Status: running\nPhase: {phase}"
+                    "Status: running\nPhase: {phase}\nlog: {}",
+                    current_log_path()
                 ))]))
             }
             Some(vdsl_sync::TaskStatus::Failed(msg)) => {
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Status: failed\nError: {msg}"
+                    "Status: failed\nError: {msg}\nlog: {}",
+                    current_log_path()
                 ))]))
             }
             Some(vdsl_sync::TaskStatus::Completed(result)) => {
@@ -4998,8 +4976,7 @@ fn default_work_dir() -> std::path::PathBuf {
 ///
 /// Returns `None` on any error (missing env, DB open failure, etc.).
 /// Callers fall back to MOCK sync backend when `None`.
-// BuildStoreResult removed — build_sdk() returns Arc<dyn SyncStoreSdk> directly.
-
+///
 /// Build a `SyncStoreSdk` from environment variables (best-effort).
 ///
 /// SDK構築。必要な環境変数:
@@ -5134,7 +5111,7 @@ async fn build_sdk(
     let mut route_desc = "local↔cloud";
 
     if let (Some(pid), Some(ref ak)) = (pod_id, &api_key) {
-        if let Ok(pod_loc_id) = vdsl_sync::LocationId::new("pod") {
+        if let Ok(pod_loc_id) = vdsl_sync::LocationId::new(format!("pod-{pid}")) {
             let pod_output_root = std::path::PathBuf::from(format!("{}/output", *COMFYUI_BASE));
             let ssh_key = Some(resolve_ssh_key(None));
 
@@ -6326,7 +6303,19 @@ fn format_sync_summary(summary: &vdsl_sync::SyncSummary) -> String {
             loc.absent
         );
     }
+    let _ = writeln!(buf);
+    let _ = writeln!(buf, "Detail log: {}", current_log_path());
     buf
+}
+
+/// 現在のログファイルパスを返す。
+fn current_log_path() -> String {
+    let log_dir = std::env::var("VDSL_LOG_DIR").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        format!("{home}/.vdsl/logs")
+    });
+    let today = chrono::Local::now().format("%Y-%m-%d");
+    format!("{log_dir}/vdsl-mcp.log.{today}")
 }
 
 /// SyncReport（sync/force完了後）を人間可読なSummary文字列に変換する。
@@ -6348,6 +6337,8 @@ fn format_sync_report_summary(result: &vdsl_sync::SyncReport) -> String {
             let _ = writeln!(buf, "  - {}: {}", e.path, e.error);
         }
     }
+    let _ = writeln!(buf);
+    let _ = writeln!(buf, "Detail log: {}", current_log_path());
     buf
 }
 

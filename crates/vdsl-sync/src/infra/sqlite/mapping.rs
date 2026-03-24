@@ -1,6 +1,6 @@
 //! SQLite ↔ domain mapping helpers.
 //!
-//! Converts between SQLite rows and domain types (TrackedFile, Transfer, RemoteConfig).
+//! Converts between SQLite rows and domain types (Transfer, TopologyFile, LocationFile).
 
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -12,10 +12,8 @@ use crate::domain::location::LocationId;
 use crate::domain::location_file::{LocationFile, LocationFileState};
 use crate::domain::retry::TransferErrorKind;
 use crate::domain::topology_file::TopologyFile;
-use crate::domain::tracked_file::TrackedFile;
 use crate::domain::transfer::{Transfer, TransferKind, TransferState};
 use crate::infra::error::InfraError;
-use crate::infra::store::RemoteConfig;
 
 /// Format a DateTime<Utc> as RFC 3339 string for SQLite storage.
 ///
@@ -35,141 +33,6 @@ pub(crate) fn parse_ts(s: &str) -> Result<DateTime<Utc>, SyncError> {
             }
             .into()
         })
-}
-
-// =============================================================================
-// RemoteConfig mapping
-// =============================================================================
-
-/// Extract raw remote row fields from a rusqlite row.
-///
-/// SELECT order: location_id, backend, config, created_at
-pub(crate) fn row_to_remote_tuple(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<(String, String, String, String)> {
-    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-}
-
-/// Build a `RemoteConfig` from raw SQLite row tuple.
-pub(crate) fn tuple_to_remote_config(
-    loc_str: String,
-    backend: String,
-    config_str: String,
-    created_at_str: String,
-) -> Result<RemoteConfig, SyncError> {
-    let loc_id = LocationId::new(&loc_str).map_err(|_| InfraError::Store {
-        op: "sqlite",
-        reason: format!("corrupt location_id in sync_remotes: {loc_str:?}"),
-    })?;
-    let config: serde_json::Value =
-        serde_json::from_str(&config_str).map_err(|e| InfraError::Store {
-            op: "sqlite",
-            reason: format!("corrupt config JSON in sync_remotes for {loc_str:?}: {e}"),
-        })?;
-    let created_at = parse_ts(&created_at_str)?;
-    Ok(RemoteConfig {
-        location_id: loc_id,
-        backend,
-        config,
-        created_at,
-    })
-}
-
-// =============================================================================
-// TrackedFile mapping
-// =============================================================================
-
-/// TrackedFile row intermediate struct.
-pub(crate) struct TrackedFileRow {
-    pub id: String,
-    pub relative_path: String,
-    pub file_type_str: String,
-    pub file_hash: String,
-    pub content_hash: Option<String>,
-    pub file_size_raw: i64,
-    pub embedded_id: Option<String>,
-    pub modified_at: Option<String>,
-    pub registered_at: String,
-    pub updated_at: String,
-    pub deleted_at: Option<String>,
-}
-
-pub(crate) fn row_to_tracked_file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrackedFileRow> {
-    Ok(TrackedFileRow {
-        id: row.get("id")?,
-        relative_path: row.get("relative_path")?,
-        file_type_str: row.get("file_type")?,
-        file_hash: row.get("file_hash")?,
-        content_hash: row.get("content_hash")?,
-        file_size_raw: row.get("file_size")?,
-        embedded_id: row.get("embedded_id")?,
-        modified_at: row.get("modified_at")?,
-        registered_at: row.get("registered_at")?,
-        updated_at: row.get("updated_at")?,
-        deleted_at: row.get("deleted_at")?,
-    })
-}
-
-pub(crate) fn build_tracked_file(r: TrackedFileRow) -> Result<TrackedFile, SyncError> {
-    let file_type: FileType = r.file_type_str.parse().map_err(|_| InfraError::Store {
-        op: "sqlite",
-        reason: format!(
-            "corrupt file_type in tracked_files: {:?} (id {})",
-            r.file_type_str, r.id
-        ),
-    })?;
-    let file_size = u64::try_from(r.file_size_raw).map_err(|_| InfraError::Store {
-        op: "sqlite",
-        reason: format!(
-            "corrupt file_size in tracked_files: {} (id {})",
-            r.file_size_raw, r.id
-        ),
-    })?;
-    let modified_at = r.modified_at.as_deref().map(parse_ts).transpose()?;
-    let registered_at = parse_ts(&r.registered_at)?;
-    let updated_at = parse_ts(&r.updated_at)?;
-    let deleted_at = r.deleted_at.as_deref().map(parse_ts).transpose()?;
-
-    Ok(TrackedFile::reconstitute(
-        r.id,
-        r.relative_path,
-        file_type,
-        r.file_hash,
-        r.content_hash,
-        file_size,
-        r.embedded_id,
-        modified_at,
-        registered_at,
-        updated_at,
-        deleted_at,
-    ))
-}
-
-pub(crate) fn query_tracked_files(
-    conn: &Connection,
-    sql: &str,
-    params: &[&dyn rusqlite::types::ToSql],
-) -> Result<Vec<TrackedFile>, SyncError> {
-    let mut stmt = conn.prepare(sql).map_err(|e| InfraError::Store {
-        op: "sqlite",
-        reason: format!("{e}"),
-    })?;
-    let rows = stmt
-        .query_map(params, row_to_tracked_file_row)
-        .map_err(|e| InfraError::Store {
-            op: "sqlite",
-            reason: format!("{e}"),
-        })?;
-
-    let mut files = Vec::new();
-    for row in rows {
-        let r = row.map_err(|e| InfraError::Store {
-            op: "sqlite",
-            reason: format!("{e}"),
-        })?;
-        files.push(build_tracked_file(r)?);
-    }
-    Ok(files)
 }
 
 // =============================================================================
@@ -330,10 +193,11 @@ pub(crate) fn build_topology_file(r: TopologyFileRow) -> Result<TopologyFile, Sy
     let registered_at = parse_ts(&r.registered_at)?;
     let deleted_at = r.deleted_at.as_deref().map(parse_ts).transpose()?;
 
+    use crate::domain::digest::ContentDigest;
     Ok(TopologyFile::reconstitute(
         r.id,
         r.relative_path,
-        r.canonical_hash,
+        r.canonical_hash.map(ContentDigest),
         file_type,
         registered_at,
         deleted_at,
@@ -428,10 +292,11 @@ pub(crate) fn build_location_file(r: LocationFileRow) -> Result<LocationFile, Sy
     let modified_at = r.modified_at.as_deref().map(parse_ts).transpose()?;
     let updated_at = parse_ts(&r.updated_at)?;
 
+    use crate::domain::digest::{ByteDigest, ContentDigest, MetaDigest};
     let fingerprint = FileFingerprint {
-        file_hash: r.file_hash,
-        content_hash: r.content_hash,
-        meta_hash: r.meta_hash,
+        byte_digest: r.file_hash.as_deref().map(ByteDigest::parse),
+        content_digest: r.content_hash.map(ContentDigest),
+        meta_digest: r.meta_hash.map(MetaDigest),
         size,
         modified_at,
     };

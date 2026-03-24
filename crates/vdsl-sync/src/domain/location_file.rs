@@ -224,7 +224,7 @@ impl LocationFile {
         new_fingerprint: FileFingerprint,
         new_embedded_id: Option<String>,
     ) -> bool {
-        let changed = !self.fingerprint.matches(&new_fingerprint);
+        let changed = !self.fingerprint.matches_within_location(&new_fingerprint);
         self.fingerprint = new_fingerprint;
         self.embedded_id = new_embedded_id;
         self.state = LocationFileState::Active;
@@ -236,7 +236,7 @@ impl LocationFile {
 
     /// スキャン結果と比較し、変更があればtrue。
     pub fn has_changed(&self, scan_fingerprint: &FileFingerprint) -> bool {
-        !self.fingerprint.matches(scan_fingerprint)
+        !self.fingerprint.matches_within_location(scan_fingerprint)
     }
 
     // =========================================================================
@@ -399,20 +399,22 @@ mod tests {
     }
 
     fn djb2_fp(hash: &str, size: u64) -> FileFingerprint {
+        use super::super::digest::ByteDigest;
         FileFingerprint {
-            file_hash: Some(hash.to_string()),
-            content_hash: None,
-            meta_hash: None,
+            byte_digest: Some(ByteDigest::Djb2(hash.to_string())),
+            content_digest: None,
+            meta_digest: None,
             size,
             modified_at: None,
         }
     }
 
     fn sha256_fp(hash: &str, size: u64) -> FileFingerprint {
+        use super::super::digest::ByteDigest;
         FileFingerprint {
-            file_hash: Some(hash.to_string()),
-            content_hash: None,
-            meta_hash: None,
+            byte_digest: Some(ByteDigest::Sha256(hash.to_string())),
+            content_digest: None,
+            meta_digest: None,
             size,
             modified_at: None,
         }
@@ -420,9 +422,9 @@ mod tests {
 
     fn cloud_fp(size: u64) -> FileFingerprint {
         FileFingerprint {
-            file_hash: None,
-            content_hash: None,
-            meta_hash: None,
+            byte_digest: None,
+            content_digest: None,
+            meta_digest: None,
             size,
             modified_at: None,
         }
@@ -456,7 +458,10 @@ mod tests {
         assert_eq!(lf.file_id(), "file-1");
         assert_eq!(lf.location_id(), &local_loc());
         assert_eq!(lf.relative_path(), "output/gen-001.png");
-        assert_eq!(lf.fingerprint().file_hash.as_deref(), Some("abc123"));
+        assert_eq!(
+            lf.fingerprint().byte_digest.as_ref().map(|d| d.as_str()),
+            Some("abc123")
+        );
         assert_eq!(lf.embedded_id(), Some("gen-001"));
         assert_eq!(lf.state(), LocationFileState::Active);
     }
@@ -540,7 +545,10 @@ mod tests {
         let mut lf = make_lf();
         let changed = lf.update_fingerprint(djb2_fp("new", 2048), None);
         assert!(changed);
-        assert_eq!(lf.fingerprint().file_hash.as_deref(), Some("new"));
+        assert_eq!(
+            lf.fingerprint().byte_digest.as_ref().map(|d| d.as_str()),
+            Some("new")
+        );
         assert_eq!(lf.state(), LocationFileState::Active);
     }
 
@@ -790,17 +798,32 @@ mod tests {
     }
 
     // =========================================================================
-    // 異location間比較は設計上使わないが、動作確認
+    // 異アルゴリズムbyte_digest → フォールバック動作確認
     // =========================================================================
 
     #[test]
-    fn cross_location_hash_always_differs() {
-        let local_lf = make_lf();
+    fn cross_algo_byte_digest_falls_back_to_size() {
+        // matches_within_location: Djb2 vs Sha256 → Err → sizeフォールバック
+        // 同一sizeなので「同一」と判定（has_changed=false）
+        let local_lf = make_lf(); // Djb2, size=1024
         let pod_fp = sha256_fp(
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             1024,
         );
-        assert!(local_lf.has_changed(&pod_fp));
+        assert!(
+            !local_lf.has_changed(&pod_fp),
+            "same size → fallback matches"
+        );
+
+        // sizeが異なれば「変更」と判定
+        let pod_fp_diff = sha256_fp(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            2048,
+        );
+        assert!(
+            local_lf.has_changed(&pod_fp_diff),
+            "different size → changed"
+        );
     }
 
     // =========================================================================
@@ -845,7 +868,14 @@ mod tests {
         assert_eq!(restored.file_id(), lf.file_id());
         assert_eq!(restored.location_id(), lf.location_id());
         assert_eq!(restored.relative_path(), lf.relative_path());
-        assert_eq!(restored.fingerprint().file_hash, lf.fingerprint().file_hash);
+        assert_eq!(
+            restored
+                .fingerprint()
+                .byte_digest
+                .as_ref()
+                .map(|d| d.as_str()),
+            lf.fingerprint().byte_digest.as_ref().map(|d| d.as_str()),
+        );
         assert_eq!(restored.state(), LocationFileState::Active);
     }
 

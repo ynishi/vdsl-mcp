@@ -1,12 +1,7 @@
 pub mod error;
-pub mod observer;
-pub(crate) mod recovery_executor;
 pub mod route;
-pub mod scanner;
 pub mod sdk;
 pub mod sdk_impl;
-pub mod store;
-pub mod sync_facade;
 pub mod task;
 pub mod topology_scanner;
 pub mod topology_store;

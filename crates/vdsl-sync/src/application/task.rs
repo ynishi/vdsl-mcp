@@ -16,16 +16,7 @@
 //! Example phases: "scanning 5000 files", "recovering 12 failed transfers",
 //! "transferring 45/200 queued".
 
-use std::sync::Arc;
 use uuid::Uuid;
-
-/// Progress callback for reporting phase transitions during long-running tasks.
-///
-/// Called by Store::sync() / force_full_rewrite() at each phase boundary.
-/// The String is a human-readable description of the current phase.
-///
-/// Uses `std::sync::Mutex` internally (not tokio) so callers don't need async.
-pub type ProgressFn = Arc<dyn Fn(String) + Send + Sync>;
 
 /// Opaque task identifier (UUID v4).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]

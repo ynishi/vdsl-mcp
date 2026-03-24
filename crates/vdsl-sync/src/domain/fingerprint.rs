@@ -7,62 +7,78 @@
 //!
 //! # ストレージ種別と取得可能情報
 //!
-//! - Local/SSH: file_hash + content_hash + meta_hash + size
+//! - Local/SSH: byte_digest(DJB2) + content_digest + meta_digest + size
+//! - Pod/Remote: byte_digest(SHA-256) + size
 //! - Cloud (B2/S3): size + modified_at のみ（hash取得不可）
 //!
-//! 比較ロジックを1箇所に集約し、精度レベルを型として可視化する。
+//! # 型安全なDigest
 //!
-//! # precision() と matches() の関係
+//! [`ByteDigest`](super::digest::ByteDigest) は `PartialEq` 未実装。
+//! 異アルゴリズム（DJB2 vs SHA-256）の `==` はコンパイルエラー。
+//! 同一location内での比較は [`matches_within_location()`](Self::matches_within_location) のみ。
+//! cross-location比較は [`CrossLocationIdentity`](super::digest::CrossLocationIdentity) を使用。
+//!
+//! # precision() と matches_within_location() の関係
 //!
 //! この2つのメソッドは**異なる軸**を扱う：
 //!
 //! - [`FileFingerprint::precision()`] — 単体が**保持する**最高精度（情報量順）。
-//!   content_hash > meta_hash > file_hash > modified_at > size の順。
+//!   content_digest > meta_digest > byte_digest > modified_at > size の順。
 //!
-//! - [`FileFingerprint::matches()`] — 2者を比較する際の**信頼性**順。
-//!   file_hash > content_hash > meta_hash > size+mtime > size の順。
-//!   file_hashはバイト完全一致を保証するため、比較の確実性が最も高い。
-//!   **content_hash/meta_hashはsize gateより前で判定** — メタ変更で
+//! - [`FileFingerprint::matches_within_location()`] — 同一location内の2者比較。
+//!   byte_digest > content_digest > meta_digest > size+mtime > size の順。
+//!   byte_digestはバイト完全一致を保証するため、比較の確実性が最も高い。
+//!   **content_digest/meta_digestはsize gateより前で判定** — メタ変更で
 //!   sizeが変わっても同一Entityとして検出する。
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::digest::{ByteDigest, ContentDigest, MetaDigest};
+
 /// ファイル同一性判定に使用するフィンガープリント。
 ///
-/// [`matches()`](Self::matches) が利用可能な最高精度の情報で比較を行う。
-/// 精度は [`precision()`](Self::precision) で確認可能。
+/// [`matches_within_location()`](Self::matches_within_location) が同一location内で
+/// 利用可能な最高精度の情報で比較を行う。
+/// cross-location比較には [`CrossLocationIdentity`](super::digest::CrossLocationIdentity) を使用。
 ///
 /// # 精度の優先順位（情報量順）
 ///
-/// 1. `content_hash` (Semantic) — フォーマット固有の意味的ハッシュ（ピクセルデータ等）
-/// 2. `meta_hash` (MetaLevel) — 埋め込みメタデータのハッシュ（PNG tEXt, EXIF等）
-/// 3. `file_hash` (ByteLevel) — ファイル全体のバイト列ハッシュ（一致=バイト同一）
+/// 1. `content_digest` (Semantic) — フォーマット固有の意味的ハッシュ（ピクセルデータ等）
+/// 2. `meta_digest` (MetaLevel) — 埋め込みメタデータのハッシュ（PNG tEXt, EXIF等）
+/// 3. `byte_digest` (ByteLevel) — ファイル全体のバイト列ハッシュ（一致=バイト同一）
 /// 4. `size` + `modified_at` (Metadata) — メタデータ比較
 /// 5. `size` のみ (SizeOnly) — 最低精度
 ///
-/// # matches()の比較信頼性順
+/// # matches_within_location()の比較信頼性順
 ///
-/// 1. `file_hash` — バイト完全一致（最も確実）
-/// 2. `content_hash` — ピクセル同一性
-/// 3. `meta_hash` — メタデータ同一性
+/// 1. `byte_digest` — バイト完全一致（最も確実、同一アルゴリズムのみ）
+/// 2. `content_digest` — ピクセル同一性
+/// 3. `meta_digest` — メタデータ同一性
 /// 4. `size` + `modified_at`
 /// 5. `size` のみ
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileFingerprint {
-    /// ファイル全体のハッシュ (DJB2, sha256 等)。
+    /// ファイル全体のハッシュ。location固有アルゴリズム（DJB2/SHA-256）。
     /// Cloud Storageではダウンロードなしに取得不可のためNone。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_hash: Option<String>,
+    ///
+    /// **PartialEq未実装** — cross-location比較はコンパイルエラー。
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "file_hash")]
+    pub byte_digest: Option<ByteDigest>,
     /// フォーマット固有セマンティックハッシュ (PNG IHDR+IDAT 等のピクセルデータ)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_hash: Option<String>,
+    /// location非依存。PartialEq実装済み。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "content_hash"
+    )]
+    pub content_digest: Option<ContentDigest>,
     /// 埋め込みメタデータのハッシュ (PNG tEXt, EXIF等)。
-    /// content_hashと合わせて「何が変わったか」を区別する:
-    /// - content_hash一致 + meta_hash不一致 → メタデータだけ変更
-    /// - content_hash不一致 → コンテンツ自体が変更
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub meta_hash: Option<String>,
+    /// content_digestと合わせて「何が変わったか」を区別する:
+    /// - content_digest一致 + meta_digest不一致 → メタデータだけ変更
+    /// - content_digest不一致 → コンテンツ自体が変更
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "meta_hash")]
+    pub meta_digest: Option<MetaDigest>,
     /// ファイルサイズ (bytes)。
     pub size: u64,
     /// 最終更新日時 (ストレージ報告値)。
@@ -74,8 +90,8 @@ pub struct FileFingerprint {
 ///
 /// 上位ほど豊かな情報を持つ。`Ord` はこの序列に基づく。
 ///
-/// **注意**: `matches()` の比較優先順序とは異なる。
-/// `matches()` は信頼性順（file_hash > content_hash > meta_hash）で比較するが、
+/// **注意**: `matches_within_location()` の比較優先順序とは異なる。
+/// `matches_within_location()` は信頼性順（byte_digest > content_digest > meta_digest）で比較するが、
 /// この enum は情報量順（Semantic > MetaLevel > ByteLevel）で序列化する。
 /// 詳細はモジュールドキュメントを参照。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -84,50 +100,59 @@ pub enum FingerprintPrecision {
     SizeOnly = 0,
     /// size + mtime。ストレージのタイムスタンプ精度に依存。
     Metadata = 1,
-    /// file_hash (DJB2/sha256)。バイト列完全一致。
+    /// byte_digest (DJB2/sha256)。バイト列完全一致。
     ByteLevel = 2,
-    /// meta_hash (PNG tEXt, EXIF等)。埋め込みメタデータの同一性。
+    /// meta_digest (PNG tEXt, EXIF等)。埋め込みメタデータの同一性。
     MetaLevel = 3,
-    /// content_hash (PNG IHDR+IDAT 等)。ピクセルデータの意味的同一性。
+    /// content_digest (PNG IHDR+IDAT 等)。ピクセルデータの意味的同一性。
     Semantic = 4,
 }
 
 impl FileFingerprint {
-    /// 利用可能な最も信頼性の高い情報で同一ファイルか判定する。
+    /// 同一location内でのファイル同一性判定。
+    ///
+    /// **cross-location比較には使用不可** — `ByteDigest` はlocation固有アルゴリズムのため、
+    /// 異location間で比較するとアルゴリズム不一致エラーになる。
+    /// cross-location比較には [`CrossLocationIdentity`](super::digest::CrossLocationIdentity) を使用。
     ///
     /// # 画像ファイル = Entity モデル
     ///
     /// Content（ピクセルデータ）がEntityのIdentity。メタデータやファイルサイズは
     /// 副次的属性であり、メタ変更でsizeが変わっても同一Entityである。
-    /// そのため content_hash / meta_hash 比較は **size gateより前** に実行し、
+    /// そのため content_digest / meta_digest 比較は **size gateより前** に実行し、
     /// hash一致時にsize不一致でも同一と判定する。
     ///
     /// # 信頼性フォールバック順
     ///
-    /// 1. 双方に `file_hash` → バイト完全一致（最も確実）
-    /// 2. 双方に `content_hash` → ピクセル同一性（size無関係で判定）
-    /// 3. 双方に `meta_hash` → メタデータ同一性（size無関係で判定）
-    /// 4. `size` gate → 上記hashが全て比較不可能な場合のみフォールバック
+    /// 1. 双方に `byte_digest` → 同一アルゴリズム比較（最も確実）
+    /// 2. 双方に `content_digest` → ピクセル同一性（size無関係で判定）
+    /// 3. 双方に `meta_digest` → メタデータ同一性（size無関係で判定）
+    /// 4. `size` gate → 上記digestが全て比較不可能な場合のみフォールバック
     /// 5. 双方に `modified_at` → mtime比較（size一致済み）
     /// 6. size一致のみ → 最低精度（false positiveリスクあり）
-    pub fn matches(&self, other: &FileFingerprint) -> bool {
-        // 1. ByteLevel: file_hash（バイト列全体のハッシュ。一致=ファイル同一）
-        if let (Some(a), Some(b)) = (&self.file_hash, &other.file_hash) {
-            return a == b;
+    pub fn matches_within_location(&self, other: &FileFingerprint) -> bool {
+        // 1. ByteLevel: byte_digest（同一アルゴリズム同士のみ比較）
+        if let (Some(a), Some(b)) = (&self.byte_digest, &other.byte_digest) {
+            // matches_same_algo は異アルゴリズムでErr。
+            // 同一location内なので通常はOk。万一Errならフォールバック。
+            match a.matches_same_algo(b) {
+                Ok(result) => return result,
+                Err(_) => { /* 異アルゴリズム — フォールバック */ }
+            }
         }
-        // 2. Semantic: content_hash（ピクセルデータ等）
-        //    sizeが異なってもcontent_hash一致なら同一Entity
+        // 2. Semantic: content_digest（ピクセルデータ等）
+        //    sizeが異なってもcontent_digest一致なら同一Entity
         //    （メタデータ変更でファイルサイズが変わるケースに対応）
-        if let (Some(a), Some(b)) = (&self.content_hash, &other.content_hash) {
+        if let (Some(a), Some(b)) = (&self.content_digest, &other.content_digest) {
             return a == b;
         }
-        // 3. MetaLevel: meta_hash（埋め込みメタデータ）
-        //    content_hashが双方にない場合のフォールバック
-        if let (Some(a), Some(b)) = (&self.meta_hash, &other.meta_hash) {
+        // 3. MetaLevel: meta_digest（埋め込みメタデータ）
+        //    content_digestが双方にない場合のフォールバック
+        if let (Some(a), Some(b)) = (&self.meta_digest, &other.meta_digest) {
             return a == b;
         }
-        // 4. Size gate — hashが全て比較不可能な場合のフォールバック
-        //    ※ content_hash/meta_hashがある場合はここに到達しない
+        // 4. Size gate — digestが全て比較不可能な場合のフォールバック
+        //    ※ content_digest/meta_digestがある場合はここに到達しない
         if self.size != other.size {
             return false;
         }
@@ -141,14 +166,14 @@ impl FileFingerprint {
 
     /// このフィンガープリントが保持する最高精度レベル。
     ///
-    /// content_hash（Semantic）を最上位とする情報量の序列。
-    /// `matches()` の比較信頼性順（file_hash最優先）とは独立した軸である。
+    /// content_digest（Semantic）を最上位とする情報量の序列。
+    /// `matches_within_location()` の比較信頼性順（byte_digest最優先）とは独立した軸である。
     pub fn precision(&self) -> FingerprintPrecision {
-        if self.content_hash.is_some() {
+        if self.content_digest.is_some() {
             FingerprintPrecision::Semantic
-        } else if self.meta_hash.is_some() {
+        } else if self.meta_digest.is_some() {
             FingerprintPrecision::MetaLevel
-        } else if self.file_hash.is_some() {
+        } else if self.byte_digest.is_some() {
             FingerprintPrecision::ByteLevel
         } else if self.modified_at.is_some() {
             FingerprintPrecision::Metadata
@@ -181,26 +206,30 @@ impl std::fmt::Display for FingerprintPrecision {
 mod tests {
     use super::*;
 
-    fn hash_fp(file_hash: &str, content_hash: Option<&str>, size: u64) -> FileFingerprint {
+    fn hash_fp(
+        byte_digest: ByteDigest,
+        content_digest: Option<&str>,
+        size: u64,
+    ) -> FileFingerprint {
         FileFingerprint {
-            file_hash: Some(file_hash.to_string()),
-            content_hash: content_hash.map(|s| s.to_string()),
-            meta_hash: None,
+            byte_digest: Some(byte_digest),
+            content_digest: content_digest.map(|s| ContentDigest(s.to_string())),
+            meta_digest: None,
             size,
             modified_at: None,
         }
     }
 
     fn hash_fp_with_meta(
-        file_hash: &str,
-        content_hash: Option<&str>,
-        meta_hash: Option<&str>,
+        byte_digest: ByteDigest,
+        content_digest: Option<&str>,
+        meta_digest: Option<&str>,
         size: u64,
     ) -> FileFingerprint {
         FileFingerprint {
-            file_hash: Some(file_hash.to_string()),
-            content_hash: content_hash.map(|s| s.to_string()),
-            meta_hash: meta_hash.map(|s| s.to_string()),
+            byte_digest: Some(byte_digest),
+            content_digest: content_digest.map(|s| ContentDigest(s.to_string())),
+            meta_digest: meta_digest.map(|s| MetaDigest(s.to_string())),
             size,
             modified_at: None,
         }
@@ -208,77 +237,76 @@ mod tests {
 
     fn metadata_fp(size: u64, mtime: Option<DateTime<Utc>>) -> FileFingerprint {
         FileFingerprint {
-            file_hash: None,
-            content_hash: None,
-            meta_hash: None,
+            byte_digest: None,
+            content_digest: None,
+            meta_digest: None,
             size,
             modified_at: mtime,
         }
     }
 
     // =========================================================================
-    // matches() — file_hash 優先（バイト同一性が最も信頼性が高い）
+    // matches_within_location() — byte_digest 優先（バイト同一性が最も信頼性が高い）
     // =========================================================================
 
     #[test]
     fn matches_byte_level_trumps_semantic() {
-        let a = hash_fp("h1", Some("c1"), 100);
-        let b = hash_fp("h1", Some("c2"), 200); // file_hash一致 → content_hash/size無関係で同一
-        assert!(a.matches(&b));
+        let a = hash_fp(ByteDigest::Djb2("h1".into()), Some("c1"), 100);
+        let b = hash_fp(ByteDigest::Djb2("h1".into()), Some("c2"), 200);
+        assert!(a.matches_within_location(&b));
     }
 
     #[test]
     fn matches_byte_level_different_trumps_semantic() {
-        let a = hash_fp("h1", Some("c1"), 100);
-        let b = hash_fp("h2", Some("c1"), 100); // file_hash不一致 → content_hash一致でも異なる
-        assert!(!a.matches(&b));
+        let a = hash_fp(ByteDigest::Djb2("h1".into()), Some("c1"), 100);
+        let b = hash_fp(ByteDigest::Djb2("h2".into()), Some("c1"), 100);
+        assert!(!a.matches_within_location(&b));
     }
 
     // =========================================================================
-    // matches() — content_hash フォールバック（file_hashなし時）
+    // matches_within_location() — content_digest フォールバック（byte_digestなし時）
     // =========================================================================
 
     #[test]
     fn matches_semantic_fallback_same() {
-        // file_hashがNone → content_hashにフォールバック
         let a = FileFingerprint {
-            file_hash: None,
-            content_hash: Some("c1".to_string()),
-            meta_hash: None,
+            byte_digest: None,
+            content_digest: Some(ContentDigest("c1".into())),
+            meta_digest: None,
             size: 100,
             modified_at: None,
         };
         let b = FileFingerprint {
-            file_hash: None,
-            content_hash: Some("c1".to_string()),
-            meta_hash: None,
+            byte_digest: None,
+            content_digest: Some(ContentDigest("c1".into())),
+            meta_digest: None,
             size: 200,
             modified_at: None,
         };
-        assert!(a.matches(&b));
+        assert!(a.matches_within_location(&b));
     }
 
     #[test]
     fn matches_semantic_fallback_different() {
         let a = FileFingerprint {
-            file_hash: None,
-            content_hash: Some("c1".to_string()),
-            meta_hash: None,
+            byte_digest: None,
+            content_digest: Some(ContentDigest("c1".into())),
+            meta_digest: None,
             size: 100,
             modified_at: None,
         };
         let b = FileFingerprint {
-            file_hash: None,
-            content_hash: Some("c2".to_string()),
-            meta_hash: None,
+            byte_digest: None,
+            content_digest: Some(ContentDigest("c2".into())),
+            meta_digest: None,
             size: 100,
             modified_at: None,
         };
-        assert!(!a.matches(&b));
+        assert!(!a.matches_within_location(&b));
     }
 
     // =========================================================================
-    // matches() — metadata (size + mtime)
+    // matches_within_location() — metadata (size + mtime)
     // =========================================================================
 
     #[test]
@@ -286,7 +314,7 @@ mod tests {
         let t = Utc::now();
         let a = metadata_fp(1024, Some(t));
         let b = metadata_fp(1024, Some(t));
-        assert!(a.matches(&b));
+        assert!(a.matches_within_location(&b));
     }
 
     #[test]
@@ -294,7 +322,7 @@ mod tests {
         let t = Utc::now();
         let a = metadata_fp(1024, Some(t));
         let b = metadata_fp(2048, Some(t));
-        assert!(!a.matches(&b));
+        assert!(!a.matches_within_location(&b));
     }
 
     #[test]
@@ -307,45 +335,56 @@ mod tests {
             .with_timezone(&Utc);
         let a = metadata_fp(1024, Some(t1));
         let b = metadata_fp(1024, Some(t2));
-        assert!(!a.matches(&b));
+        assert!(!a.matches_within_location(&b));
     }
 
     // =========================================================================
-    // matches() — size only (最低精度)
+    // matches_within_location() — size only (最低精度)
     // =========================================================================
 
     #[test]
     fn matches_size_only_same() {
         let a = metadata_fp(1024, None);
         let b = metadata_fp(1024, None);
-        assert!(a.matches(&b)); // size一致 → true (false positive リスクあり)
+        assert!(a.matches_within_location(&b));
     }
 
     #[test]
     fn matches_size_only_different() {
         let a = metadata_fp(1024, None);
         let b = metadata_fp(2048, None);
-        assert!(!a.matches(&b));
+        assert!(!a.matches_within_location(&b));
     }
 
     // =========================================================================
-    // matches() — 異精度の比較
+    // matches_within_location() — 異精度の比較
     // =========================================================================
 
     #[test]
     fn matches_hash_vs_metadata_size_match() {
-        // hash側にはfile_hashがあるが、metadata側にはない
-        // → file_hash比較不可、size比較にフォールバック
-        let a = hash_fp("h1", None, 1024);
+        let a = hash_fp(ByteDigest::Djb2("h1".into()), None, 1024);
         let b = metadata_fp(1024, None);
-        assert!(a.matches(&b)); // size一致で true
+        assert!(a.matches_within_location(&b));
     }
 
     #[test]
     fn matches_hash_vs_metadata_size_differs() {
-        let a = hash_fp("h1", None, 1024);
+        let a = hash_fp(ByteDigest::Djb2("h1".into()), None, 1024);
         let b = metadata_fp(2048, None);
-        assert!(!a.matches(&b));
+        assert!(!a.matches_within_location(&b));
+    }
+
+    // =========================================================================
+    // matches_within_location() — 異アルゴリズムはフォールバック
+    // =========================================================================
+
+    #[test]
+    fn cross_algorithm_falls_back_to_size() {
+        // 同一location内では通常起きないが、万一の安全策
+        let a = hash_fp(ByteDigest::Djb2("h1".into()), None, 1024);
+        let b = hash_fp(ByteDigest::Sha256("h2".into()), None, 1024);
+        // byte_digest比較はErr → size比較にフォールバック → size一致でtrue
+        assert!(a.matches_within_location(&b));
     }
 
     // =========================================================================
@@ -354,13 +393,13 @@ mod tests {
 
     #[test]
     fn precision_semantic() {
-        let fp = hash_fp("h", Some("c"), 100);
+        let fp = hash_fp(ByteDigest::Djb2("h".into()), Some("c"), 100);
         assert_eq!(fp.precision(), FingerprintPrecision::Semantic);
     }
 
     #[test]
     fn precision_byte_level() {
-        let fp = hash_fp("h", None, 100);
+        let fp = hash_fp(ByteDigest::Djb2("h".into()), None, 100);
         assert_eq!(fp.precision(), FingerprintPrecision::ByteLevel);
     }
 
@@ -382,7 +421,7 @@ mod tests {
 
     #[test]
     fn effective_precision_downgrades() {
-        let hash = hash_fp("h", Some("c"), 100);
+        let hash = hash_fp(ByteDigest::Djb2("h".into()), Some("c"), 100);
         let meta = metadata_fp(100, Some(Utc::now()));
         assert_eq!(
             hash.effective_precision(&meta),
@@ -392,8 +431,8 @@ mod tests {
 
     #[test]
     fn effective_precision_same_level() {
-        let a = hash_fp("h1", None, 100);
-        let b = hash_fp("h2", None, 200);
+        let a = hash_fp(ByteDigest::Djb2("h1".into()), None, 100);
+        let b = hash_fp(ByteDigest::Djb2("h2".into()), None, 200);
         assert_eq!(a.effective_precision(&b), FingerprintPrecision::ByteLevel);
     }
 
@@ -411,66 +450,61 @@ mod tests {
     }
 
     // =========================================================================
-    // meta_hash — メタデータ同一性
+    // meta_digest — メタデータ同一性
     // =========================================================================
 
     #[test]
-    fn matches_meta_hash_fallback_same() {
-        // file_hash/content_hashがNone → meta_hashにフォールバック
+    fn matches_meta_digest_fallback_same() {
         let a = FileFingerprint {
-            file_hash: None,
-            content_hash: None,
-            meta_hash: Some("m1".to_string()),
+            byte_digest: None,
+            content_digest: None,
+            meta_digest: Some(MetaDigest("m1".into())),
             size: 100,
             modified_at: None,
         };
         let b = FileFingerprint {
-            file_hash: None,
-            content_hash: None,
-            meta_hash: Some("m1".to_string()),
+            byte_digest: None,
+            content_digest: None,
+            meta_digest: Some(MetaDigest("m1".into())),
             size: 200,
             modified_at: None,
         };
-        assert!(a.matches(&b));
+        assert!(a.matches_within_location(&b));
     }
 
     #[test]
-    fn matches_meta_hash_fallback_different() {
+    fn matches_meta_digest_fallback_different() {
         let a = FileFingerprint {
-            file_hash: None,
-            content_hash: None,
-            meta_hash: Some("m1".to_string()),
+            byte_digest: None,
+            content_digest: None,
+            meta_digest: Some(MetaDigest("m1".into())),
             size: 100,
             modified_at: None,
         };
         let b = FileFingerprint {
-            file_hash: None,
-            content_hash: None,
-            meta_hash: Some("m2".to_string()),
+            byte_digest: None,
+            content_digest: None,
+            meta_digest: Some(MetaDigest("m2".into())),
             size: 100,
             modified_at: None,
         };
-        assert!(!a.matches(&b));
+        assert!(!a.matches_within_location(&b));
     }
 
     #[test]
     fn content_same_meta_different_means_meta_only_change() {
-        // ピクセル同一だがメタデータが異なるケース
-        // file_hash不一致（バイト列は違う）、content_hash一致（ピクセル同一）
-        let a = hash_fp_with_meta("h1", Some("c1"), Some("m1"), 1024);
-        let b = hash_fp_with_meta("h2", Some("c1"), Some("m2"), 1024);
-        // file_hash不一致 → matches = false（バイトレベルでは別物）
-        assert!(!a.matches(&b));
-        // しかしcontent_hashだけで比較すれば同一と判定できる
-        // → rename検出やcanonical_hash用途ではcontent_hashを使う
+        let a = hash_fp_with_meta(ByteDigest::Djb2("h1".into()), Some("c1"), Some("m1"), 1024);
+        let b = hash_fp_with_meta(ByteDigest::Djb2("h2".into()), Some("c1"), Some("m2"), 1024);
+        // byte_digest不一致 → matches = false（バイトレベルでは別物）
+        assert!(!a.matches_within_location(&b));
     }
 
     #[test]
     fn precision_meta_level() {
         let fp = FileFingerprint {
-            file_hash: None,
-            content_hash: None,
-            meta_hash: Some("m1".to_string()),
+            byte_digest: None,
+            content_digest: None,
+            meta_digest: Some(MetaDigest("m1".into())),
             size: 100,
             modified_at: None,
         };
@@ -479,11 +513,10 @@ mod tests {
 
     #[test]
     fn precision_semantic_trumps_meta() {
-        // content_hashとmeta_hash両方ある場合 → Semantic
         let fp = FileFingerprint {
-            file_hash: None,
-            content_hash: Some("c1".to_string()),
-            meta_hash: Some("m1".to_string()),
+            byte_digest: None,
+            content_digest: Some(ContentDigest("c1".into())),
+            meta_digest: Some(MetaDigest("m1".into())),
             size: 100,
             modified_at: None,
         };
@@ -504,62 +537,60 @@ mod tests {
 
     #[test]
     fn entity_model_meta_change_does_not_break_identity() {
-        // 画像ファイル = Entity。Content（ピクセルデータ）がIdentity。
-        // メタデータ（tEXt/EXIF）にTSを埋め込むと、同一コンテンツでも
-        // file_hash/size/meta_hashが全て変わるが、content_hashは不変。
-        // → content_hash一致で同一Entityと判定。
         let before = FileFingerprint {
-            file_hash: None, // file_hashは双方にないケース（Cloud等）
-            content_hash: Some("pixel_hash_abc".to_string()),
-            meta_hash: Some("meta_v1".to_string()),
-            size: 10240, // メタ書き換え前のサイズ
+            byte_digest: None,
+            content_digest: Some(ContentDigest("pixel_hash_abc".into())),
+            meta_digest: Some(MetaDigest("meta_v1".into())),
+            size: 10240,
             modified_at: None,
         };
         let after = FileFingerprint {
-            file_hash: None,
-            content_hash: Some("pixel_hash_abc".to_string()), // ピクセル同一
-            meta_hash: Some("meta_v2".to_string()),           // メタ変化
-            size: 10300,                                      // メタ追加でサイズ変化
+            byte_digest: None,
+            content_digest: Some(ContentDigest("pixel_hash_abc".into())),
+            meta_digest: Some(MetaDigest("meta_v2".into())),
+            size: 10300,
             modified_at: None,
         };
-        // content_hash一致 → 同一Entity（sizeの違いは無関係）
-        assert!(before.matches(&after));
+        assert!(before.matches_within_location(&after));
     }
 
     #[test]
     fn entity_model_content_change_is_detected() {
-        // コンテンツ（ピクセルデータ）が変わった → 別Entity
         let v1 = FileFingerprint {
-            file_hash: None,
-            content_hash: Some("pixel_v1".to_string()),
-            meta_hash: Some("meta_v1".to_string()),
+            byte_digest: None,
+            content_digest: Some(ContentDigest("pixel_v1".into())),
+            meta_digest: Some(MetaDigest("meta_v1".into())),
             size: 10240,
             modified_at: None,
         };
         let v2 = FileFingerprint {
-            file_hash: None,
-            content_hash: Some("pixel_v2".to_string()), // ピクセル変化
-            meta_hash: Some("meta_v1".to_string()),     // メタは同一
-            size: 10240,                                // sizeも同一
+            byte_digest: None,
+            content_digest: Some(ContentDigest("pixel_v2".into())),
+            meta_digest: Some(MetaDigest("meta_v1".into())),
+            size: 10240,
             modified_at: None,
         };
-        // content_hash不一致 → 別Entity
-        assert!(!v1.matches(&v2));
+        assert!(!v1.matches_within_location(&v2));
     }
 
     #[test]
     fn entity_model_reexport_with_ts_in_meta() {
-        // 同一画像を再書き出し（メタにTS埋め込み）→ 同一Entity
-        // file_hashは変わる（バイト列が違う）がcontent_hashは同じ
-        let original = hash_fp_with_meta("file_h1", Some("pixel_abc"), Some("meta_ts1"), 10240);
-        let reexport = hash_fp_with_meta("file_h2", Some("pixel_abc"), Some("meta_ts2"), 10300);
-        // file_hash不一致で即false — バイトレベルでは別物
-        assert!(!original.matches(&reexport));
-        // しかしcontent_hashだけ取り出せば同一Entity
-        // → canonical_hash（content_hash）によるマッチングで同一と判定可能
+        let original = hash_fp_with_meta(
+            ByteDigest::Djb2("file_h1".into()),
+            Some("pixel_abc"),
+            Some("meta_ts1"),
+            10240,
+        );
+        let reexport = hash_fp_with_meta(
+            ByteDigest::Djb2("file_h2".into()),
+            Some("pixel_abc"),
+            Some("meta_ts2"),
+            10300,
+        );
+        assert!(!original.matches_within_location(&reexport));
         assert_eq!(
-            original.content_hash.as_deref(),
-            reexport.content_hash.as_deref()
+            original.content_digest.as_ref().map(|cd| cd.as_str()),
+            reexport.content_digest.as_ref().map(|cd| cd.as_str()),
         );
     }
 }

@@ -294,8 +294,7 @@ impl TransferRoute {
     /// Batch transfer multiple files along this route in a single operation.
     ///
     /// Uses `backend.push_batch()` with `--files-from` for rclone backends.
-    /// Only supports Push direction (Sync transfers). Pull and Delete
-    /// operations should use individual `transfer()` / `delete()` calls.
+    /// For sync transfers only. Delete transfers use `delete_batch()`.
     ///
     /// Returns per-file Ok/Err results keyed by relative path.
     pub async fn transfer_batch(
@@ -333,6 +332,54 @@ impl TransferRoute {
                 self.backend
                     .pull_batch(src_root_str, &self.dest_file_root, relative_paths)
                     .await
+            }
+        }
+    }
+
+    /// Batch delete multiple files along this route in a single operation.
+    ///
+    /// Uses `backend.delete_batch()` with `rclone delete --files-from`.
+    /// For push-direction routes, deletes from dest (remote).
+    /// For pull-direction routes, deletes from dest (local) — falls back to individual.
+    ///
+    /// Returns per-file Ok/Err results keyed by relative path.
+    pub async fn delete_batch(
+        &self,
+        relative_paths: &[String],
+    ) -> HashMap<String, Result<(), SyncError>> {
+        if relative_paths.is_empty() {
+            return HashMap::new();
+        }
+
+        for rel in relative_paths {
+            if Self::validate_relative_path(rel).is_err() {
+                return relative_paths
+                    .iter()
+                    .map(|p| {
+                        (
+                            p.clone(),
+                            Err(SyncError::OutsideSyncRoot { path: p.clone() }),
+                        )
+                    })
+                    .collect();
+            }
+        }
+
+        match self.direction {
+            TransferDirection::Push => {
+                let dest_root_str = self.dest_file_root.to_str().unwrap_or_default();
+                self.backend
+                    .delete_batch(dest_root_str, relative_paths)
+                    .await
+            }
+            TransferDirection::Pull => {
+                // Pull direction: dest is local filesystem — delete individually
+                let mut results = HashMap::with_capacity(relative_paths.len());
+                for rel in relative_paths {
+                    let result = self.delete(rel).await;
+                    results.insert(rel.clone(), result);
+                }
+                results
             }
         }
     }

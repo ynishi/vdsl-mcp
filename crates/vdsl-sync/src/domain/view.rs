@@ -1,6 +1,6 @@
 //! クエリ用ビュー型。
 //!
-//! TrackedFileとTransferから導出される読み取り専用のビュー。
+//! Transfer/LocationFileから導出される読み取り専用のビュー。
 //! ドメインエンティティではない。外部API (MCP, CLI, Lua bridge) への
 //! レスポンス構築用。
 
@@ -10,7 +10,6 @@ use std::fmt;
 
 use super::location::LocationId;
 use super::retry::RetryPolicy;
-use super::tracked_file::TrackedFile;
 use super::transfer::{Transfer, TransferKind, TransferState};
 
 /// 特定locationでのファイルの存在状態。
@@ -57,13 +56,6 @@ impl PresenceState {
     }
 
     /// Transfer + RetryPolicy からPresenceStateを導出。
-    ///
-    /// - Queued → Pending
-    /// - InFlight → Syncing
-    /// - Completed → Present
-    /// - Failed + retryable → Pending（リトライ待ち）
-    /// - Failed + exhausted → Failed（手動介入が必要）
-    /// - Cancelled → Absent（転送は中断済み。ファイルは到達していない）
     pub fn from_transfer(transfer: &Transfer, policy: &RetryPolicy) -> Self {
         match transfer.state() {
             TransferState::Blocked => Self::Pending,
@@ -89,8 +81,6 @@ impl fmt::Display for PresenceState {
 }
 
 /// 特定locationでのファイルの存在状況ビュー。
-///
-/// 最新のTransferから構築される。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresenceView {
     pub location: LocationId,
@@ -102,40 +92,7 @@ pub struct PresenceView {
     pub attempt: u32,
 }
 
-/// TrackedFile + 各locationのPresence情報を結合したビュー。
-///
-/// `Store::get()` 等のクエリAPIが返す型。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileView {
-    #[serde(flatten)]
-    pub file: TrackedFile,
-    pub presences: Vec<PresenceView>,
-}
-
-impl FileView {
-    /// 特定locationの存在状態を取得。
-    pub fn presence(&self, loc: &LocationId) -> Option<&PresenceView> {
-        self.presences.iter().find(|p| &p.location == loc)
-    }
-
-    /// 特定locationのPresenceStateを取得。
-    pub fn presence_state(&self, loc: &LocationId) -> Option<PresenceState> {
-        self.presence(loc).map(|p| p.state)
-    }
-
-    /// Serialize to [`serde_json::Value`] for cross-boundary transport.
-    pub fn to_value(&self) -> Result<serde_json::Value, serde_json::Error> {
-        serde_json::to_value(self)
-    }
-}
-
-// =============================================================================
-// Status detail entries (Store::status() 用)
-// =============================================================================
-
 /// 失敗したTransferの表示情報。
-///
-/// Transfer本体を公開せず、Store利用者が必要な情報のみを提供する。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorEntry {
     pub file_id: String,
@@ -146,7 +103,6 @@ pub struct ErrorEntry {
 }
 
 impl ErrorEntry {
-    /// Transferから表示用ErrorEntryを構築する。
     pub(crate) fn from_transfer(t: &Transfer) -> Self {
         Self {
             file_id: t.file_id().to_string(),
@@ -159,8 +115,6 @@ impl ErrorEntry {
 }
 
 /// 待機中Transferの表示情報。
-///
-/// Transfer本体を公開せず、Store利用者が必要な情報のみを提供する。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingEntry {
     pub file_id: String,
@@ -170,7 +124,6 @@ pub struct PendingEntry {
 }
 
 impl PendingEntry {
-    /// Transferから表示用PendingEntryを構築する。
     pub(crate) fn from_transfer(t: &Transfer) -> Self {
         Self {
             file_id: t.file_id().to_string(),
@@ -184,49 +137,10 @@ impl PendingEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::file_type::FileType;
     use crate::domain::retry::TransferErrorKind;
-    use crate::domain::transfer::TransferKind;
 
     fn loc(s: &str) -> LocationId {
         LocationId::new(s).unwrap()
-    }
-
-    fn sample_view() -> FileView {
-        FileView {
-            file: TrackedFile::from_scan(
-                "output/test.png".into(),
-                FileType::Image,
-                "hash123".into(),
-                None,
-                1024,
-                None,
-            )
-            .expect("valid test data"),
-            presences: vec![
-                PresenceView {
-                    location: loc("local"),
-                    state: PresenceState::Present,
-                    error: None,
-                    synced_at: None,
-                    attempt: 0,
-                },
-                PresenceView {
-                    location: loc("cloud"),
-                    state: PresenceState::Pending,
-                    error: None,
-                    synced_at: None,
-                    attempt: 1,
-                },
-                PresenceView {
-                    location: loc("pod"),
-                    state: PresenceState::Present,
-                    error: None,
-                    synced_at: Some(Utc::now()),
-                    attempt: 2,
-                },
-            ],
-        }
     }
 
     fn make_transfer(
@@ -317,43 +231,5 @@ mod tests {
             PresenceState::from_transfer(&t, &policy),
             PresenceState::Failed
         );
-    }
-
-    #[test]
-    fn file_view_presence_lookup() {
-        let v = sample_view();
-        assert_eq!(
-            v.presence_state(&loc("local")),
-            Some(PresenceState::Present)
-        );
-        assert_eq!(
-            v.presence_state(&loc("cloud")),
-            Some(PresenceState::Pending)
-        );
-        assert_eq!(v.presence_state(&loc("nas")), None);
-    }
-
-    #[test]
-    fn file_view_presence_detail() {
-        let v = sample_view();
-        let pod = v.presence(&loc("pod")).unwrap();
-        assert_eq!(pod.attempt, 2);
-        assert!(pod.synced_at.is_some());
-    }
-
-    #[test]
-    fn serde_roundtrip() {
-        let v = sample_view();
-        let json = serde_json::to_value(&v).unwrap();
-
-        // file fields are flattened
-        assert!(json.get("relative_path").is_some());
-        assert!(json.get("file_hash").is_some());
-        // presences is an array
-        assert!(json.get("presences").unwrap().is_array());
-
-        let restored: FileView = serde_json::from_value(json).unwrap();
-        assert_eq!(restored.file.relative_path(), "output/test.png");
-        assert_eq!(restored.presences.len(), 3);
     }
 }

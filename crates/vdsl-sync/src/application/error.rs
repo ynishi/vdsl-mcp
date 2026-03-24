@@ -32,6 +32,10 @@ pub enum SyncError {
     #[error("file not registered in sync store: {0}")]
     NotRegistered(String),
 
+    /// 初期化失敗（拠点到達不能、外部ツール確保失敗等）。
+    #[error("initialization failed: {0}")]
+    Init(String),
+
     /// バックエンド未設定。
     #[error("backend not configured for location: {0}")]
     NoBackend(String),

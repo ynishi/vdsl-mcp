@@ -1,16 +1,16 @@
-//! TransferPlan — FileDelta から必要な Transfer を計画する純粋関数。
+//! TransferPlan — DistributeAction から必要な Transfer を計画する純粋関数。
 //!
 //! ドメインロジックの核心。インフラに依存しない。
 //!
 //! # 入力
 //!
-//! - `FileDelta[]` — scanフェーズの出力
+//! - `DistributeAction[]` — distribute_actions() の出力
 //! - [`Topology`] — 経路トポロジー（到達可能性・最適経路の解決を抽象化）
-//! - `HashMap<LocationId, PresenceState>` — 各locationでの現在の存在状態
+//! - `pending_dests` / `existing_presences` — 重複抑止・マルチソース最適化用
 //!
 //! # 計画ルール
 //!
-//! origin から到達可能な全destination に到達する最小コスト経路を
+//! source から全target に到達する最小コスト経路を
 //! [`Topology`] 経由で計算し、依存順序付きの `PlannedTransfer` 列に変換する。
 //!
 //! chain転送 (e.g., local→pod→cloud) は plan 時に全hop分のTransfer が作成され、
@@ -19,11 +19,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::delta::FileDelta;
+use tracing::trace;
+
 use super::location::LocationId;
 use super::topology_delta::DistributeAction;
 use super::transfer::TransferKind;
-use super::view::PresenceState;
 
 /// 経路トポロジーの抽象。
 ///
@@ -41,6 +41,24 @@ pub trait Topology: Send + Sync {
         origin: &LocationId,
         required_dests: &HashSet<LocationId>,
     ) -> Vec<(LocationId, LocationId)>;
+
+    /// 複数ソースから `required_dests` 全てに到達する最小コスト経路の辺リスト。
+    ///
+    /// `sources` 内の全locationがデータを保持している前提で、Multi-source Dijkstraにより
+    /// 最も安いsource→dest経路を選択する。
+    /// デフォルト実装は最初のsourceにフォールバック。
+    fn optimal_tree_multi_source(
+        &self,
+        sources: &HashSet<LocationId>,
+        required_dests: &HashSet<LocationId>,
+    ) -> Vec<(LocationId, LocationId)> {
+        // Default: pick first source and use single-source optimal_tree
+        if let Some(origin) = sources.iter().next() {
+            self.optimal_tree(origin, required_dests)
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 /// 計画されたTransfer。まだDB未書き込み。
@@ -55,99 +73,6 @@ pub struct PlannedTransfer {
     /// このTransferが依存する先行Transferのインデックス（同一Vec内）。
     /// `None` = 依存なし（即Queued）、`Some(i)` = i番目のTransfer完了後にQueued化。
     pub depends_on_index: Option<usize>,
-}
-
-/// 単一の FileDelta から最適なTransfer列を計画する。
-///
-/// `optimal_tree` で最小コスト到達木を計算し、依存順序付きTransfer列を返す。
-///
-/// # 引数
-///
-/// - `delta` — 1ファイルの変化
-/// - `graph` — コスト付きルートトポロジー
-/// - `presence` — このファイルの各locationでの存在状態（DB由来）。
-///   キーが存在しない location は Absent として扱う。
-///   **Modified の場合は内部で presence を無視する**（dest の内容は古いため）。
-/// - `pending_dests` — 既に未完了Transfer が存在する dest の集合。
-///   重複Transfer の抑止に使用。
-pub fn plan_transfers_for(
-    delta: &FileDelta,
-    topology: &dyn Topology,
-    presence: &HashMap<LocationId, PresenceState>,
-    pending_dests: &HashSet<LocationId>,
-) -> Vec<PlannedTransfer> {
-    let origin = delta.origin();
-    let file_id = delta.file_id().to_string();
-
-    match delta {
-        FileDelta::Added(_) => {
-            plan_sync(&file_id, origin, topology, presence, pending_dests, false)
-        }
-        FileDelta::Modified(_) => {
-            plan_sync(&file_id, origin, topology, presence, pending_dests, true)
-        }
-        FileDelta::Removed(_) => plan_delete(&file_id, origin, topology, pending_dests),
-    }
-}
-
-/// origin から全到達可能destへのSync Transfer列を計画する。
-///
-/// - `stale_presence = false` (Added): presenceがPresentのdestはスキップ
-/// - `stale_presence = true` (Modified): presenceを無視して全destに送る
-pub fn plan_sync(
-    file_id: &str,
-    origin: &LocationId,
-    topology: &dyn Topology,
-    presence: &HashMap<LocationId, PresenceState>,
-    pending_dests: &HashSet<LocationId>,
-    stale_presence: bool,
-) -> Vec<PlannedTransfer> {
-    // 1. 必要な destination を特定
-    let all_reachable = topology.reachable_from(origin);
-    let required_dests: HashSet<LocationId> = all_reachable
-        .into_iter()
-        .filter(|dest| {
-            if pending_dests.contains(dest) {
-                return false;
-            }
-            if stale_presence {
-                return true;
-            }
-            let state = presence.get(dest).copied().unwrap_or(PresenceState::Absent);
-            state != PresenceState::Present
-        })
-        .collect();
-
-    if required_dests.is_empty() {
-        return Vec::new();
-    }
-
-    // 2. 最適到達木を計算
-    let tree_edges = topology.optimal_tree(origin, &required_dests);
-
-    // 3. 辺をPlannedTransferに変換（依存関係付き）
-    edges_to_planned_transfers(&tree_edges, file_id, TransferKind::Sync)
-}
-
-/// origin から全到達可能destへのDelete Transfer列を計画する。
-pub fn plan_delete(
-    file_id: &str,
-    origin: &LocationId,
-    topology: &dyn Topology,
-    pending_dests: &HashSet<LocationId>,
-) -> Vec<PlannedTransfer> {
-    let all_reachable = topology.reachable_from(origin);
-    let required_dests: HashSet<LocationId> = all_reachable
-        .into_iter()
-        .filter(|dest| !pending_dests.contains(dest))
-        .collect();
-
-    if required_dests.is_empty() {
-        return Vec::new();
-    }
-
-    let tree_edges = topology.optimal_tree(origin, &required_dests);
-    edges_to_planned_transfers(&tree_edges, file_id, TransferKind::Delete)
 }
 
 /// optimal_tree の辺リスト（依存順序済み）をPlannedTransfer列に変換。
@@ -177,27 +102,6 @@ pub fn edges_to_planned_transfers(
     result
 }
 
-/// 複数の FileDelta から全体の TransferPlan を生成。
-pub fn plan_all(
-    deltas: &[FileDelta],
-    topology: &dyn Topology,
-    presence_map: &HashMap<String, HashMap<LocationId, PresenceState>>,
-    pending_map: &HashMap<String, HashSet<LocationId>>,
-) -> Vec<PlannedTransfer> {
-    let empty_presence = HashMap::new();
-    let empty_pending = HashSet::new();
-
-    deltas
-        .iter()
-        .flat_map(|delta| {
-            let file_id = delta.file_id();
-            let presence = presence_map.get(file_id).unwrap_or(&empty_presence);
-            let pending = pending_map.get(file_id).unwrap_or(&empty_pending);
-            plan_transfers_for(delta, topology, presence, pending)
-        })
-        .collect()
-}
-
 // =============================================================================
 // Phase 3: DistributeAction → PlannedTransfer (Topology中心モデル)
 // =============================================================================
@@ -212,18 +116,29 @@ pub fn plan_all(
 /// - `actions` — distribute_actions()の出力
 /// - `topology` — ルーティングに使用するTopology(RouteGraph等)
 /// - `pending_dests` — `file_id → 既に未完了Transferが存在するdest集合`。重複抑止用。
+/// - `existing_presences` — `file_id → 既にデータを保持しているlocation集合`。
+///   Multi-source Dijkstraでsource以外の保持locationも考慮し、最安経路を選択する。
 ///
 /// # アルゴリズム
 ///
 /// 1. actions を (file_id, source, kind) でグループ化
 /// 2. 各グループ: targets - pending_dests = required_dests
-/// 3. optimal_tree(source, required_dests) → 依存順序付き辺リスト
+/// 3. optimal_tree_multi_source(sources, required_dests) → 依存順序付き辺リスト
+///    sources = {group.source} ∪ existing_presences[file_id]
 /// 4. edges_to_planned_transfers() で PlannedTransfer に変換
 pub fn plan_distribution(
     actions: &[DistributeAction],
     topology: &dyn Topology,
     pending_dests: &HashMap<String, HashSet<LocationId>>,
+    existing_presences: &HashMap<String, HashSet<LocationId>>,
 ) -> Vec<PlannedTransfer> {
+    trace!(
+        actions = actions.len(),
+        pending_dests = pending_dests.len(),
+        existing_presences = existing_presences.len(),
+        "plan_distribution: start"
+    );
+
     // 1. グループ化: (file_id, source, kind) → targets
     let mut groups: HashMap<DistributeGroup, HashSet<LocationId>> = HashMap::new();
 
@@ -235,27 +150,66 @@ pub fn plan_distribution(
             .insert(action.target().clone());
     }
 
+    trace!(groups = groups.len(), "plan_distribution: grouped");
+
     let empty_pending = HashSet::new();
+    let empty_presences = HashSet::new();
     let mut all_transfers = Vec::new();
 
     // 2. 各グループについて最適木を計算
     for (group, mut targets) in groups {
         // pending除外
         let pending = pending_dests.get(&group.file_id).unwrap_or(&empty_pending);
+        let pre_filter = targets.len();
         targets.retain(|t| !pending.contains(t));
 
         if targets.is_empty() {
+            trace!(
+                file_id = %group.file_id,
+                kind = ?group.kind,
+                pre_filter = pre_filter,
+                "plan_distribution: all targets pending, skip"
+            );
             continue;
         }
 
-        // 3. optimal_tree
-        let tree_edges = topology.optimal_tree(&group.source, &targets);
+        // 3. Multi-source optimal_tree
+        // sources = ingest origin + 既にデータを保持しているlocation
+        let existing = existing_presences
+            .get(&group.file_id)
+            .unwrap_or(&empty_presences);
+        let mut sources = existing.clone();
+        sources.insert(group.source.clone());
 
-        // 4. PlannedTransferに変換
+        trace!(
+            file_id = %group.file_id,
+            kind = ?group.kind,
+            sources = ?sources.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            targets = ?targets.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            "plan_distribution: computing optimal tree"
+        );
+
+        let tree_edges = topology.optimal_tree_multi_source(&sources, &targets);
+
+        trace!(
+            file_id = %group.file_id,
+            edges = tree_edges.len(),
+            "plan_distribution: tree computed"
+        );
+
+        // 4. PlannedTransferに変換（インデックスをグローバルオフセット）
+        let base_offset = all_transfers.len();
         let transfers = edges_to_planned_transfers(&tree_edges, &group.file_id, group.kind);
-        all_transfers.extend(transfers);
+        for mut pt in transfers {
+            pt.depends_on_index = pt.depends_on_index.map(|i| i + base_offset);
+            all_transfers.push(pt);
+        }
     }
 
+    trace!(
+        total_transfers = all_transfers.len(),
+        "plan_distribution: done"
+    );
     all_transfers
 }
 
@@ -329,9 +283,7 @@ pub fn plan_deletes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::delta::{AddedFile, ModifiedFile, RemovedFile};
     use crate::domain::file_type::FileType;
-    use crate::domain::fingerprint::FileFingerprint;
     use crate::domain::graph::{EdgeCost, RouteGraph};
 
     fn local() -> LocationId {
@@ -342,16 +294,6 @@ mod tests {
     }
     fn pod() -> LocationId {
         LocationId::new("pod").unwrap()
-    }
-
-    fn fp(hash: &str, size: u64) -> FileFingerprint {
-        FileFingerprint {
-            file_hash: Some(hash.to_string()),
-            content_hash: None,
-            meta_hash: None,
-            size,
-            modified_at: None,
-        }
     }
 
     /// local→cloud の単一辺グラフ
@@ -376,393 +318,6 @@ mod tests {
         g.add_with_cost(pod(), cloud(), EdgeCost::new(2.0, 10));
         g.add_with_cost(local(), cloud(), EdgeCost::new(10.0, 10)); // 高コスト直接辺
         g
-    }
-
-    fn no_presence() -> HashMap<LocationId, PresenceState> {
-        HashMap::new()
-    }
-
-    fn no_pending() -> HashSet<LocationId> {
-        HashSet::new()
-    }
-
-    // =========================================================================
-    // Added — simple graph
-    // =========================================================================
-
-    #[test]
-    fn added_creates_sync_to_direct_dests() {
-        let delta = FileDelta::Added(AddedFile {
-            id: "f1".into(),
-            relative_path: "a.png".into(),
-            file_type: FileType::Image,
-            fingerprint: fp("h1", 100),
-            origin: local(),
-            embedded_id: None,
-        });
-
-        let planned = plan_transfers_for(&delta, &simple_graph(), &no_presence(), &no_pending());
-
-        assert_eq!(planned.len(), 1);
-        assert_eq!(planned[0].src, local());
-        assert_eq!(planned[0].dest, cloud());
-        assert_eq!(planned[0].kind, TransferKind::Sync);
-        assert_eq!(planned[0].depends_on_index, None);
-    }
-
-    #[test]
-    fn added_skips_present_dest() {
-        let delta = FileDelta::Added(AddedFile {
-            id: "f1".into(),
-            relative_path: "a.png".into(),
-            file_type: FileType::Image,
-            fingerprint: fp("h1", 100),
-            origin: local(),
-            embedded_id: None,
-        });
-
-        let mut presence = HashMap::new();
-        presence.insert(cloud(), PresenceState::Present);
-
-        let planned = plan_transfers_for(&delta, &simple_graph(), &presence, &no_pending());
-        assert_eq!(planned.len(), 0, "Present dest should be skipped");
-    }
-
-    #[test]
-    fn added_does_not_skip_pending_presence() {
-        let delta = FileDelta::Added(AddedFile {
-            id: "f1".into(),
-            relative_path: "a.png".into(),
-            file_type: FileType::Image,
-            fingerprint: fp("h1", 100),
-            origin: local(),
-            embedded_id: None,
-        });
-
-        let mut presence = HashMap::new();
-        presence.insert(cloud(), PresenceState::Pending);
-
-        let planned = plan_transfers_for(&delta, &simple_graph(), &presence, &no_pending());
-        assert_eq!(planned.len(), 1, "Pending dest needs sync");
-    }
-
-    #[test]
-    fn added_skips_already_pending_transfer() {
-        let delta = FileDelta::Added(AddedFile {
-            id: "f1".into(),
-            relative_path: "a.png".into(),
-            file_type: FileType::Image,
-            fingerprint: fp("h1", 100),
-            origin: local(),
-            embedded_id: None,
-        });
-
-        let mut pending = HashSet::new();
-        pending.insert(cloud());
-
-        let planned = plan_transfers_for(&delta, &simple_graph(), &no_presence(), &pending);
-        assert_eq!(
-            planned.len(),
-            0,
-            "Already pending transfer should not duplicate"
-        );
-    }
-
-    // =========================================================================
-    // Added — chain graph (全hop計画)
-    // =========================================================================
-
-    #[test]
-    fn added_chain_plans_all_hops_with_dependencies() {
-        let delta = FileDelta::Added(AddedFile {
-            id: "f1".into(),
-            relative_path: "a.png".into(),
-            file_type: FileType::Image,
-            fingerprint: fp("h1", 100),
-            origin: local(),
-            embedded_id: None,
-        });
-
-        let planned = plan_transfers_for(&delta, &chain_graph(), &no_presence(), &no_pending());
-
-        // local→pod (Queued) + pod→cloud (depends on local→pod)
-        assert_eq!(planned.len(), 2);
-        assert_eq!(planned[0].src, local());
-        assert_eq!(planned[0].dest, pod());
-        assert_eq!(planned[0].depends_on_index, None);
-
-        assert_eq!(planned[1].src, pod());
-        assert_eq!(planned[1].dest, cloud());
-        assert_eq!(planned[1].depends_on_index, Some(0));
-    }
-
-    // =========================================================================
-    // Added — chain + direct (optimal tree picks chain)
-    // =========================================================================
-
-    #[test]
-    fn added_chain_with_direct_picks_chain() {
-        let delta = FileDelta::Added(AddedFile {
-            id: "f1".into(),
-            relative_path: "a.png".into(),
-            file_type: FileType::Image,
-            fingerprint: fp("h1", 100),
-            origin: local(),
-            embedded_id: None,
-        });
-
-        let planned = plan_transfers_for(
-            &delta,
-            &chain_with_direct_graph(),
-            &no_presence(),
-            &no_pending(),
-        );
-
-        // Should pick local→pod→cloud (cost 3.0), NOT local→pod + local→cloud (cost 11.0)
-        assert_eq!(planned.len(), 2);
-        assert_eq!(planned[0].src, local());
-        assert_eq!(planned[0].dest, pod());
-        assert_eq!(planned[1].src, pod());
-        assert_eq!(planned[1].dest, cloud());
-    }
-
-    #[test]
-    fn added_chain_with_direct_cloud_present_only_pod() {
-        // cloud is already Present → only need to reach pod
-        let delta = FileDelta::Added(AddedFile {
-            id: "f1".into(),
-            relative_path: "a.png".into(),
-            file_type: FileType::Image,
-            fingerprint: fp("h1", 100),
-            origin: local(),
-            embedded_id: None,
-        });
-
-        let mut presence = HashMap::new();
-        presence.insert(cloud(), PresenceState::Present);
-
-        let planned =
-            plan_transfers_for(&delta, &chain_with_direct_graph(), &presence, &no_pending());
-
-        // Only pod needs sync, cloud is present
-        assert_eq!(planned.len(), 1);
-        assert_eq!(planned[0].src, local());
-        assert_eq!(planned[0].dest, pod());
-        assert_eq!(planned[0].depends_on_index, None);
-    }
-
-    // =========================================================================
-    // Modified
-    // =========================================================================
-
-    #[test]
-    fn modified_creates_sync() {
-        let delta = FileDelta::Modified(ModifiedFile {
-            file_id: "f1".into(),
-            relative_path: "a.png".into(),
-            file_type: FileType::Image,
-            old_fingerprint: fp("old", 100),
-            new_fingerprint: fp("new", 200),
-            origin: local(),
-            embedded_id: None,
-        });
-
-        let planned = plan_transfers_for(&delta, &simple_graph(), &no_presence(), &no_pending());
-        assert_eq!(planned.len(), 1);
-        assert_eq!(planned[0].kind, TransferKind::Sync);
-    }
-
-    #[test]
-    fn modified_ignores_present_dest() {
-        let delta = FileDelta::Modified(ModifiedFile {
-            file_id: "f1".into(),
-            relative_path: "a.png".into(),
-            file_type: FileType::Image,
-            old_fingerprint: fp("old", 100),
-            new_fingerprint: fp("new", 200),
-            origin: local(),
-            embedded_id: None,
-        });
-
-        let mut presence = HashMap::new();
-        presence.insert(cloud(), PresenceState::Present);
-
-        let planned = plan_transfers_for(&delta, &simple_graph(), &presence, &no_pending());
-        assert_eq!(
-            planned.len(),
-            1,
-            "Modified must sync even if dest is Present (content is stale)"
-        );
-    }
-
-    #[test]
-    fn modified_still_skips_pending_transfer() {
-        let delta = FileDelta::Modified(ModifiedFile {
-            file_id: "f1".into(),
-            relative_path: "a.png".into(),
-            file_type: FileType::Image,
-            old_fingerprint: fp("old", 100),
-            new_fingerprint: fp("new", 200),
-            origin: local(),
-            embedded_id: None,
-        });
-
-        let mut pending = HashSet::new();
-        pending.insert(cloud());
-
-        let planned = plan_transfers_for(&delta, &simple_graph(), &no_presence(), &pending);
-        assert_eq!(
-            planned.len(),
-            0,
-            "Modified must still respect pending_dests"
-        );
-    }
-
-    #[test]
-    fn modified_chain_plans_all_hops() {
-        let delta = FileDelta::Modified(ModifiedFile {
-            file_id: "f1".into(),
-            relative_path: "a.png".into(),
-            file_type: FileType::Image,
-            old_fingerprint: fp("old", 100),
-            new_fingerprint: fp("new", 200),
-            origin: local(),
-            embedded_id: None,
-        });
-
-        let planned = plan_transfers_for(&delta, &chain_graph(), &no_presence(), &no_pending());
-        assert_eq!(planned.len(), 2);
-        assert_eq!(planned[0].depends_on_index, None);
-        assert_eq!(planned[1].depends_on_index, Some(0));
-    }
-
-    // =========================================================================
-    // Removed
-    // =========================================================================
-
-    #[test]
-    fn removed_creates_delete_transfers() {
-        let delta = FileDelta::Removed(RemovedFile {
-            file_id: "f1".into(),
-            relative_path: "a.png".into(),
-            origin: local(),
-        });
-
-        let planned = plan_transfers_for(&delta, &simple_graph(), &no_presence(), &no_pending());
-        assert_eq!(planned.len(), 1);
-        assert_eq!(planned[0].kind, TransferKind::Delete);
-        assert_eq!(planned[0].src, local());
-        assert_eq!(planned[0].dest, cloud());
-    }
-
-    #[test]
-    fn removed_skips_pending_dest() {
-        let delta = FileDelta::Removed(RemovedFile {
-            file_id: "f1".into(),
-            relative_path: "a.png".into(),
-            origin: local(),
-        });
-
-        let mut pending = HashSet::new();
-        pending.insert(cloud());
-
-        let planned = plan_transfers_for(&delta, &simple_graph(), &no_presence(), &pending);
-        assert_eq!(planned.len(), 0);
-    }
-
-    #[test]
-    fn removed_chain_plans_all_hops() {
-        let delta = FileDelta::Removed(RemovedFile {
-            file_id: "f1".into(),
-            relative_path: "a.png".into(),
-            origin: local(),
-        });
-
-        let planned = plan_transfers_for(&delta, &chain_graph(), &no_presence(), &no_pending());
-        assert_eq!(planned.len(), 2);
-        assert_eq!(planned[0].kind, TransferKind::Delete);
-        assert_eq!(planned[1].kind, TransferKind::Delete);
-        assert_eq!(planned[1].depends_on_index, Some(0));
-    }
-
-    // =========================================================================
-    // plan_all
-    // =========================================================================
-
-    #[test]
-    fn plan_all_multiple_deltas() {
-        let deltas = vec![
-            FileDelta::Added(AddedFile {
-                id: "f1".into(),
-                relative_path: "a.png".into(),
-                file_type: FileType::Image,
-                fingerprint: fp("h1", 100),
-                origin: local(),
-                embedded_id: None,
-            }),
-            FileDelta::Removed(RemovedFile {
-                file_id: "f2".into(),
-                relative_path: "b.png".into(),
-                origin: local(),
-            }),
-        ];
-
-        let planned = plan_all(&deltas, &simple_graph(), &HashMap::new(), &HashMap::new());
-        assert_eq!(planned.len(), 2);
-        assert_eq!(planned[0].kind, TransferKind::Sync);
-        assert_eq!(planned[1].kind, TransferKind::Delete);
-    }
-
-    #[test]
-    fn plan_all_modified_ignores_presence() {
-        let deltas = vec![FileDelta::Modified(ModifiedFile {
-            file_id: "f1".into(),
-            relative_path: "a.png".into(),
-            file_type: FileType::Image,
-            old_fingerprint: fp("old", 100),
-            new_fingerprint: fp("new", 200),
-            origin: local(),
-            embedded_id: None,
-        })];
-
-        let mut presence_map = HashMap::new();
-        let mut f1_presence = HashMap::new();
-        f1_presence.insert(cloud(), PresenceState::Present);
-        presence_map.insert("f1".to_string(), f1_presence);
-
-        let planned = plan_all(&deltas, &simple_graph(), &presence_map, &HashMap::new());
-        assert_eq!(planned.len(), 1, "Modified must sync even via plan_all");
-    }
-
-    #[test]
-    fn plan_all_respects_per_file_presence() {
-        let deltas = vec![
-            FileDelta::Added(AddedFile {
-                id: "f1".into(),
-                relative_path: "a.png".into(),
-                file_type: FileType::Image,
-                fingerprint: fp("h1", 100),
-                origin: local(),
-                embedded_id: None,
-            }),
-            FileDelta::Added(AddedFile {
-                id: "f2".into(),
-                relative_path: "b.png".into(),
-                file_type: FileType::Image,
-                fingerprint: fp("h2", 200),
-                origin: local(),
-                embedded_id: None,
-            }),
-        ];
-
-        let mut presence_map = HashMap::new();
-        let mut f1_presence = HashMap::new();
-        f1_presence.insert(cloud(), PresenceState::Present);
-        presence_map.insert("f1".to_string(), f1_presence);
-
-        let planned = plan_all(&deltas, &simple_graph(), &presence_map, &HashMap::new());
-        assert_eq!(planned.len(), 1);
-        assert_eq!(planned[0].file_id, "f2");
     }
 
     // =========================================================================
@@ -802,7 +357,8 @@ mod tests {
     fn plan_distribution_single_send() {
         let actions = vec![send_action("f1", local(), cloud())];
 
-        let planned = plan_distribution(&actions, &simple_graph(), &HashMap::new());
+        let planned =
+            plan_distribution(&actions, &simple_graph(), &HashMap::new(), &HashMap::new());
 
         assert_eq!(planned.len(), 1);
         assert_eq!(planned[0].file_id, "f1");
@@ -820,7 +376,7 @@ mod tests {
             send_action("f1", local(), cloud()),
         ];
 
-        let planned = plan_distribution(&actions, &chain_graph(), &HashMap::new());
+        let planned = plan_distribution(&actions, &chain_graph(), &HashMap::new(), &HashMap::new());
 
         // chain_graph: local→pod→cloud
         // optimal_tree(local, {pod, cloud}) → local→pod, pod→cloud
@@ -843,7 +399,7 @@ mod tests {
         let mut pending = HashMap::new();
         pending.insert("f1".to_string(), HashSet::from([cloud()]));
 
-        let planned = plan_distribution(&actions, &chain_graph(), &pending);
+        let planned = plan_distribution(&actions, &chain_graph(), &pending, &HashMap::new());
 
         // cloudはpending → skip。podのみ
         assert_eq!(planned.len(), 1);
@@ -854,7 +410,8 @@ mod tests {
     fn plan_distribution_update_uses_sync_kind() {
         let actions = vec![update_action("f1", local(), cloud())];
 
-        let planned = plan_distribution(&actions, &simple_graph(), &HashMap::new());
+        let planned =
+            plan_distribution(&actions, &simple_graph(), &HashMap::new(), &HashMap::new());
 
         assert_eq!(planned.len(), 1);
         assert_eq!(planned[0].kind, TransferKind::Sync);
@@ -867,7 +424,8 @@ mod tests {
             send_action("f2", local(), cloud()),
         ];
 
-        let planned = plan_distribution(&actions, &simple_graph(), &HashMap::new());
+        let planned =
+            plan_distribution(&actions, &simple_graph(), &HashMap::new(), &HashMap::new());
 
         assert_eq!(planned.len(), 2);
         let file_ids: HashSet<_> = planned.iter().map(|p| p.file_id.as_str()).collect();
@@ -883,9 +441,66 @@ mod tests {
             send_action("f1", local(), cloud()),
         ];
 
-        let planned = plan_distribution(&actions, &chain_with_direct_graph(), &HashMap::new());
+        let planned = plan_distribution(
+            &actions,
+            &chain_with_direct_graph(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         // optimal: local→pod→cloud (cost 3.0) < local→pod + local→cloud (cost 11.0)
+        assert_eq!(planned.len(), 2);
+        assert_eq!(planned[0].src, local());
+        assert_eq!(planned[0].dest, pod());
+        assert_eq!(planned[1].src, pod());
+        assert_eq!(planned[1].dest, cloud());
+    }
+
+    // =========================================================================
+    // plan_distribution — multi-source (existing_presences)
+    // =========================================================================
+
+    #[test]
+    fn plan_distribution_multi_source_picks_cheaper_relay() {
+        // Scenario: file "f1" exists on local (source) AND pod (existing presence).
+        // Need to reach cloud. pod→cloud(2.0) is cheaper than local→cloud(5.0).
+        //
+        // Graph: local→pod(1.0), pod→cloud(2.0), local→cloud(5.0), cloud→local(5.0), cloud→pod(2.0)
+        let mut g = RouteGraph::new();
+        g.add_with_cost(local(), pod(), EdgeCost::new(1.0, 10));
+        g.add_with_cost(pod(), cloud(), EdgeCost::new(2.0, 10));
+        g.add_with_cost(local(), cloud(), EdgeCost::new(5.0, 10));
+        g.add_with_cost(cloud(), local(), EdgeCost::new(5.0, 10));
+        g.add_with_cost(cloud(), pod(), EdgeCost::new(2.0, 10));
+
+        let actions = vec![send_action("f1", local(), cloud())];
+
+        // pod already has f1
+        let mut existing = HashMap::new();
+        existing.insert("f1".to_string(), HashSet::from([local(), pod()]));
+
+        let planned = plan_distribution(&actions, &g, &HashMap::new(), &existing);
+
+        assert_eq!(planned.len(), 1);
+        // Should pick pod→cloud (2.0) instead of local→cloud (5.0)
+        assert_eq!(planned[0].src, pod());
+        assert_eq!(planned[0].dest, cloud());
+    }
+
+    #[test]
+    fn plan_distribution_no_existing_presences_uses_source() {
+        // Without existing_presences, falls back to source-only routing.
+        let mut g = RouteGraph::new();
+        g.add_with_cost(local(), pod(), EdgeCost::new(1.0, 10));
+        g.add_with_cost(pod(), cloud(), EdgeCost::new(2.0, 10));
+        g.add_with_cost(local(), cloud(), EdgeCost::new(5.0, 10));
+
+        let actions = vec![send_action("f1", local(), cloud())];
+
+        let planned = plan_distribution(&actions, &g, &HashMap::new(), &HashMap::new());
+
+        // target is {cloud}. Dijkstra from local:
+        // local→pod(1.0)→cloud(3.0) < local→cloud(5.0) → chain path via pod
         assert_eq!(planned.len(), 2);
         assert_eq!(planned[0].src, local());
         assert_eq!(planned[0].dest, pod());
@@ -935,5 +550,57 @@ mod tests {
 
         assert_eq!(planned.len(), 1);
         assert_eq!(planned[0].file_id, "f2");
+    }
+
+    // =========================================================================
+    // plan_distribution — depends_on_index offset across multiple files
+    // =========================================================================
+
+    #[test]
+    fn plan_distribution_multi_file_chain_depends_on_index_offset() {
+        // 2ファイル × chain_graph(local→pod→cloud)
+        // f1: local→pod(idx=0), pod→cloud(dep=0)
+        // f2: local→pod(idx=2), pod→cloud(dep=2)
+        // depends_on_indexがファイル間でずれないことを検証
+        let actions = vec![
+            send_action("f1", local(), pod()),
+            send_action("f1", local(), cloud()),
+            send_action("f2", local(), pod()),
+            send_action("f2", local(), cloud()),
+        ];
+
+        let planned = plan_distribution(&actions, &chain_graph(), &HashMap::new(), &HashMap::new());
+
+        assert_eq!(planned.len(), 4);
+
+        // f1とf2のTransferを分離
+        let f1: Vec<_> = planned.iter().filter(|p| p.file_id == "f1").collect();
+        let f2: Vec<_> = planned.iter().filter(|p| p.file_id == "f2").collect();
+        assert_eq!(f1.len(), 2);
+        assert_eq!(f2.len(), 2);
+
+        // 各ファイルのchain: hop1(dep=None), hop2(dep=hop1のグローバルindex)
+        let f1_hop1_idx = planned
+            .iter()
+            .position(|p| p.file_id == "f1" && p.dest == pod())
+            .unwrap();
+        let f1_hop2 = planned
+            .iter()
+            .find(|p| p.file_id == "f1" && p.dest == cloud())
+            .unwrap();
+        assert_eq!(f1_hop2.depends_on_index, Some(f1_hop1_idx));
+
+        let f2_hop1_idx = planned
+            .iter()
+            .position(|p| p.file_id == "f2" && p.dest == pod())
+            .unwrap();
+        let f2_hop2 = planned
+            .iter()
+            .find(|p| p.file_id == "f2" && p.dest == cloud())
+            .unwrap();
+        assert_eq!(f2_hop2.depends_on_index, Some(f2_hop1_idx));
+
+        // f2のdepends_onがf1のTransferを指していないことを確認
+        assert_ne!(f2_hop2.depends_on_index, Some(f1_hop1_idx));
     }
 }
