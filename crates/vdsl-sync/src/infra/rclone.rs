@@ -8,14 +8,14 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex as StdMutex;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use secrecy::{ExposeSecret, SecretBox};
 
-use super::backend::{RemoteFile, StorageBackend};
+use super::backend::{ProgressFn, RemoteFile, StorageBackend};
 use super::shell::{LocalShell, RemoteShell};
-use crate::application::error::SyncError;
 use crate::infra::error::InfraError;
 
 /// Default rclone command timeout (seconds).
@@ -39,6 +39,31 @@ const MIN_RCLONE_TIMEOUT_SECS: u64 = 10;
 /// Prevents large batches from hitting the timeout while small batches
 /// still fail fast on network issues.
 const BATCH_PER_FILE_TIMEOUT_SECS: u64 = 30;
+
+/// Extra rclone flags for SFTP remotes to reduce protocol overhead.
+///
+/// SFTP performs per-file round-trips for modtime setting and hash verification
+/// after each transfer. On high-latency / low-bandwidth links (home ISP upload),
+/// this overhead dominates — observed 100 KB/s vs 1 MB/s on the same link via
+/// other protocols. These flags eliminate the extra round-trips:
+///
+/// - `--sftp-set-modtime=false`: skip post-transfer SFTP setstat for mtime
+///   (vdsl-sync uses sha256 for identity, not mtime)
+/// - `--sftp-disable-hashcheck`: skip post-transfer sha256sum via SFTP exec
+///   (vdsl-sync runs its own batch_inspect for verification)
+const SFTP_OPTIMIZATION_FLAGS: &[&str] = &["--sftp-set-modtime=false", "--sftp-disable-hashcheck"];
+
+/// Chunk size for SFTP batch transfers.
+///
+/// Large SFTP batches (thousands of files) cause rclone to stall due to
+/// SFTP session management overhead. Chunking into smaller batches with
+/// per-chunk progress logging and retry prevents hangs and provides visibility.
+///
+/// Non-SFTP backends (B2, S3) handle large batches natively — no chunking.
+const SFTP_BATCH_CHUNK_SIZE: usize = 100;
+
+/// Maximum retries per chunk on failure.
+const BATCH_CHUNK_MAX_RETRIES: u32 = 1;
 
 /// Resolve rclone timeout from: explicit > env > default.
 ///
@@ -81,6 +106,8 @@ pub struct RcloneBackend {
     shell: Box<dyn RemoteShell>,
     /// Per-command timeout in seconds.
     timeout_secs: u64,
+    /// Progress callback for reporting chunk completion during batch transfers.
+    progress: StdMutex<Option<ProgressFn>>,
 }
 
 impl RcloneBackend {
@@ -91,7 +118,7 @@ impl RcloneBackend {
     ///
     /// # Example
     /// ```no_run
-    /// # use vdsl_sync::infra::rclone::RcloneBackend;
+    /// # use vdsl_sync::RcloneBackend;
     /// let backend = RcloneBackend::new(":b2,account=key_id,key=secret:my-bucket");
     /// ```
     pub fn new(remote: impl Into<String>) -> Self {
@@ -99,6 +126,7 @@ impl RcloneBackend {
             remote: SecretBox::new(Box::new(remote.into())),
             shell: Box::new(LocalShell),
             timeout_secs: resolve_timeout(None),
+            progress: StdMutex::new(None),
         }
     }
 
@@ -108,6 +136,7 @@ impl RcloneBackend {
             remote: SecretBox::new(Box::new(remote.into())),
             shell,
             timeout_secs: resolve_timeout(None),
+            progress: StdMutex::new(None),
         }
     }
 
@@ -124,21 +153,19 @@ impl RcloneBackend {
     ///
     /// Validates against CLI flag injection (`-` prefix) and
     /// path traversal (`..` segments).
-    fn remote_path(&self, path: &str) -> Result<String, SyncError> {
+    fn remote_path(&self, path: &str) -> Result<String, InfraError> {
         let path = path.trim_matches('/');
         // Reject paths that look like CLI flags (argument injection)
         if path.starts_with('-') {
             return Err(InfraError::Transfer {
                 reason: format!("invalid remote path (starts with '-'): {path}"),
-            }
-            .into());
+            });
         }
         // Reject path traversal attempts
         if path.split('/').any(|seg| seg == "..") {
             return Err(InfraError::Transfer {
                 reason: format!("invalid remote path (contains '..' traversal): {path}"),
-            }
-            .into());
+            });
         }
         let remote = self.remote.expose_secret();
         if path.is_empty() {
@@ -148,22 +175,36 @@ impl RcloneBackend {
         }
     }
 
+    /// Whether this backend targets an SFTP remote.
+    ///
+    /// Used to inject SFTP-specific optimization flags that eliminate
+    /// per-file round-trips (modtime set, hash check).
+    fn is_sftp(&self) -> bool {
+        self.remote.expose_secret().starts_with(":sftp")
+    }
+
     /// Execute an rclone command via the configured shell.
     ///
     /// Uses the configured timeout (`with_timeout` > `VDSL_RCLONE_TIMEOUT` > 300s).
     /// Callers needing a different timeout (e.g. batch) should use `exec_rclone_with_timeout`.
-    async fn exec_rclone(&self, args: &[&str]) -> Result<String, SyncError> {
+    async fn exec_rclone(&self, args: &[&str]) -> Result<String, InfraError> {
         self.exec_rclone_with_timeout(args, self.timeout_secs).await
     }
 
     /// Execute an rclone command with an explicit timeout.
+    ///
+    /// Automatically appends SFTP optimization flags when the remote
+    /// is an SFTP target (see [`SFTP_OPTIMIZATION_FLAGS`]).
     async fn exec_rclone_with_timeout(
         &self,
         args: &[&str],
         timeout_secs: u64,
-    ) -> Result<String, SyncError> {
+    ) -> Result<String, InfraError> {
         let mut full_args = vec!["rclone"];
         full_args.extend_from_slice(args);
+        if self.is_sftp() {
+            full_args.extend_from_slice(SFTP_OPTIMIZATION_FLAGS);
+        }
 
         let output = self.shell.exec(&full_args, Some(timeout_secs)).await?;
 
@@ -176,8 +217,7 @@ impl RcloneBackend {
                         .map_or("signal".to_string(), |c| c.to_string()),
                     output.stderr.trim()
                 ),
-            }
-            .into());
+            });
         }
 
         Ok(output.stdout)
@@ -186,22 +226,21 @@ impl RcloneBackend {
 
 #[async_trait]
 impl StorageBackend for RcloneBackend {
-    async fn push(&self, local_path: &Path, remote_path: &str) -> Result<(), SyncError> {
+    async fn push(&self, local_path: &Path, remote_path: &str) -> Result<(), InfraError> {
         let dest = self.remote_path(remote_path)?;
-        let local_str = local_path.to_str().ok_or_else(|| -> SyncError {
+        let local_str = local_path.to_str().ok_or_else(|| -> InfraError {
             InfraError::Transfer {
                 reason: format!(
                     "local path is not valid UTF-8: {}",
                     local_path.to_string_lossy()
                 ),
             }
-            .into()
         })?;
         self.exec_rclone(&["copyto", local_str, &dest]).await?;
         Ok(())
     }
 
-    async fn pull(&self, remote_path: &str, local_path: &Path) -> Result<(), SyncError> {
+    async fn pull(&self, remote_path: &str, local_path: &Path) -> Result<(), InfraError> {
         let src = self.remote_path(remote_path)?;
         // Ensure parent directory exists via shell (works for both local and remote hosts)
         if let Some(parent) = local_path.parent() {
@@ -214,20 +253,19 @@ impl StorageBackend for RcloneBackend {
                 }
             }
         }
-        let local_str = local_path.to_str().ok_or_else(|| -> SyncError {
+        let local_str = local_path.to_str().ok_or_else(|| -> InfraError {
             InfraError::Transfer {
                 reason: format!(
                     "local path is not valid UTF-8: {}",
                     local_path.to_string_lossy()
                 ),
             }
-            .into()
         })?;
         self.exec_rclone(&["copyto", &src, local_str]).await?;
         Ok(())
     }
 
-    async fn list(&self, remote_path: &str) -> Result<Vec<RemoteFile>, SyncError> {
+    async fn list(&self, remote_path: &str) -> Result<Vec<RemoteFile>, InfraError> {
         let target = self.remote_path(remote_path)?;
         // Format: "path;size;modtime" — modtime is ISO 8601 (e.g. "2024-01-15T10:30:00.000000000")
         // --files-only excludes directory markers (B2/S3 "folders" are 0-byte objects
@@ -268,7 +306,7 @@ impl StorageBackend for RcloneBackend {
     /// Note: returns `Ok(false)` on any rclone error (including network failures).
     /// This is a best-effort check — callers must not rely on `false` meaning
     /// "confirmed absent". Use `push`/`pull` for authoritative operations.
-    async fn exists(&self, remote_path: &str) -> Result<bool, SyncError> {
+    async fn exists(&self, remote_path: &str) -> Result<bool, InfraError> {
         let target = self.remote_path(remote_path)?;
         let result = self.exec_rclone(&["lsf", &target]).await;
         match result {
@@ -284,7 +322,7 @@ impl StorageBackend for RcloneBackend {
         }
     }
 
-    async fn delete(&self, remote_path: &str) -> Result<(), SyncError> {
+    async fn delete(&self, remote_path: &str) -> Result<(), InfraError> {
         let target = self.remote_path(remote_path)?;
         // rclone deletefile removes a single file (not directory).
         // --retries 1 to fail fast on permanent errors.
@@ -316,140 +354,73 @@ impl StorageBackend for RcloneBackend {
 
     /// Batch push using `rclone copy --files-from`.
     ///
-    /// Single rclone process for N files: one auth handshake, internal
-    /// parallelism via `--transfers`. Significantly faster than N individual
-    /// `rclone copyto` calls, especially on high-latency links (home ISP upload).
+    /// For SFTP remotes, splits into chunks of [`SFTP_BATCH_CHUNK_SIZE`] files
+    /// with per-chunk progress logging and retry. Non-SFTP backends run as
+    /// a single batch (rclone handles large batches natively for B2/S3).
     ///
-    /// Returns per-file Ok/Err. On rclone success (exit 0), all files are Ok.
-    /// On failure, checks which files actually arrived at dest to determine
-    /// per-file status.
+    /// Returns per-file Ok/Err.
     async fn push_batch(
         &self,
         src_root: &Path,
         dest_root: &str,
         relative_paths: &[String],
-    ) -> HashMap<String, Result<(), SyncError>> {
+    ) -> HashMap<String, Result<(), InfraError>> {
         if relative_paths.is_empty() {
             return HashMap::new();
         }
 
-        // Validate dest_root (same rules as remote_path)
-        if self.remote_path(dest_root).is_err() {
-            let reason = format!("invalid dest_root for batch push: {dest_root}");
-            return relative_paths
-                .iter()
-                .map(|p| {
-                    (
-                        p.clone(),
-                        Err(SyncError::from(InfraError::Transfer {
-                            reason: reason.clone(),
-                        })),
-                    )
-                })
-                .collect();
-        }
+        let dest_full = match self.remote_path(dest_root) {
+            Ok(d) => d,
+            Err(_) => {
+                let reason = format!("invalid dest_root for batch push: {dest_root}");
+                return Self::all_batch_err(relative_paths, &reason);
+            }
+        };
 
         let src_root_str = match src_root.to_str() {
-            Some(s) => s,
+            Some(s) => s.to_string(),
             None => {
                 let reason = format!(
                     "src_root is not valid UTF-8: {}",
                     src_root.to_string_lossy()
                 );
-                return relative_paths
-                    .iter()
-                    .map(|p| {
-                        (
-                            p.clone(),
-                            Err(SyncError::from(InfraError::Transfer {
-                                reason: reason.clone(),
-                            })),
-                        )
-                    })
-                    .collect();
+                return Self::all_batch_err(relative_paths, &reason);
             }
         };
 
-        let dest_full = self.remote_path(dest_root).expect("validated above");
-
-        // Scaled timeout: base + per-file allowance
-        let batch_timeout =
-            self.timeout_secs + (relative_paths.len() as u64 * BATCH_PER_FILE_TIMEOUT_SECS);
-
-        // Build shell script that creates --files-from on the execution host,
-        // runs rclone, then cleans up. Works on both local and remote shells.
-        let file_list = relative_paths.join("\n");
-        let list_filename = format!("vdsl-batch-{}.txt", uuid::Uuid::new_v4().as_simple());
-        let script = format!(
-            "cat <<'__VDSL_EOF__' > /tmp/{list_filename}\n\
-             {file_list}\n\
-             __VDSL_EOF__\n\
-             rclone copy {src_root_str} {dest_full} \
-               --files-from /tmp/{list_filename} --transfers 8; \
-             _rc=$?; rm -f /tmp/{list_filename}; exit $_rc"
-        );
-
-        let result = self.shell.exec_script(&script, Some(batch_timeout)).await;
-
-        match result {
-            Ok(output) if output.success => {
-                relative_paths.iter().map(|p| (p.clone(), Ok(()))).collect()
-            }
-            Ok(output) => {
-                let err_msg = format!(
-                    "rclone failed (exit {}): {}",
-                    output
-                        .exit_code
-                        .map_or("signal".to_string(), |c| c.to_string()),
-                    output.stderr.trim()
-                );
-                relative_paths
-                    .iter()
-                    .map(|p| {
-                        (
-                            p.clone(),
-                            Err(SyncError::from(InfraError::Transfer {
-                                reason: format!("batch push failed: {err_msg}"),
-                            })),
-                        )
-                    })
-                    .collect()
-            }
-            Err(e) => {
-                // Partial failure. Report all as failed with the batch error.
-                // A more sophisticated impl could check dest existence per file,
-                // but that adds N API calls — defeating the batch purpose.
-                let err_msg = e.to_string();
-                relative_paths
-                    .iter()
-                    .map(|p| {
-                        (
-                            p.clone(),
-                            Err(SyncError::from(InfraError::Transfer {
-                                reason: format!("batch push failed: {err_msg}"),
-                            })),
-                        )
-                    })
-                    .collect()
-            }
-        }
+        self.exec_batch_chunked(
+            relative_paths,
+            "push",
+            |chunk, list_filename, sftp_flags, _chunk_timeout| {
+                let file_list = chunk.join("\n");
+                let src = &src_root_str;
+                let dest = &dest_full;
+                format!(
+                    "cat <<'__VDSL_EOF__' > /tmp/{list_filename}\n\
+                     {file_list}\n\
+                     __VDSL_EOF__\n\
+                     rclone copy {src} {dest} \
+                       --files-from /tmp/{list_filename} --transfers 8{sftp_flags}; \
+                     _rc=$?; rm -f /tmp/{list_filename}; exit $_rc"
+                )
+            },
+        )
+        .await
     }
 
     /// Batch pull using `rclone copy --files-from`.
     ///
-    /// Mirror of `push_batch` but reversed: pulls from remote to local (or Pod filesystem).
-    /// Single rclone process with `--transfers 8` for internal parallelism.
+    /// For SFTP remotes, splits into chunks with progress logging and retry.
     async fn pull_batch(
         &self,
         src_root: &str,
         dest_root: &Path,
         relative_paths: &[String],
-    ) -> HashMap<String, Result<(), SyncError>> {
+    ) -> HashMap<String, Result<(), InfraError>> {
         if relative_paths.is_empty() {
             return HashMap::new();
         }
 
-        // Validate src_root (remote path)
         let src_full = match self.remote_path(src_root) {
             Ok(s) => s,
             Err(_) => {
@@ -459,7 +430,7 @@ impl StorageBackend for RcloneBackend {
         };
 
         let dest_root_str = match dest_root.to_str() {
-            Some(s) => s,
+            Some(s) => s.to_string(),
             None => {
                 let reason = format!(
                     "dest_root is not valid UTF-8: {}",
@@ -469,58 +440,38 @@ impl StorageBackend for RcloneBackend {
             }
         };
 
-        // Scaled timeout: base + per-file allowance
-        let batch_timeout =
-            self.timeout_secs + (relative_paths.len() as u64 * BATCH_PER_FILE_TIMEOUT_SECS);
-
-        // Build shell script that creates --files-from on the execution host,
-        // runs rclone, then cleans up. Works on both local and remote shells.
-        let file_list = relative_paths.join("\n");
-        let list_filename = format!("vdsl-pull-batch-{}.txt", uuid::Uuid::new_v4().as_simple());
-        let script = format!(
-            "cat <<'__VDSL_EOF__' > /tmp/{list_filename}\n\
-             {file_list}\n\
-             __VDSL_EOF__\n\
-             rclone copy {src_full} {dest_root_str} \
-               --files-from /tmp/{list_filename} --transfers 8; \
-             _rc=$?; rm -f /tmp/{list_filename}; exit $_rc"
-        );
-
-        let result = self.shell.exec_script(&script, Some(batch_timeout)).await;
-
-        match result {
-            Ok(output) if output.success => {
-                relative_paths.iter().map(|p| (p.clone(), Ok(()))).collect()
-            }
-            Ok(output) => {
-                let err_msg = format!(
-                    "rclone failed (exit {}): {}",
-                    output
-                        .exit_code
-                        .map_or("signal".to_string(), |c| c.to_string()),
-                    output.stderr.trim()
-                );
-                Self::all_batch_err(relative_paths, &format!("batch pull failed: {err_msg}"))
-            }
-            Err(e) => Self::all_batch_err(relative_paths, &format!("batch pull failed: {e}")),
-        }
+        self.exec_batch_chunked(
+            relative_paths,
+            "pull",
+            |chunk, list_filename, sftp_flags, _chunk_timeout| {
+                let file_list = chunk.join("\n");
+                let src = &src_full;
+                let dest = &dest_root_str;
+                format!(
+                    "cat <<'__VDSL_EOF__' > /tmp/{list_filename}\n\
+                     {file_list}\n\
+                     __VDSL_EOF__\n\
+                     rclone copy {src} {dest} \
+                       --files-from /tmp/{list_filename} --transfers 8{sftp_flags}; \
+                     _rc=$?; rm -f /tmp/{list_filename}; exit $_rc"
+                )
+            },
+        )
+        .await
     }
 
     /// Batch delete using `rclone delete --files-from`.
     ///
-    /// Single rclone process for N deletes: one auth handshake, internal
-    /// parallelism via `--transfers`. Significantly faster than N individual
-    /// `rclone deletefile` calls.
+    /// For SFTP remotes, splits into chunks with progress logging and retry.
     async fn delete_batch(
         &self,
         remote_root: &str,
         relative_paths: &[String],
-    ) -> HashMap<String, Result<(), SyncError>> {
+    ) -> HashMap<String, Result<(), InfraError>> {
         if relative_paths.is_empty() {
             return HashMap::new();
         }
 
-        // Validate remote_root
         let remote_full = match self.remote_path(remote_root) {
             Ok(r) => r,
             Err(_) => {
@@ -531,38 +482,23 @@ impl StorageBackend for RcloneBackend {
             }
         };
 
-        // Delete is fast (no data transfer), use shorter per-file timeout
-        let batch_timeout = self.timeout_secs + (relative_paths.len() as u64 * 2);
-
-        let file_list = relative_paths.join("\n");
-        let list_filename = format!("vdsl-del-batch-{}.txt", uuid::Uuid::new_v4().as_simple());
-        let script = format!(
-            "cat <<'__VDSL_EOF__' > /tmp/{list_filename}\n\
-             {file_list}\n\
-             __VDSL_EOF__\n\
-             rclone delete {remote_full} \
-               --files-from /tmp/{list_filename} --transfers 8; \
-             _rc=$?; rm -f /tmp/{list_filename}; exit $_rc"
-        );
-
-        let result = self.shell.exec_script(&script, Some(batch_timeout)).await;
-
-        match result {
-            Ok(output) if output.success => {
-                relative_paths.iter().map(|p| (p.clone(), Ok(()))).collect()
-            }
-            Ok(output) => {
-                let err_msg = format!(
-                    "rclone failed (exit {}): {}",
-                    output
-                        .exit_code
-                        .map_or("signal".to_string(), |c| c.to_string()),
-                    output.stderr.trim()
-                );
-                Self::all_batch_err(relative_paths, &format!("batch delete failed: {err_msg}"))
-            }
-            Err(e) => Self::all_batch_err(relative_paths, &format!("batch delete failed: {e}")),
-        }
+        self.exec_batch_chunked(
+            relative_paths,
+            "delete",
+            |chunk, list_filename, sftp_flags, _chunk_timeout| {
+                let file_list = chunk.join("\n");
+                let dest = &remote_full;
+                format!(
+                    "cat <<'__VDSL_EOF__' > /tmp/{list_filename}\n\
+                     {file_list}\n\
+                     __VDSL_EOF__\n\
+                     rclone delete {dest} \
+                       --files-from /tmp/{list_filename} --transfers 8{sftp_flags}; \
+                     _rc=$?; rm -f /tmp/{list_filename}; exit $_rc"
+                )
+            },
+        )
+        .await
     }
 
     fn supports_batch(&self) -> bool {
@@ -573,7 +509,13 @@ impl StorageBackend for RcloneBackend {
         "rclone"
     }
 
-    async fn ensure(&self) -> Result<(), SyncError> {
+    fn set_progress_callback(&self, callback: Option<ProgressFn>) {
+        if let Ok(mut guard) = self.progress.lock() {
+            *guard = callback;
+        }
+    }
+
+    async fn ensure(&self) -> Result<(), InfraError> {
         // Step 1: rclone バイナリの存在確認
         let check = self.shell.exec(&["which", "rclone"], Some(10)).await;
         let rclone_found = matches!(&check, Ok(out) if out.success);
@@ -608,21 +550,21 @@ impl StorageBackend for RcloneBackend {
                             tracing::info!("rclone installed successfully via install.sh");
                         }
                         Ok(o) => {
-                            return Err(SyncError::Init(format!(
+                            return Err(InfraError::Init(format!(
                                 "rclone install failed (exit {}): {}",
                                 o.exit_code.unwrap_or(-1),
                                 o.stderr.trim()
                             )));
                         }
                         Err(e) => {
-                            return Err(SyncError::Init(format!(
+                            return Err(InfraError::Init(format!(
                                 "rclone install.sh exec failed: {e}"
                             )));
                         }
                     }
                 }
                 Err(e) => {
-                    return Err(SyncError::Init(format!(
+                    return Err(InfraError::Init(format!(
                         "rclone .deb install exec failed: {e}"
                     )));
                 }
@@ -633,7 +575,7 @@ impl StorageBackend for RcloneBackend {
             match &recheck {
                 Ok(out) if out.success => {}
                 _ => {
-                    return Err(SyncError::Init(
+                    return Err(InfraError::Init(
                         "rclone still not found after install attempt".to_string(),
                     ));
                 }
@@ -644,26 +586,210 @@ impl StorageBackend for RcloneBackend {
         let remote = self.remote.expose_secret();
         self.exec_rclone_with_timeout(&["lsf", "--max-depth", "1", remote], 30)
             .await
-            .map_err(|e| SyncError::Init(format!("rclone connectivity test failed: {e}")))?;
+            .map_err(|e| InfraError::Init(format!("rclone connectivity test failed: {e}")))?;
 
         Ok(())
     }
 }
 
 impl RcloneBackend {
+    /// SFTP optimization flags as a space-separated string for shell scripts.
+    ///
+    /// Returns `" --sftp-set-modtime=false --sftp-disable-hashcheck"` for SFTP,
+    /// empty string otherwise.
+    fn sftp_flags_for_script(&self) -> &'static str {
+        if self.is_sftp() {
+            " --sftp-set-modtime=false --sftp-disable-hashcheck"
+        } else {
+            ""
+        }
+    }
+
+    /// Chunk size for this backend. SFTP uses small chunks; others run all-at-once.
+    fn batch_chunk_size(&self) -> usize {
+        if self.is_sftp() {
+            SFTP_BATCH_CHUNK_SIZE
+        } else {
+            usize::MAX // no chunking for non-SFTP
+        }
+    }
+
+    /// Execute a batch operation in chunks with progress logging and retry.
+    ///
+    /// `build_script` receives (chunk_paths, list_filename, sftp_flags, chunk_timeout)
+    /// and returns the shell script to execute.
+    ///
+    /// For SFTP: splits into [`SFTP_BATCH_CHUNK_SIZE`] chunks, logs progress
+    /// per chunk, retries failed chunks once.
+    /// For non-SFTP: runs as a single batch (chunk_size = usize::MAX).
+    async fn exec_batch_chunked<F>(
+        &self,
+        relative_paths: &[String],
+        operation: &str,
+        build_script: F,
+    ) -> HashMap<String, Result<(), InfraError>>
+    where
+        F: Fn(&[String], &str, &str, u64) -> String,
+    {
+        let chunk_size = self.batch_chunk_size();
+        let sftp_flags = self.sftp_flags_for_script();
+        let total = relative_paths.len();
+        let chunks: Vec<&[String]> = relative_paths.chunks(chunk_size).collect();
+        let num_chunks = chunks.len();
+
+        if num_chunks > 1 {
+            tracing::info!(
+                operation,
+                total,
+                num_chunks,
+                chunk_size,
+                "batch_{operation}: chunked transfer start"
+            );
+        }
+
+        let mut all_results = HashMap::with_capacity(total);
+        let mut completed = 0usize;
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let chunk_num = i + 1;
+            let chunk_timeout =
+                self.timeout_secs + (chunk.len() as u64 * BATCH_PER_FILE_TIMEOUT_SECS);
+            let list_filename =
+                format!("vdsl-{operation}-{}.txt", uuid::Uuid::new_v4().as_simple());
+
+            if num_chunks > 1 {
+                tracing::info!(
+                    operation,
+                    chunk = chunk_num,
+                    num_chunks,
+                    files = chunk.len(),
+                    completed,
+                    total,
+                    "batch_{operation}: chunk start"
+                );
+            }
+
+            let script = build_script(chunk, &list_filename, sftp_flags, chunk_timeout);
+
+            let mut attempt = 0u32;
+            let chunk_result = loop {
+                let result = self.shell.exec_script(&script, Some(chunk_timeout)).await;
+
+                match &result {
+                    Ok(output) if output.success => break Ok(()),
+                    Ok(output) => {
+                        let err_msg = format!(
+                            "rclone failed (exit {}): {}",
+                            output
+                                .exit_code
+                                .map_or("signal".to_string(), |c| c.to_string()),
+                            output.stderr.trim()
+                        );
+                        if attempt < BATCH_CHUNK_MAX_RETRIES {
+                            attempt += 1;
+                            tracing::warn!(
+                                operation,
+                                chunk = chunk_num,
+                                attempt,
+                                error = %err_msg,
+                                "batch_{operation}: chunk failed, retrying"
+                            );
+                            continue;
+                        }
+                        break Err(format!("batch {operation} failed: {err_msg}"));
+                    }
+                    Err(e) => {
+                        if attempt < BATCH_CHUNK_MAX_RETRIES {
+                            attempt += 1;
+                            tracing::warn!(
+                                operation,
+                                chunk = chunk_num,
+                                attempt,
+                                error = %e,
+                                "batch_{operation}: chunk failed, retrying"
+                            );
+                            continue;
+                        }
+                        break Err(format!("batch {operation} failed: {e}"));
+                    }
+                }
+            };
+
+            match chunk_result {
+                Ok(()) => {
+                    for p in *chunk {
+                        all_results.insert(p.clone(), Ok(()));
+                    }
+                    completed += chunk.len();
+                }
+                Err(reason) => {
+                    for p in *chunk {
+                        all_results.insert(
+                            p.clone(),
+                            Err(InfraError::Transfer {
+                                reason: reason.clone(),
+                            }),
+                        );
+                    }
+                    // Continue with next chunks — don't abort the entire batch
+                    tracing::error!(
+                        operation,
+                        chunk = chunk_num,
+                        failed_files = chunk.len(),
+                        reason = %reason,
+                        "batch_{operation}: chunk failed after retries, continuing"
+                    );
+                }
+            }
+
+            // Report progress via callback (if set).
+            if let Ok(guard) = self.progress.lock() {
+                if let Some(cb) = guard.as_ref() {
+                    cb(&format!(
+                        "{operation}: chunk {chunk_num}/{num_chunks} ({completed}/{total})"
+                    ));
+                }
+            }
+
+            if num_chunks > 1 {
+                tracing::info!(
+                    operation,
+                    chunk = chunk_num,
+                    num_chunks,
+                    completed,
+                    total,
+                    "batch_{operation}: chunk done"
+                );
+            }
+        }
+
+        if num_chunks > 1 {
+            let failed = total - completed;
+            tracing::info!(
+                operation,
+                total,
+                completed,
+                failed,
+                "batch_{operation}: all chunks done"
+            );
+        }
+
+        all_results
+    }
+
     /// Helper: build all-error result map for batch operations.
     fn all_batch_err(
         relative_paths: &[String],
         reason: &str,
-    ) -> HashMap<String, Result<(), SyncError>> {
+    ) -> HashMap<String, Result<(), InfraError>> {
         relative_paths
             .iter()
             .map(|p| {
                 (
                     p.clone(),
-                    Err(SyncError::from(InfraError::Transfer {
+                    Err(InfraError::Transfer {
                         reason: reason.to_string(),
-                    })),
+                    }),
                 )
             })
             .collect()
@@ -748,6 +874,20 @@ mod tests {
     fn parse_rclone_timestamp_invalid() {
         assert!(parse_rclone_timestamp("not-a-date").is_none());
         assert!(parse_rclone_timestamp("").is_none());
+    }
+
+    #[test]
+    fn is_sftp_detection() {
+        let sftp = RcloneBackend::new(":sftp,host=1.2.3.4,port=22,user=root:");
+        assert!(sftp.is_sftp());
+        assert_eq!(
+            sftp.sftp_flags_for_script(),
+            " --sftp-set-modtime=false --sftp-disable-hashcheck"
+        );
+
+        let b2 = RcloneBackend::new(":b2,account=kid,key=k:bucket");
+        assert!(!b2.is_sftp());
+        assert_eq!(b2.sftp_flags_for_script(), "");
     }
 
     use chrono::Datelike;

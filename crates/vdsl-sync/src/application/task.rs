@@ -59,7 +59,7 @@ impl std::fmt::Display for TaskId {
 /// {"status":"completed","result":{"scanned":5000,...}}
 /// {"status":"failed","result":"rclone: exit code 1"}
 /// ```
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "status", content = "result")]
 pub enum TaskStatus<T: Clone> {
     /// Task is spawned but not yet started processing.

@@ -22,8 +22,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::application::error::SyncError;
 use crate::domain::location::LocationId;
+use crate::infra::error::InfraError;
 use crate::infra::location_scanner::LocationScanner;
 
 /// 拠点の物理的分類。
@@ -89,7 +89,7 @@ pub trait Location: Send + Sync {
     /// - Cloud: rcloneバイナリ確認 + バケット接続テスト
     ///
     /// 失敗時は早期エラーで、数分かかるscanを無駄にしない。
-    async fn ensure(&self) -> Result<(), SyncError>;
+    async fn ensure(&self) -> Result<(), InfraError>;
 }
 
 // =============================================================================
@@ -140,17 +140,17 @@ impl Location for LocalLocation {
         ))
     }
 
-    async fn ensure(&self) -> Result<(), SyncError> {
+    async fn ensure(&self) -> Result<(), InfraError> {
         if !self.root.exists() {
             std::fs::create_dir_all(&self.root).map_err(|e| {
-                SyncError::Init(format!(
+                InfraError::Init(format!(
                     "local file_root '{}' does not exist and could not be created: {e}",
                     self.root.display()
                 ))
             })?;
         }
         if !self.root.is_dir() {
-            return Err(SyncError::Init(format!(
+            return Err(InfraError::Init(format!(
                 "local file_root '{}' exists but is not a directory",
                 self.root.display()
             )));
@@ -203,10 +203,10 @@ impl Location for SshLocation {
         ))
     }
 
-    async fn ensure(&self) -> Result<(), SyncError> {
+    async fn ensure(&self) -> Result<(), InfraError> {
         let output = self.shell.exec(&["echo", "pong"], Some(10)).await?;
         if !output.success {
-            return Err(SyncError::Init(format!(
+            return Err(InfraError::Init(format!(
                 "SSH location '{}' unreachable (exit {}): {}",
                 self.id,
                 output.exit_code.unwrap_or(-1),
@@ -262,9 +262,9 @@ impl Location for CloudLocation {
         ))
     }
 
-    async fn ensure(&self) -> Result<(), SyncError> {
+    async fn ensure(&self) -> Result<(), InfraError> {
         self.backend.ensure().await.map_err(|e| {
-            SyncError::Init(format!("cloud location '{}' ensure failed: {e}", self.id))
+            InfraError::Init(format!("cloud location '{}' ensure failed: {e}", self.id))
         })
     }
 }

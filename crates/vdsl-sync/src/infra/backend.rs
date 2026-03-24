@@ -6,12 +6,20 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use crate::application::error::SyncError;
 use crate::infra::error::InfraError;
+
+/// Progress callback for reporting transfer phase changes.
+///
+/// Called with a human-readable phase description:
+/// - `"pushing to pod-xxx: chunk 5/22 (500/2111)"`
+/// - `"pulling from cloud: 1200 files"`
+/// - `"target cloud: 4383 queued"`
+pub type ProgressFn = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// A file discovered on a remote location.
 ///
@@ -36,30 +44,29 @@ pub struct RemoteFile {
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
     /// Push a local file to this remote.
-    async fn push(&self, local_path: &Path, remote_path: &str) -> Result<(), SyncError>;
+    async fn push(&self, local_path: &Path, remote_path: &str) -> Result<(), InfraError>;
 
     /// Pull a file from this remote to a local path.
-    async fn pull(&self, remote_path: &str, local_path: &Path) -> Result<(), SyncError>;
+    async fn pull(&self, remote_path: &str, local_path: &Path) -> Result<(), InfraError>;
 
     /// List files at a remote path.
-    async fn list(&self, remote_path: &str) -> Result<Vec<RemoteFile>, SyncError>;
+    async fn list(&self, remote_path: &str) -> Result<Vec<RemoteFile>, InfraError>;
 
     /// Check if a remote file exists.
-    async fn exists(&self, remote_path: &str) -> Result<bool, SyncError>;
+    async fn exists(&self, remote_path: &str) -> Result<bool, InfraError>;
 
     /// Delete a file on this remote.
     ///
     /// Returns `Ok(())` if the file was deleted or didn't exist.
     /// Default implementation returns `Err` — backends that support deletion
     /// must override this.
-    async fn delete(&self, remote_path: &str) -> Result<(), SyncError> {
+    async fn delete(&self, remote_path: &str) -> Result<(), InfraError> {
         Err(InfraError::Transfer {
             reason: format!(
                 "delete not supported by {} backend for path: {remote_path}",
                 self.backend_type()
             ),
-        }
-        .into())
+        })
     }
 
     /// Push multiple files in a single batch operation.
@@ -74,7 +81,7 @@ pub trait StorageBackend: Send + Sync {
         src_root: &Path,
         dest_root: &str,
         relative_paths: &[String],
-    ) -> HashMap<String, Result<(), SyncError>> {
+    ) -> HashMap<String, Result<(), InfraError>> {
         let mut results = HashMap::with_capacity(relative_paths.len());
         for rel in relative_paths {
             let local_path = src_root.join(rel);
@@ -101,7 +108,7 @@ pub trait StorageBackend: Send + Sync {
         src_root: &str,
         dest_root: &Path,
         relative_paths: &[String],
-    ) -> HashMap<String, Result<(), SyncError>> {
+    ) -> HashMap<String, Result<(), InfraError>> {
         let mut results = HashMap::with_capacity(relative_paths.len());
         for rel in relative_paths {
             let remote_path = if src_root.is_empty() {
@@ -127,7 +134,7 @@ pub trait StorageBackend: Send + Sync {
         &self,
         remote_root: &str,
         relative_paths: &[String],
-    ) -> HashMap<String, Result<(), SyncError>> {
+    ) -> HashMap<String, Result<(), InfraError>> {
         let mut results = HashMap::with_capacity(relative_paths.len());
         for rel in relative_paths {
             let remote_path = if remote_root.is_empty() {
@@ -152,13 +159,21 @@ pub trait StorageBackend: Send + Sync {
     /// Backend type name for display and config matching.
     fn backend_type(&self) -> &str;
 
+    /// Set a progress callback for batch operations.
+    ///
+    /// Called by the sync engine before batch execution.
+    /// Implementations that support chunked transfers (e.g. RcloneBackend)
+    /// should call this callback on chunk completion.
+    /// Default: no-op (callback is ignored).
+    fn set_progress_callback(&self, _callback: Option<ProgressFn>) {}
+
     /// 外部ツールの到達確認 + 確保。
     ///
     /// - rclone: バイナリ存在確認 → なければインストール → 接続テスト
     /// - memory: 常にOk
     ///
     /// デフォルト実装: `list("")` で接続テスト（バイナリが存在しなければここで失敗する）。
-    async fn ensure(&self) -> Result<(), SyncError> {
+    async fn ensure(&self) -> Result<(), InfraError> {
         self.list("").await.map(|_| ())
     }
 }
@@ -198,7 +213,7 @@ pub mod memory {
 
     #[async_trait]
     impl StorageBackend for InMemoryBackend {
-        async fn push(&self, local_path: &Path, remote_path: &str) -> Result<(), SyncError> {
+        async fn push(&self, local_path: &Path, remote_path: &str) -> Result<(), InfraError> {
             self.log.lock().await.push(Op::Push {
                 local: local_path.display().to_string(),
                 remote: remote_path.into(),
@@ -214,7 +229,7 @@ pub mod memory {
             Ok(())
         }
 
-        async fn pull(&self, remote_path: &str, local_path: &Path) -> Result<(), SyncError> {
+        async fn pull(&self, remote_path: &str, local_path: &Path) -> Result<(), InfraError> {
             self.log.lock().await.push(Op::Pull {
                 remote: remote_path.into(),
                 local: local_path.display().to_string(),
@@ -230,7 +245,7 @@ pub mod memory {
             Ok(())
         }
 
-        async fn list(&self, remote_path: &str) -> Result<Vec<RemoteFile>, SyncError> {
+        async fn list(&self, remote_path: &str) -> Result<Vec<RemoteFile>, InfraError> {
             self.log.lock().await.push(Op::List {
                 path: remote_path.into(),
             });
@@ -245,14 +260,14 @@ pub mod memory {
                 .collect())
         }
 
-        async fn exists(&self, remote_path: &str) -> Result<bool, SyncError> {
+        async fn exists(&self, remote_path: &str) -> Result<bool, InfraError> {
             self.log.lock().await.push(Op::Exists {
                 path: remote_path.into(),
             });
             Ok(self.files.lock().await.contains_key(remote_path))
         }
 
-        async fn delete(&self, remote_path: &str) -> Result<(), SyncError> {
+        async fn delete(&self, remote_path: &str) -> Result<(), InfraError> {
             self.log.lock().await.push(Op::Delete {
                 path: remote_path.into(),
             });
@@ -278,19 +293,19 @@ pub mod memory {
     /// Avoids orphan-rule workarounds (newtype wrapper) in every test module.
     #[async_trait]
     impl StorageBackend for std::sync::Arc<InMemoryBackend> {
-        async fn push(&self, local_path: &Path, remote_path: &str) -> Result<(), SyncError> {
+        async fn push(&self, local_path: &Path, remote_path: &str) -> Result<(), InfraError> {
             (**self).push(local_path, remote_path).await
         }
-        async fn pull(&self, remote_path: &str, local_path: &Path) -> Result<(), SyncError> {
+        async fn pull(&self, remote_path: &str, local_path: &Path) -> Result<(), InfraError> {
             (**self).pull(remote_path, local_path).await
         }
-        async fn list(&self, remote_path: &str) -> Result<Vec<RemoteFile>, SyncError> {
+        async fn list(&self, remote_path: &str) -> Result<Vec<RemoteFile>, InfraError> {
             (**self).list(remote_path).await
         }
-        async fn exists(&self, remote_path: &str) -> Result<bool, SyncError> {
+        async fn exists(&self, remote_path: &str) -> Result<bool, InfraError> {
             (**self).exists(remote_path).await
         }
-        async fn delete(&self, remote_path: &str) -> Result<(), SyncError> {
+        async fn delete(&self, remote_path: &str) -> Result<(), InfraError> {
             (**self).delete(remote_path).await
         }
         async fn push_batch(
@@ -298,7 +313,7 @@ pub mod memory {
             src_root: &Path,
             dest_root: &str,
             relative_paths: &[String],
-        ) -> HashMap<String, Result<(), SyncError>> {
+        ) -> HashMap<String, Result<(), InfraError>> {
             (**self)
                 .push_batch(src_root, dest_root, relative_paths)
                 .await
@@ -307,7 +322,7 @@ pub mod memory {
             &self,
             remote_root: &str,
             relative_paths: &[String],
-        ) -> HashMap<String, Result<(), SyncError>> {
+        ) -> HashMap<String, Result<(), InfraError>> {
             (**self).delete_batch(remote_root, relative_paths).await
         }
         fn supports_batch(&self) -> bool {
@@ -316,8 +331,11 @@ pub mod memory {
         fn backend_type(&self) -> &str {
             (**self).backend_type()
         }
-        async fn ensure(&self) -> Result<(), SyncError> {
+        async fn ensure(&self) -> Result<(), InfraError> {
             (**self).ensure().await
+        }
+        fn set_progress_callback(&self, callback: Option<ProgressFn>) {
+            (**self).set_progress_callback(callback);
         }
     }
 }

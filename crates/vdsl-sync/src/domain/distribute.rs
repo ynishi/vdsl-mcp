@@ -29,6 +29,7 @@ pub enum DistributeAction {
     /// Locationのファイルが古い → 更新転送が必要。
     Update(UpdateAction),
     /// Topology上で削除済み → Locationからも削除。
+    #[allow(dead_code)] // Delete設計はテスト済み、production配線は未実装
     Delete(DeleteAction),
 }
 
@@ -163,6 +164,7 @@ impl DistributeAction {
         }
     }
 
+    #[cfg(test)]
     pub fn relative_path(&self) -> &str {
         match self {
             Self::Send(a) => &a.relative_path,
@@ -179,10 +181,12 @@ impl DistributeAction {
         }
     }
 
+    #[cfg(test)]
     pub fn is_send(&self) -> bool {
         matches!(self, Self::Send(_))
     }
 
+    #[cfg(test)]
     pub fn is_update(&self) -> bool {
         matches!(self, Self::Update(_))
     }
@@ -349,7 +353,10 @@ fn emit_action_for_target(
                 trace!(file_id = %file_id, target = %target, "no latest fingerprint, skip Update");
                 return;
             };
-            if lf.has_changed(fp) {
+            // cross-location比較: ByteDigestを構造的に除外するCrossLocationIdentityを使用
+            let target_id = CrossLocationIdentity::from_fingerprint(lf.fingerprint());
+            let latest_id = CrossLocationIdentity::from_fingerprint(fp);
+            if !latest_id.matches(&target_id) {
                 trace!(file_id = %file_id, target = %target, source = %source, "Update");
                 actions.push(DistributeAction::Update(UpdateAction {
                     topology_file_id: file_id.to_string(),
@@ -379,6 +386,7 @@ fn emit_action_for_target(
 /// - `deleted_topology_files` — 削除済みのTopologyFile群
 /// - `location_files` — `file_id → LocationFile[]`
 /// - `target_locations` — 配布先候補
+#[cfg(test)]
 pub fn distribute_delete_actions(
     deleted_topology_files: &[&TopologyFile],
     location_files: &HashMap<String, Vec<&LocationFile>>,

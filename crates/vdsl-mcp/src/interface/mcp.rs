@@ -133,11 +133,14 @@ impl VdslMcpServer {
 
         // Build new SDK
         let work_dir = default_work_dir();
-        let sdk = build_sdk(&work_dir, current_pod_id.as_deref())
+        let (sdk, persistence) = build_sdk(&work_dir, current_pod_id.as_deref())
             .await
             .map_err(|e| {
                 McpError::invalid_params(format!("Failed to initialize sync SDK: {e:#}"), None)
             })?;
+
+        // DB store を SyncTaskManager に設定（初回のみ。stale running タスクの recovery も行う）
+        self.sync_task_mgr.set_store(persistence).await;
 
         *guard = Some(sdk.clone());
         if let Ok(mut pid_guard) = self.sync_sdk_pod_id.lock() {
@@ -3829,7 +3832,11 @@ impl VdslMcpServer {
     )]
     async fn sync(&self) -> Result<CallToolResult, McpError> {
         let db = self.resolve_or_init_sdk().await?;
-        let task_id = self.sync_task_mgr.spawn_sync(&db).await;
+        let task_id = self
+            .sync_task_mgr
+            .spawn_sync(&db)
+            .await
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(format!(
             "sync spawned.\ntask_id: {task_id}\nlog: {}\n\nUse vdsl_sync_poll with this task_id to check progress.",
             current_log_path()
@@ -3858,7 +3865,11 @@ impl VdslMcpServer {
             .map_err(|e| McpError::invalid_params(format!("invalid src location: {e}"), None))?;
         let dest = vdsl_sync::LocationId::new(&req.dest)
             .map_err(|e| McpError::invalid_params(format!("invalid dest location: {e}"), None))?;
-        let task_id = self.sync_task_mgr.spawn_sync_route(&db, src, dest).await;
+        let task_id = self
+            .sync_task_mgr
+            .spawn_sync_route(&db, src, dest)
+            .await
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(format!(
             "sync_route spawned ({} → {}).\ntask_id: {task_id}\nlog: {}\n\nUse vdsl_sync_poll with this task_id to check progress.",
             req.src, req.dest, current_log_path()
@@ -5024,14 +5035,14 @@ fn default_work_dir() -> std::path::PathBuf {
 async fn build_sdk(
     work_dir: &std::path::Path,
     pod_id: Option<&str>,
-) -> anyhow::Result<Arc<dyn vdsl_sync::SyncStoreSdk>> {
+) -> anyhow::Result<(
+    Arc<dyn vdsl_sync::SyncStoreSdk>,
+    Arc<vdsl_sync::SqliteSyncStore>,
+)> {
     use crate::application::pod_service::resolve_api_key;
     use crate::infra::runpod_cli::RunPodCli;
     use anyhow::Context as _;
-    use vdsl_sync::infra::location_file_store::LocationFileStore;
-    use vdsl_sync::infra::sqlite::SqliteSyncStore;
-    use vdsl_sync::infra::topology_file_store::TopologyFileStore;
-    use vdsl_sync::LocationId;
+    use vdsl_sync::{LocationFileStore, LocationId, SqliteSyncStore, TopologyFileStore};
 
     // Resolve B2 credentials
     let key_id = std::env::var("VDSL_B2_KEY_ID").context("VDSL_B2_KEY_ID not set")?;
@@ -5218,7 +5229,10 @@ async fn build_sdk(
         "sync: SyncStoreSdk initialized (cloud=B2)"
     );
 
-    Ok(Arc::new(sdk) as Arc<dyn vdsl_sync::SyncStoreSdk>)
+    Ok((
+        Arc::new(sdk) as Arc<dyn vdsl_sync::SyncStoreSdk>,
+        persistence,
+    ))
 }
 
 /// Parse lua CLI args into code string for mlua execution.

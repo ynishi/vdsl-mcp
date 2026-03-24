@@ -9,14 +9,14 @@
 //! - **Application** — use-case orchestration ([`SdkImpl`], [`TopologyStore`], [`TopologyScanner`])
 //! - **Infrastructure** — persistence and transfer ([`TransferStore`], [`StorageBackend`])
 
-pub mod application;
-pub mod domain;
-pub mod infra;
+pub(crate) mod application;
+pub(crate) mod domain;
+pub(crate) mod infra;
 
 // Re-exports: SDK public API face
 //
-// Interface layers (MCP, Lua) depend only on these types.
-// Internal types (domain::*, infra::*) are accessible via direct module paths.
+// Interface layers (MCP, Lua) depend only on these re-exported types.
+// Internal modules are pub(crate) — external crates cannot access via module paths.
 
 // --- SDK trait + result types ---
 pub use application::error::SyncError;
@@ -34,12 +34,13 @@ pub use domain::location::{LocationId, LocationSummary, SyncSummary};
 pub use domain::view::{ErrorEntry, PendingEntry, PresenceState, PresenceView};
 
 // --- Builder boundary types (SdkImplBuilder construction) ---
-pub use infra::backend::StorageBackend;
+pub use infra::backend::{ProgressFn, StorageBackend};
 pub use infra::error::InfraError;
 pub use infra::hasher::{ContentHasher, Djb2Hasher};
 pub use infra::location::{CloudLocation, LocalLocation, Location, SshLocation};
 pub use infra::location_file_store::LocationFileStore;
 pub use infra::rclone::RcloneBackend;
 pub use infra::shell::{FileInspection, RemoteShell, ShellOutput};
+pub use infra::sqlite::SqliteSyncStore;
 pub use infra::topology_file_store::TopologyFileStore;
 pub use infra::transfer_store::TransferStore;

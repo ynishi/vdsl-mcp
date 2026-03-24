@@ -25,7 +25,7 @@ use crate::domain::file_type::FileType;
 use crate::domain::fingerprint::FileFingerprint;
 use crate::domain::graph::RouteGraph;
 use crate::domain::location::LocationId;
-use crate::domain::location_file::{LocationFile, LocationFileState};
+use crate::domain::location_file::{self, LocationFile};
 use crate::domain::plan::{plan_distribution, PlannedTransfer};
 use tracing::{debug, info, trace};
 
@@ -512,12 +512,7 @@ impl TopologyStore {
 
     /// ファイル数。
     pub async fn file_count(&self) -> Result<usize, SyncError> {
-        self.topology_files.count_active().await
-    }
-
-    /// Graph参照。
-    pub fn graph(&self) -> &RouteGraph {
-        &self.graph
+        Ok(self.topology_files.count_active().await?)
     }
 
     /// Location一覧。
@@ -654,18 +649,17 @@ impl TopologyStore {
                         }
                     }
 
-                    // 他LocationのLocationFileをStaleに
+                    // 他LocationのLocationFileをStaleに（cross-location比較で実際に異なるもののみ）
                     let all_lfs = self
                         .location_files
                         .list_by_file(&c.topology_file_id)
                         .await?;
-                    for lf in all_lfs {
-                        if lf.location_id() != &c.origin && lf.state() == LocationFileState::Active
-                        {
-                            let mut lf = lf;
-                            lf.mark_stale();
-                            self.location_files.upsert(&lf).await?;
-                        }
+                    for stale_lf in
+                        location_file::stale_candidates(&all_lfs, &c.origin, &c.new_fingerprint)
+                    {
+                        let mut lf = stale_lf.clone();
+                        lf.mark_stale();
+                        self.location_files.upsert(&lf).await?;
                     }
 
                     ingest_origins
@@ -840,6 +834,7 @@ mod tests {
     use crate::domain::location_file::LocationFileState;
     use crate::domain::topology_delta::{ContentChangedFile, DiscoveredFile, VanishedFile};
     use crate::domain::transfer::TransferState;
+    use crate::infra::error::InfraError;
     use crate::infra::transfer_store::TransferStatRow;
 
     // =========================================================================
@@ -860,7 +855,7 @@ mod tests {
 
     #[async_trait]
     impl TopologyFileStore for MockTopologyFileStore {
-        async fn upsert(&self, file: &TopologyFile) -> Result<(), SyncError> {
+        async fn upsert(&self, file: &TopologyFile) -> Result<(), InfraError> {
             let mut files = self.files.lock().await;
             if let Some(pos) = files.iter().position(|f| f.id() == file.id()) {
                 files[pos] = file.clone();
@@ -870,7 +865,7 @@ mod tests {
             Ok(())
         }
 
-        async fn get_by_id(&self, id: &str) -> Result<Option<TopologyFile>, SyncError> {
+        async fn get_by_id(&self, id: &str) -> Result<Option<TopologyFile>, InfraError> {
             Ok(self
                 .files
                 .lock()
@@ -880,7 +875,7 @@ mod tests {
                 .cloned())
         }
 
-        async fn get_by_path(&self, path: &str) -> Result<Option<TopologyFile>, SyncError> {
+        async fn get_by_path(&self, path: &str) -> Result<Option<TopologyFile>, InfraError> {
             Ok(self
                 .files
                 .lock()
@@ -893,7 +888,7 @@ mod tests {
         async fn find_by_canonical_hash(
             &self,
             hash: &str,
-        ) -> Result<Option<TopologyFile>, SyncError> {
+        ) -> Result<Option<TopologyFile>, InfraError> {
             Ok(self
                 .files
                 .lock()
@@ -907,7 +902,7 @@ mod tests {
             &self,
             file_type: Option<FileType>,
             limit: Option<usize>,
-        ) -> Result<Vec<TopologyFile>, SyncError> {
+        ) -> Result<Vec<TopologyFile>, InfraError> {
             let files = self.files.lock().await;
             let mut result: Vec<_> = files
                 .iter()
@@ -921,7 +916,7 @@ mod tests {
             Ok(result)
         }
 
-        async fn list_deleted(&self) -> Result<Vec<TopologyFile>, SyncError> {
+        async fn list_deleted(&self) -> Result<Vec<TopologyFile>, InfraError> {
             Ok(self
                 .files
                 .lock()
@@ -932,7 +927,7 @@ mod tests {
                 .collect())
         }
 
-        async fn count_active(&self) -> Result<usize, SyncError> {
+        async fn count_active(&self) -> Result<usize, InfraError> {
             Ok(self
                 .files
                 .lock()
@@ -942,7 +937,7 @@ mod tests {
                 .count())
         }
 
-        async fn list_active_paths(&self) -> Result<Vec<String>, SyncError> {
+        async fn list_active_paths(&self) -> Result<Vec<String>, InfraError> {
             Ok(self
                 .files
                 .lock()
@@ -968,7 +963,7 @@ mod tests {
 
     #[async_trait]
     impl LocationFileStore for MockLocationFileStore {
-        async fn upsert(&self, file: &LocationFile) -> Result<(), SyncError> {
+        async fn upsert(&self, file: &LocationFile) -> Result<(), InfraError> {
             let mut files = self.files.lock().await;
             if let Some(pos) = files.iter().position(|f| {
                 f.file_id() == file.file_id() && f.location_id() == file.location_id()
@@ -984,7 +979,7 @@ mod tests {
             &self,
             file_id: &str,
             location_id: &LocationId,
-        ) -> Result<Option<LocationFile>, SyncError> {
+        ) -> Result<Option<LocationFile>, InfraError> {
             Ok(self
                 .files
                 .lock()
@@ -994,7 +989,7 @@ mod tests {
                 .cloned())
         }
 
-        async fn list_by_file(&self, file_id: &str) -> Result<Vec<LocationFile>, SyncError> {
+        async fn list_by_file(&self, file_id: &str) -> Result<Vec<LocationFile>, InfraError> {
             Ok(self
                 .files
                 .lock()
@@ -1008,7 +1003,7 @@ mod tests {
         async fn list_by_location(
             &self,
             location_id: &LocationId,
-        ) -> Result<Vec<LocationFile>, SyncError> {
+        ) -> Result<Vec<LocationFile>, InfraError> {
             Ok(self
                 .files
                 .lock()
@@ -1022,7 +1017,7 @@ mod tests {
         async fn list_by_files(
             &self,
             file_ids: &[&str],
-        ) -> Result<HashMap<String, Vec<LocationFile>>, SyncError> {
+        ) -> Result<HashMap<String, Vec<LocationFile>>, InfraError> {
             let files = self.files.lock().await;
             let mut map: HashMap<String, Vec<LocationFile>> = HashMap::new();
             for f in files.iter() {
@@ -1035,14 +1030,18 @@ mod tests {
             Ok(map)
         }
 
-        async fn delete(&self, file_id: &str, location_id: &LocationId) -> Result<bool, SyncError> {
+        async fn delete(
+            &self,
+            file_id: &str,
+            location_id: &LocationId,
+        ) -> Result<bool, InfraError> {
             let mut files = self.files.lock().await;
             let before = files.len();
             files.retain(|f| !(f.file_id() == file_id && f.location_id() == location_id));
             Ok(files.len() < before)
         }
 
-        async fn count_by_location(&self, location_id: &LocationId) -> Result<usize, SyncError> {
+        async fn count_by_location(&self, location_id: &LocationId) -> Result<usize, InfraError> {
             Ok(self
                 .files
                 .lock()
@@ -1067,12 +1066,12 @@ mod tests {
 
     #[async_trait]
     impl TransferStore for MockTransferStore {
-        async fn insert_transfer(&self, transfer: &Transfer) -> Result<(), SyncError> {
+        async fn insert_transfer(&self, transfer: &Transfer) -> Result<(), InfraError> {
             self.transfers.lock().await.push(transfer.clone());
             Ok(())
         }
 
-        async fn update_transfer(&self, transfer: &Transfer) -> Result<(), SyncError> {
+        async fn update_transfer(&self, transfer: &Transfer) -> Result<(), InfraError> {
             let mut transfers = self.transfers.lock().await;
             if let Some(pos) = transfers.iter().position(|t| t.id() == transfer.id()) {
                 transfers[pos] = transfer.clone();
@@ -1080,7 +1079,7 @@ mod tests {
             Ok(())
         }
 
-        async fn queued_transfers(&self, dest: &LocationId) -> Result<Vec<Transfer>, SyncError> {
+        async fn queued_transfers(&self, dest: &LocationId) -> Result<Vec<Transfer>, InfraError> {
             Ok(self
                 .transfers
                 .lock()
@@ -1094,7 +1093,7 @@ mod tests {
         async fn latest_transfers_by_file(
             &self,
             file_id: &str,
-        ) -> Result<Vec<Transfer>, SyncError> {
+        ) -> Result<Vec<Transfer>, InfraError> {
             Ok(self
                 .transfers
                 .lock()
@@ -1105,15 +1104,15 @@ mod tests {
                 .collect())
         }
 
-        async fn failed_transfers(&self) -> Result<Vec<Transfer>, SyncError> {
+        async fn failed_transfers(&self) -> Result<Vec<Transfer>, InfraError> {
             Ok(Vec::new())
         }
 
-        async fn prune_completed(&self, _before: DateTime<Utc>) -> Result<usize, SyncError> {
+        async fn prune_completed(&self, _before: DateTime<Utc>) -> Result<usize, InfraError> {
             Ok(0)
         }
 
-        async fn count_queued(&self) -> Result<usize, SyncError> {
+        async fn count_queued(&self) -> Result<usize, InfraError> {
             Ok(self
                 .transfers
                 .lock()
@@ -1123,18 +1122,18 @@ mod tests {
                 .count())
         }
 
-        async fn cancel_orphaned_inflight(&self) -> Result<usize, SyncError> {
+        async fn cancel_orphaned_inflight(&self) -> Result<usize, InfraError> {
             Ok(0)
         }
 
         async fn unblock_dependents(
             &self,
             _completed_transfer_id: &str,
-        ) -> Result<usize, SyncError> {
+        ) -> Result<usize, InfraError> {
             Ok(0)
         }
 
-        async fn all_pending_transfers(&self) -> Result<Vec<Transfer>, SyncError> {
+        async fn all_pending_transfers(&self) -> Result<Vec<Transfer>, InfraError> {
             Ok(self
                 .transfers
                 .lock()
@@ -1147,13 +1146,13 @@ mod tests {
                 .collect())
         }
 
-        async fn transfer_stats(&self) -> Result<Vec<TransferStatRow>, SyncError> {
+        async fn transfer_stats(&self) -> Result<Vec<TransferStatRow>, InfraError> {
             Ok(Vec::new())
         }
 
         async fn present_counts_by_location(
             &self,
-        ) -> Result<HashMap<LocationId, usize>, SyncError> {
+        ) -> Result<HashMap<LocationId, usize>, InfraError> {
             Ok(HashMap::new())
         }
     }
@@ -1201,7 +1200,6 @@ mod tests {
 
     fn discovered(path: &str, hash: &str, origin: &str) -> TopologyDelta {
         TopologyDelta::Discovered(DiscoveredFile {
-            id: uuid::Uuid::new_v4().to_string(),
             relative_path: path.to_string(),
             file_type: FileType::Image,
             fingerprint: fp(hash, 1024),

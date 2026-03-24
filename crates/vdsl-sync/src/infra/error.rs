@@ -28,4 +28,7 @@ pub enum InfraError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("initialization failed: {0}")]
+    Init(String),
 }

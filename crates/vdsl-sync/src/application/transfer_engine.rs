@@ -146,6 +146,16 @@ impl TransferEngine {
         self.graph.destinations_ordered_from(&LocationId::local())
     }
 
+    /// Set progress callback on all route backends.
+    pub(crate) fn set_progress_callback(
+        &self,
+        callback: Option<crate::infra::backend::ProgressFn>,
+    ) {
+        for route in self.routes.values() {
+            route.backend().set_progress_callback(callback.clone());
+        }
+    }
+
     /// 全destinationをBFS順で返す（chain dependency order）。
     ///
     /// BFS順に並べた後、BFS到達不能なdestinationを末尾に追加する。
@@ -482,10 +492,6 @@ impl TransferEngine {
 }
 
 impl Topology for TransferEngine {
-    fn reachable_from(&self, origin: &LocationId) -> std::collections::HashSet<LocationId> {
-        self.graph.reachable_from(origin)
-    }
-
     fn optimal_tree(
         &self,
         origin: &LocationId,
@@ -543,9 +549,10 @@ fn classify_infra_error(e: &crate::infra::error::InfraError) -> TransferErrorKin
         // IO errors: most are transient (disk full, permission denied could be permanent
         // but conservatively treat as transient for retry)
         InfraError::Io(_) => TransferErrorKind::Transient,
-        // Store/Hash/Serialization — likely bugs, permanent
-        InfraError::Store { .. } | InfraError::Hash { .. } | InfraError::Serialization(_) => {
-            TransferErrorKind::Permanent
-        }
+        // Store/Hash/Serialization/Init — likely bugs or config errors, permanent
+        InfraError::Store { .. }
+        | InfraError::Hash { .. }
+        | InfraError::Serialization(_)
+        | InfraError::Init(_) => TransferErrorKind::Permanent,
     }
 }

@@ -31,9 +31,6 @@ use super::transfer::TransferKind;
 /// 内部実装がGraph/DOD/静的テーブルの何であれ、このインタフェースが同じなら
 /// plan.rs は変更不要。
 pub trait Topology: Send + Sync {
-    /// `origin` から到達可能な全locationの集合（origin自身は含まない）。
-    fn reachable_from(&self, origin: &LocationId) -> HashSet<LocationId>;
-
     /// `origin` から `required_dests` 全てに到達する最小コスト経路の辺リスト。
     /// 辺は依存順序: (A,B) が (B,C) より前に来る。
     fn optimal_tree(
@@ -250,6 +247,7 @@ impl DistributeGroup {
 ///
 /// DeleteはRouteGraphの最適木を使わない（各Locationへの個別削除指示）。
 /// plan_distributionから呼ばれるのではなく、Deleteを別経路で処理する場合に使用。
+#[cfg(test)]
 pub fn plan_deletes(
     delete_actions: &[DistributeAction],
     pending_dests: &HashMap<String, HashSet<LocationId>>,

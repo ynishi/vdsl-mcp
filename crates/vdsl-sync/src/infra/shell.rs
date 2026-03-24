@@ -10,7 +10,6 @@
 
 use async_trait::async_trait;
 
-use crate::application::error::SyncError;
 use crate::infra::error::InfraError;
 
 /// Output from a shell command execution.
@@ -43,7 +42,7 @@ pub trait RemoteShell: Send + Sync {
         &self,
         args: &[&str],
         timeout_secs: Option<u64>,
-    ) -> Result<ShellOutput, SyncError>;
+    ) -> Result<ShellOutput, InfraError>;
 
     /// Execute a shell script on this host.
     ///
@@ -54,7 +53,7 @@ pub trait RemoteShell: Send + Sync {
         &self,
         script: &str,
         timeout_secs: Option<u64>,
-    ) -> Result<ShellOutput, SyncError> {
+    ) -> Result<ShellOutput, InfraError> {
         self.exec(&["sh", "-c", script], timeout_secs).await
     }
 
@@ -68,7 +67,7 @@ pub trait RemoteShell: Send + Sync {
         &self,
         root: &str,
         relative_paths: &[String],
-    ) -> Result<Vec<FileInspection>, SyncError> {
+    ) -> Result<Vec<FileInspection>, InfraError> {
         if relative_paths.is_empty() {
             return Ok(Vec::new());
         }
@@ -81,7 +80,7 @@ pub trait RemoteShell: Send + Sync {
              s=$(stat --format=%s \"$f\" 2>/dev/null || echo 0); \
              [ -n \"$h\" ] && printf '%s %s %s\\n' \"$h\" \"$s\" \"$f\"; \
              done <<'__VDSL_FILELIST__'\n",
-            root
+            root.replace('\'', "'\\''")
         );
         for rel in relative_paths {
             script.push_str(rel);
@@ -95,8 +94,7 @@ pub trait RemoteShell: Send + Sync {
         if !output.success {
             return Err(InfraError::Transfer {
                 reason: format!("batch_inspect failed: {}", output.stderr.trim()),
-            }
-            .into());
+            });
         }
 
         let mut results = Vec::with_capacity(relative_paths.len());
@@ -137,12 +135,11 @@ impl RemoteShell for LocalShell {
         &self,
         args: &[&str],
         timeout_secs: Option<u64>,
-    ) -> Result<ShellOutput, SyncError> {
+    ) -> Result<ShellOutput, InfraError> {
         if args.is_empty() {
             return Err(InfraError::Transfer {
                 reason: "empty command".into(),
-            }
-            .into());
+            });
         }
 
         let mut cmd = tokio::process::Command::new(args[0]);
@@ -155,7 +152,7 @@ impl RemoteShell for LocalShell {
 
         let output = tokio::time::timeout(timeout, cmd.output())
             .await
-            .map_err(|_| -> SyncError {
+            .map_err(|_| -> InfraError {
                 InfraError::Transfer {
                     reason: format!(
                         "command timed out after {}s: {}",
@@ -163,13 +160,11 @@ impl RemoteShell for LocalShell {
                         args.join(" ")
                     ),
                 }
-                .into()
             })?
-            .map_err(|e| -> SyncError {
+            .map_err(|e| -> InfraError {
                 InfraError::Transfer {
                     reason: format!("exec failed ({}): {e}", args[0]),
                 }
-                .into()
             })?;
 
         Ok(ShellOutput {
@@ -242,7 +237,7 @@ pub mod mock {
             &self,
             args: &[&str],
             _timeout_secs: Option<u64>,
-        ) -> Result<ShellOutput, SyncError> {
+        ) -> Result<ShellOutput, InfraError> {
             let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
             self.exec_log.lock().await.push(owned);
 

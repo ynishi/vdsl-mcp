@@ -18,11 +18,11 @@ use std::sync::Arc;
 use crate::application::error::SyncError;
 use crate::domain::fingerprint::FileFingerprint;
 use crate::domain::location::LocationId;
-use crate::domain::scan::{ScanOutcome, ScanReport};
 use crate::domain::topology_delta::{
     ContentChangedFile, DiscoveredFile, TopologyDelta, VanishedFile,
 };
 use crate::domain::topology_file::{ScanMatch, TopologyFile};
+use crate::infra::backend::ProgressFn;
 use crate::infra::location_file_store::LocationFileStore;
 use crate::infra::location_scanner::{LocationScanner, ScannedFile};
 use crate::infra::topology_file_store::TopologyFileStore;
@@ -43,7 +43,6 @@ pub struct ScanResult {
     pub deltas: Vec<TopologyDelta>,
     pub scanned: usize,
     pub scan_errors: Vec<TopologyScanError>,
-    pub scan_report: ScanReport,
 }
 
 // =============================================================================
@@ -84,10 +83,10 @@ impl TopologyScanner {
         &self,
         excludes: &[glob::Pattern],
         skip_locations: &std::collections::HashSet<crate::domain::location::LocationId>,
+        progress: Option<&ProgressFn>,
     ) -> Result<ScanResult, SyncError> {
         let mut all_scanned: Vec<ScannedFile> = Vec::new();
         let mut all_errors: Vec<TopologyScanError> = Vec::new();
-        let mut scan_report = ScanReport::new();
 
         let location_total = self.scanners.len();
         tracing::info!(locations = location_total, "topology_scan: starting");
@@ -100,12 +99,6 @@ impl TopologyScanner {
                 tracing::warn!(
                     location = %loc_id,
                     "topology_scan: skipping location (ensure failed)"
-                );
-                scan_report.record(
-                    loc_id,
-                    ScanOutcome::Failed {
-                        error: "skipped: ensure failed".to_string(),
-                    },
                 );
                 continue;
             }
@@ -127,13 +120,12 @@ impl TopologyScanner {
                         errors = error_count,
                         "topology_scan: location done"
                     );
-                    scan_report.record(
-                        loc_id.clone(),
-                        ScanOutcome::Scanned {
-                            entries: entry_count,
-                            errors: error_count,
-                        },
-                    );
+                    if let Some(cb) = &progress {
+                        cb(&format!(
+                            "scan: {loc_id} done ({entry_count} files) [{}/{location_total}]",
+                            idx + 1
+                        ));
+                    }
                     all_scanned.extend(result.files);
                     all_errors.extend(result.errors.into_iter().map(|e| TopologyScanError {
                         path: e.path,
@@ -145,12 +137,6 @@ impl TopologyScanner {
                         location = %loc_id,
                         error = %e,
                         "topology_scan: location failed"
-                    );
-                    scan_report.record(
-                        loc_id,
-                        ScanOutcome::Failed {
-                            error: e.to_string(),
-                        },
                     );
                 }
             }
@@ -172,7 +158,6 @@ impl TopologyScanner {
             deltas,
             scanned,
             scan_errors: all_errors,
-            scan_report,
         })
     }
 
@@ -332,7 +317,6 @@ fn match_and_classify(
         all_tfs.len()
     );
     Some(TopologyDelta::Discovered(DiscoveredFile {
-        id: uuid::Uuid::new_v4().to_string(),
         relative_path: entry.relative_path.clone(),
         file_type: entry.file_type,
         fingerprint: entry.fingerprint.clone(),

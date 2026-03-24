@@ -386,6 +386,39 @@ impl LocationFile {
     }
 }
 
+// =============================================================================
+// Pure function — Stale候補判定
+// =============================================================================
+
+/// ContentChanged後にStaleにすべきLocationFileを判定する。
+///
+/// origin（変更を検出したLocation）以外のActive LocationFileについて、
+/// [`CrossLocationIdentity`] でcross-location比較し、コンテンツが実際に異なるもののみ返す。
+///
+/// # 比較精度
+///
+/// - 双方に `content_digest` あり → ピクセルデータ比較（PNG等で高精度）
+/// - `content_digest` なし → `size` フォールバック（txtファイル等）
+///
+/// `byte_digest` はcross-locationで使用不可のため、`CrossLocationIdentity` が構造的に除外する。
+pub fn stale_candidates<'a>(
+    all_lfs: &'a [LocationFile],
+    origin: &LocationId,
+    new_fingerprint: &FileFingerprint,
+) -> Vec<&'a LocationFile> {
+    let new_identity = super::digest::CrossLocationIdentity::from_fingerprint(new_fingerprint);
+    all_lfs
+        .iter()
+        .filter(|lf| {
+            lf.location_id() != origin
+                && lf.state() == LocationFileState::Active
+                && !new_identity.matches(&super::digest::CrossLocationIdentity::from_fingerprint(
+                    lf.fingerprint(),
+                ))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,5 +919,103 @@ mod tests {
         let json = serde_json::to_value(&lf).unwrap();
         let restored: LocationFile = serde_json::from_value(json).unwrap();
         assert_eq!(restored.state(), LocationFileState::Archived);
+    }
+
+    // =========================================================================
+    // stale_candidates
+    // =========================================================================
+
+    fn cloud_loc() -> LocationId {
+        LocationId::new("cloud").unwrap()
+    }
+
+    fn fp_with_content(content_hash: &str, size: u64) -> FileFingerprint {
+        use super::super::digest::{ByteDigest, ContentDigest};
+        FileFingerprint {
+            byte_digest: Some(ByteDigest::Djb2("aaa".into())),
+            content_digest: Some(ContentDigest(content_hash.into())),
+            meta_digest: None,
+            size,
+            modified_at: None,
+        }
+    }
+
+    fn fp_cloud_no_digest(size: u64) -> FileFingerprint {
+        FileFingerprint {
+            byte_digest: None,
+            content_digest: None,
+            meta_digest: None,
+            size,
+            modified_at: None,
+        }
+    }
+
+    fn make_lf_at(file_id: &str, loc: LocationId, fp: FileFingerprint) -> LocationFile {
+        LocationFile::new(file_id.into(), loc, "a.png".into(), fp, None).unwrap()
+    }
+
+    #[test]
+    fn stale_candidates_skips_same_content_digest() {
+        let local = make_lf_at("f1", local_loc(), fp_with_content("pixhash1", 1000));
+        let cloud = make_lf_at("f1", cloud_loc(), fp_with_content("pixhash1", 1000));
+        let new_fp = fp_with_content("pixhash1", 1000);
+        let lfs = [local, cloud];
+        let result = stale_candidates(&lfs, &local_loc(), &new_fp);
+        assert!(result.is_empty(), "same content_digest → skip");
+    }
+
+    #[test]
+    fn stale_candidates_marks_different_content_digest() {
+        let local = make_lf_at("f1", local_loc(), fp_with_content("pixhash_new", 1000));
+        let cloud = make_lf_at("f1", cloud_loc(), fp_with_content("pixhash_old", 1000));
+        let new_fp = fp_with_content("pixhash_new", 1000);
+        let lfs = [local, cloud];
+        let result = stale_candidates(&lfs, &local_loc(), &new_fp);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].location_id(), &cloud_loc());
+    }
+
+    #[test]
+    fn stale_candidates_size_fallback_same() {
+        // content_digest双方None + size一致 → Staleにしない
+        let local = make_lf_at("f1", local_loc(), djb2_fp("aaa", 500));
+        let cloud = make_lf_at("f1", cloud_loc(), fp_cloud_no_digest(500));
+        let new_fp = djb2_fp("bbb", 500);
+        let lfs = [local, cloud];
+        let result = stale_candidates(&lfs, &local_loc(), &new_fp);
+        assert!(result.is_empty(), "same size, no content_digest → skip");
+    }
+
+    #[test]
+    fn stale_candidates_size_fallback_different() {
+        // content_digest双方None + size不一致 → Stale候補
+        let local = make_lf_at("f1", local_loc(), djb2_fp("aaa", 600));
+        let cloud = make_lf_at("f1", cloud_loc(), fp_cloud_no_digest(500));
+        let new_fp = djb2_fp("bbb", 600);
+        let lfs = [local, cloud];
+        let result = stale_candidates(&lfs, &local_loc(), &new_fp);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].location_id(), &cloud_loc());
+    }
+
+    #[test]
+    fn stale_candidates_excludes_origin() {
+        let local = make_lf_at("f1", local_loc(), fp_with_content("px1", 1000));
+        let new_fp = fp_with_content("px2", 2000);
+        let lfs = [local];
+        let result = stale_candidates(&lfs, &local_loc(), &new_fp);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn stale_candidates_excludes_non_active() {
+        let mut archived = make_lf_at("f1", cloud_loc(), fp_with_content("old", 1000));
+        archived.archive();
+        let mut stale = make_lf_at("f1", pod_loc(), fp_with_content("old", 1000));
+        stale.mark_stale();
+        let new_fp = fp_with_content("new", 2000);
+        let lfs = [archived, stale];
+        let result = stale_candidates(&lfs, &local_loc(), &new_fp);
+        assert!(result.is_empty(), "Archived/Stale are not candidates");
     }
 }

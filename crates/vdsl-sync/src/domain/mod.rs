@@ -9,7 +9,6 @@ pub mod location;
 pub mod location_file;
 pub mod plan;
 pub mod retry;
-pub mod scan;
 pub mod topology_delta;
 pub mod topology_file;
 pub mod transfer;

@@ -20,6 +20,7 @@ use crate::domain::file_type::FileType;
 use crate::domain::fingerprint::FileFingerprint;
 use crate::domain::location::{LocationId, SyncSummary};
 use crate::domain::view::{ErrorEntry, PendingEntry};
+use crate::infra::backend::ProgressFn;
 
 // =============================================================================
 // SDK Result types
@@ -29,7 +30,7 @@ use crate::domain::view::{ErrorEntry, PendingEntry};
 ///
 /// 旧BatchResult/SyncResult/FacadeSyncResultを統合した単一型。
 /// Serialize対応でMCP層がそのまま返せる。
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SyncReport {
     /// スキャンで検出されたファイル数。
     pub scanned: usize,
@@ -54,7 +55,7 @@ pub struct SyncReport {
 /// コンフリクト報告。SDK面の型。
 ///
 /// domain::distribute::ConflictEntry から変換して使用する。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SyncReportConflict {
     pub file_id: String,
     pub path: String,
@@ -77,7 +78,7 @@ impl From<&crate::domain::distribute::ConflictEntry> for SyncReportConflict {
 }
 
 /// 転送失敗の詳細。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SyncReportError {
     pub path: String,
     pub error: String,
@@ -172,4 +173,14 @@ pub trait SyncStoreSdk: Send + Sync {
 
     /// ローカルファイルルート。
     fn local_root(&self) -> Option<&Path>;
+
+    /// Set a progress callback for reporting phase/chunk progress.
+    ///
+    /// Called by `SyncTaskManager` before spawning sync.
+    /// The callback receives human-readable messages like:
+    /// - `"phase: scan (1200 files)"`
+    /// - `"push: chunk 5/22 (500/2111)"`
+    ///
+    /// Default: no-op.
+    fn set_progress_callback(&self, _callback: Option<ProgressFn>) {}
 }

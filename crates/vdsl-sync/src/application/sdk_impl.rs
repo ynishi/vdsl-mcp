@@ -17,7 +17,7 @@
 //! ```
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use tracing::{debug, error, info, trace, warn};
@@ -35,7 +35,7 @@ use crate::domain::graph::{EdgeCost, RouteGraph};
 use crate::domain::location::{LocationId, SyncSummary};
 use crate::domain::transfer::TransferState;
 use crate::domain::view::{ErrorEntry, PendingEntry, PresenceState};
-use crate::infra::backend::StorageBackend;
+use crate::infra::backend::{ProgressFn, StorageBackend};
 use crate::infra::location::{Location, LocationKind};
 use crate::infra::location_file_store::LocationFileStore;
 use crate::infra::location_scanner::LocationScanner;
@@ -57,6 +57,8 @@ pub struct SdkImpl {
     locations: Vec<Arc<dyn Location>>,
     config: SyncConfig,
     scan_excludes: Vec<glob::Pattern>,
+    /// Progress callback for reporting phase/chunk progress.
+    progress: StdMutex<Option<ProgressFn>>,
 }
 
 // =============================================================================
@@ -307,6 +309,7 @@ impl SdkImplBuilder {
             locations: self.locations,
             config,
             scan_excludes: self.scan_excludes,
+            progress: StdMutex::new(None),
         })
     }
 }
@@ -340,6 +343,15 @@ fn estimate_route_cost(
 }
 
 impl SdkImpl {
+    /// Report progress via the stored callback (if set).
+    fn report_progress(&self, msg: &str) {
+        if let Ok(guard) = self.progress.lock() {
+            if let Some(cb) = guard.as_ref() {
+                cb(msg);
+            }
+        }
+    }
+
     /// BFS順でTransfer実行 + DB永続化。
     ///
     /// Engine.execute_prepared()で純粋なroute I/Oを実行し、
@@ -369,6 +381,7 @@ impl SdkImpl {
                 continue;
             }
             info!(target = %target, queued = queued.len(), "execute_bfs: processing target");
+            self.report_progress(&format!("target {target}: {} queued", queued.len()));
 
             // Prepare: resolve relative_path from topology_files
             let mut prepared = Vec::with_capacity(queued.len());
@@ -606,6 +619,7 @@ impl SyncStoreSdk for SdkImpl {
 
     async fn sync(&self) -> Result<SyncReport, SyncError> {
         info!("sdk_impl::sync: pipeline start");
+        self.report_progress("ensure: checking locations");
 
         // Phase 0a: Ensure — 全拠点の到達確認 + 外部ツール確保
         // 失敗したLocationはスキャン/転送対象から除外し、syncは続行する。
@@ -659,10 +673,12 @@ impl SyncStoreSdk for SdkImpl {
         }
 
         // Phase 1: Scan → TopologyDelta[]
+        self.report_progress("scan: scanning locations");
         info!("sdk_impl::sync: phase1 scan start");
+        let progress_cb = self.progress.lock().ok().and_then(|g| g.clone());
         let scan_result = self
             .scanner
-            .scan_all(&self.scan_excludes, &failed_locations)
+            .scan_all(&self.scan_excludes, &failed_locations, progress_cb.as_ref())
             .await?;
         info!(
             scanned = scan_result.scanned,
@@ -676,6 +692,11 @@ impl SyncStoreSdk for SdkImpl {
         }
 
         // Phase 2: Plan — Apply → Distribute → Route → Transfer作成
+        self.report_progress(&format!(
+            "plan: {} files scanned, {} deltas",
+            scan_result.scanned,
+            scan_result.deltas.len()
+        ));
         info!(
             delta_count = scan_result.deltas.len(),
             "sdk_impl::sync: phase2 plan start"
@@ -688,8 +709,18 @@ impl SyncStoreSdk for SdkImpl {
         );
 
         // Phase 3: Execute — BFS順でTransfer実行 + DB永続化
+        // Propagate progress callback to all route backends for chunk-level reporting.
+        if let Ok(guard) = self.progress.lock() {
+            self.engine.set_progress_callback(guard.clone());
+        }
+        self.report_progress(&format!(
+            "execute: {} transfers queued",
+            plan_result.transfers_created
+        ));
         info!("sdk_impl::sync: phase3 execute start");
         let (transferred, failed, errors) = self.execute_bfs(&failed_locations).await?;
+        // Clear backend callbacks after execution.
+        self.engine.set_progress_callback(None);
         info!(
             transferred = transferred,
             failed = failed,
@@ -734,9 +765,14 @@ impl SyncStoreSdk for SdkImpl {
         }
 
         // Phase 1: Plan — sync_routeはdelta生成なし、Distribute + Route のみ
+        self.report_progress(&format!("plan: route {src} → {dest}"));
         let plan_result = self.topology.sync_route(src, dest).await?;
 
         // Phase 2: Execute — dest宛のQueued Transferをsrcでフィルタして実行
+        // Propagate progress callback to all route backends.
+        if let Ok(guard) = self.progress.lock() {
+            self.engine.set_progress_callback(guard.clone());
+        }
         let queued = self.transfer_store.queued_transfers(dest).await?;
         let eligible: Vec<_> = queued.into_iter().filter(|t| t.src() == src).collect();
 
@@ -769,7 +805,13 @@ impl SyncStoreSdk for SdkImpl {
             }
         }
 
+        self.report_progress(&format!(
+            "execute: {} transfers ({src} → {dest})",
+            prepared.len()
+        ));
         let outcomes = self.engine.execute_prepared(prepared).await;
+        // Clear backend callbacks after execution.
+        self.engine.set_progress_callback(None);
         let mut total_transferred = 0usize;
 
         self.persist_outcomes(
@@ -977,5 +1019,11 @@ impl SyncStoreSdk for SdkImpl {
 
     fn local_root(&self) -> Option<&Path> {
         self.engine.local_root()
+    }
+
+    fn set_progress_callback(&self, callback: Option<ProgressFn>) {
+        if let Ok(mut guard) = self.progress.lock() {
+            *guard = callback;
+        }
     }
 }

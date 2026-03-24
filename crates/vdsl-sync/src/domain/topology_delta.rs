@@ -20,7 +20,6 @@
 use super::file_type::FileType;
 use super::fingerprint::FileFingerprint;
 use super::location::LocationId;
-use super::topology_file::{ScanMatch, TopologyFile};
 
 // =============================================================================
 // Phase 1: Ingest — Location → Topology
@@ -46,8 +45,6 @@ pub enum TopologyDelta {
 /// 新規ファイル。Topologyに未登録のファイルが検出された。
 #[derive(Debug, Clone)]
 pub struct DiscoveredFile {
-    /// スキャン時に生成した仮ID（UUID v4）。Apply時にTopologyFile.idとなる。
-    pub(crate) id: String,
     pub(crate) relative_path: String,
     pub(crate) file_type: FileType,
     pub(crate) fingerprint: FileFingerprint,
@@ -103,11 +100,12 @@ pub struct VanishedFile {
 /// `TopologyDelta::from_scan_match()` の入力をまとめた構造体。
 ///
 /// 8引数を構造体に集約し、呼び出し側の可読性を向上させる。
+#[cfg(test)]
 pub struct ScanContext<'a> {
     /// TopologyFile.matches_scan()の結果。
-    pub scan_match: ScanMatch,
+    pub scan_match: super::topology_file::ScanMatch,
     /// マッチしたTopologyFile（NoMatchの場合はNone）。
-    pub topology_file: Option<&'a TopologyFile>,
+    pub topology_file: Option<&'a super::topology_file::TopologyFile>,
     /// このLocationでの既存fingerprint（None = 未登録）。
     pub location_fingerprint: Option<&'a FileFingerprint>,
     /// スキャン結果のrelative_path。
@@ -126,6 +124,7 @@ pub struct ScanContext<'a> {
 // Accessors — TopologyDelta
 // =============================================================================
 
+#[cfg(test)]
 impl TopologyDelta {
     pub fn relative_path(&self) -> &str {
         match self {
@@ -147,10 +146,10 @@ impl TopologyDelta {
 
     pub fn topology_file_id(&self) -> &str {
         match self {
-            Self::Discovered(f) => &f.id,
             Self::ContentChanged(f) => &f.topology_file_id,
             Self::Renamed(f) => &f.topology_file_id,
             Self::Vanished(f) => &f.topology_file_id,
+            Self::Discovered(_) => panic!("Discovered has no topology_file_id"),
         }
     }
 
@@ -172,20 +171,47 @@ impl TopologyDelta {
 
     /// ScanMatchからTopologyDeltaを構築するファクトリ。
     pub fn from_scan_match(ctx: ScanContext<'_>) -> Option<Self> {
-        match ctx.scan_match {
-            ScanMatch::NoMatch => {
-                // 新規ファイル
-                Some(Self::Discovered(DiscoveredFile {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    relative_path: ctx.scan_path.to_string(),
-                    file_type: ctx.scan_file_type,
-                    fingerprint: ctx.scan_fingerprint.clone(),
-                    origin: ctx.scan_origin.clone(),
-                    embedded_id: ctx.scan_embedded_id,
-                }))
+        use super::topology_file::ScanMatch;
+
+        fn content_change(
+            tf: &super::topology_file::TopologyFile,
+            location_fp: Option<&FileFingerprint>,
+            scan_path: &str,
+            scan_fp: &FileFingerprint,
+            scan_ft: FileType,
+            scan_origin: &LocationId,
+            scan_eid: Option<String>,
+        ) -> Option<TopologyDelta> {
+            let old_fp = location_fp.cloned().unwrap_or(FileFingerprint {
+                byte_digest: None,
+                content_digest: None,
+                meta_digest: None,
+                size: 0,
+                modified_at: None,
+            });
+            if location_fp.is_some_and(|fp| fp.matches_within_location(scan_fp)) {
+                return None;
             }
+            Some(TopologyDelta::ContentChanged(ContentChangedFile {
+                topology_file_id: tf.id().to_string(),
+                relative_path: scan_path.to_string(),
+                file_type: scan_ft,
+                old_fingerprint: old_fp,
+                new_fingerprint: scan_fp.clone(),
+                origin: scan_origin.clone(),
+                embedded_id: scan_eid,
+            }))
+        }
+
+        match ctx.scan_match {
+            ScanMatch::NoMatch => Some(Self::Discovered(DiscoveredFile {
+                relative_path: ctx.scan_path.to_string(),
+                file_type: ctx.scan_file_type,
+                fingerprint: ctx.scan_fingerprint.clone(),
+                origin: ctx.scan_origin.clone(),
+                embedded_id: ctx.scan_embedded_id,
+            })),
             ScanMatch::ByHash => {
-                // canonical_hash一致 + path不一致 = rename
                 let tf = ctx.topology_file?;
                 if tf.relative_path() != ctx.scan_path {
                     Some(Self::Renamed(RenamedFile {
@@ -198,8 +224,7 @@ impl TopologyDelta {
                         embedded_id: ctx.scan_embedded_id,
                     }))
                 } else {
-                    // hash一致 + path一致 → コンテンツ変更チェック
-                    check_content_change(
+                    content_change(
                         tf,
                         ctx.location_fingerprint,
                         ctx.scan_path,
@@ -211,9 +236,8 @@ impl TopologyDelta {
                 }
             }
             ScanMatch::ByPath => {
-                // path一致 → コンテンツ変更チェック
                 let tf = ctx.topology_file?;
-                check_content_change(
+                content_change(
                     tf,
                     ctx.location_fingerprint,
                     ctx.scan_path,
@@ -222,59 +246,6 @@ impl TopologyDelta {
                     ctx.scan_origin,
                     ctx.scan_embedded_id,
                 )
-            }
-        }
-    }
-}
-
-/// LocationFileのfingerprint比較でコンテンツ変更を検出する。
-///
-/// location_fingerprintがNone（このLocationに未登録）の場合、
-/// 新規追加としてContentChangedを返す。
-fn check_content_change(
-    topology_file: &TopologyFile,
-    location_fingerprint: Option<&FileFingerprint>,
-    scan_path: &str,
-    scan_fingerprint: &FileFingerprint,
-    scan_file_type: FileType,
-    scan_origin: &LocationId,
-    scan_embedded_id: Option<String>,
-) -> Option<TopologyDelta> {
-    match location_fingerprint {
-        None => {
-            // このLocationに未登録 → path一致だがLocationFileがない
-            // TopologyFileは存在するがこのLocationでは初めて → ContentChanged
-            // （他Locationで先にDiscoveredされてTopologyに登録済みのケース）
-            Some(TopologyDelta::ContentChanged(ContentChangedFile {
-                topology_file_id: topology_file.id().to_string(),
-                relative_path: scan_path.to_string(),
-                file_type: scan_file_type,
-                old_fingerprint: FileFingerprint {
-                    byte_digest: None,
-                    content_digest: None,
-                    meta_digest: None,
-                    size: 0,
-                    modified_at: None,
-                },
-                new_fingerprint: scan_fingerprint.clone(),
-                origin: scan_origin.clone(),
-                embedded_id: scan_embedded_id,
-            }))
-        }
-        Some(existing_fp) => {
-            if existing_fp.matches_within_location(scan_fingerprint) {
-                // fingerprint一致 → 変更なし
-                None
-            } else {
-                Some(TopologyDelta::ContentChanged(ContentChangedFile {
-                    topology_file_id: topology_file.id().to_string(),
-                    relative_path: scan_path.to_string(),
-                    file_type: scan_file_type,
-                    old_fingerprint: existing_fp.clone(),
-                    new_fingerprint: scan_fingerprint.clone(),
-                    origin: scan_origin.clone(),
-                    embedded_id: scan_embedded_id,
-                }))
             }
         }
     }
@@ -301,7 +272,7 @@ impl std::fmt::Display for TopologyDelta {
 mod tests {
     use super::*;
     use crate::domain::test_helpers::{cloud, cloud_fp, content_fp, local, local_fp, pod};
-    use crate::domain::topology_file::TopologyFile;
+    use crate::domain::topology_file::{ScanMatch, TopologyFile};
 
     // =========================================================================
     // TopologyDelta — accessors
@@ -310,7 +281,6 @@ mod tests {
     #[test]
     fn discovered_accessors() {
         let delta = TopologyDelta::Discovered(DiscoveredFile {
-            id: "uuid-1".into(),
             relative_path: "output/001.png".into(),
             file_type: FileType::Image,
             fingerprint: local_fp("abc", 1024),
@@ -319,7 +289,6 @@ mod tests {
         });
         assert_eq!(delta.relative_path(), "output/001.png");
         assert_eq!(delta.origin(), &local());
-        assert_eq!(delta.topology_file_id(), "uuid-1");
         assert!(delta.is_discovered());
         assert!(!delta.is_content_changed());
         assert!(!delta.is_renamed());
@@ -375,7 +344,6 @@ mod tests {
     #[test]
     fn display_discovered() {
         let delta = TopologyDelta::Discovered(DiscoveredFile {
-            id: "id".into(),
             relative_path: "a.png".into(),
             file_type: FileType::Image,
             fingerprint: local_fp("h", 10),

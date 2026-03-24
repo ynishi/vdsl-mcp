@@ -5,9 +5,9 @@
 
 use async_trait::async_trait;
 
-use crate::application::error::SyncError;
 use crate::domain::location::LocationId;
 use crate::domain::location_file::LocationFile;
+use crate::infra::error::InfraError;
 
 /// LocationFile永続化。
 ///
@@ -18,19 +18,19 @@ pub trait LocationFileStore: Send + Sync {
     /// LocationFileを保存（新規 or 更新）。
     ///
     /// `(file_id, location_id)` が既存ならUPDATE、なければINSERT。
-    async fn upsert(&self, file: &LocationFile) -> Result<(), SyncError>;
+    async fn upsert(&self, file: &LocationFile) -> Result<(), InfraError>;
 
     /// `(file_id, location_id)` でLocationFileを取得。
     async fn get(
         &self,
         file_id: &str,
         location_id: &LocationId,
-    ) -> Result<Option<LocationFile>, SyncError>;
+    ) -> Result<Option<LocationFile>, InfraError>;
 
     /// あるファイルの全Location分のLocationFileを取得。
     ///
     /// distribute_actions()の入力用: file_id → Vec<LocationFile>。
-    async fn list_by_file(&self, file_id: &str) -> Result<Vec<LocationFile>, SyncError>;
+    async fn list_by_file(&self, file_id: &str) -> Result<Vec<LocationFile>, InfraError>;
 
     /// あるLocationの全LocationFileを取得。
     ///
@@ -38,7 +38,7 @@ pub trait LocationFileStore: Send + Sync {
     async fn list_by_location(
         &self,
         location_id: &LocationId,
-    ) -> Result<Vec<LocationFile>, SyncError>;
+    ) -> Result<Vec<LocationFile>, InfraError>;
 
     /// 複数ファイルの全LocationFileを一括取得。
     ///
@@ -47,11 +47,11 @@ pub trait LocationFileStore: Send + Sync {
     async fn list_by_files(
         &self,
         file_ids: &[&str],
-    ) -> Result<std::collections::HashMap<String, Vec<LocationFile>>, SyncError>;
+    ) -> Result<std::collections::HashMap<String, Vec<LocationFile>>, InfraError>;
 
     /// LocationFileを削除。削除した場合true。
-    async fn delete(&self, file_id: &str, location_id: &LocationId) -> Result<bool, SyncError>;
+    async fn delete(&self, file_id: &str, location_id: &LocationId) -> Result<bool, InfraError>;
 
     /// あるLocationのLocationFile数。
-    async fn count_by_location(&self, location_id: &LocationId) -> Result<usize, SyncError>;
+    async fn count_by_location(&self, location_id: &LocationId) -> Result<usize, InfraError>;
 }

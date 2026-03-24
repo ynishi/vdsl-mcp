@@ -242,7 +242,10 @@ impl LocationScanner for SshScanner {
         })?;
 
         // Phase 1: find でファイルリスト取得
-        let find_cmd = format!("find {} -type f -not -name '.*'", root_str);
+        let find_cmd = format!(
+            "find '{}' -type f -not -name '.*'",
+            root_str.replace('\'', "'\\''")
+        );
         let output = self
             .shell
             .exec(&["bash", "-c", &find_cmd], Some(60))

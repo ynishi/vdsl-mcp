@@ -17,17 +17,6 @@ use crate::infra::backend::StorageBackend;
 use crate::infra::error::InfraError;
 use crate::infra::shell::RemoteShell;
 
-/// A file discovered during source-side scan.
-#[derive(Debug, Clone)]
-pub struct SrcFile {
-    /// Relative path from `src_file_root`.
-    pub relative_path: String,
-    /// File size in bytes (when available).
-    pub size: Option<u64>,
-    /// Last modification time (when available from backend metadata).
-    pub modified_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
 /// Direction of file transfer relative to the rclone remote.
 ///
 /// - `Push`: src is a "local" filesystem path, dest is a rclone remote path.
@@ -187,10 +176,6 @@ impl TransferRoute {
         &self.src_file_root
     }
 
-    pub fn dest_file_root(&self) -> &Path {
-        &self.dest_file_root
-    }
-
     /// Whether this route is a pull-direction transfer.
     ///
     /// Pull routes have a remote (e.g. rclone) source that cannot be checked
@@ -200,21 +185,9 @@ impl TransferRoute {
         self.direction == TransferDirection::Pull
     }
 
-    /// Whether this route has a source shell for remote operations.
-    ///
-    /// When false and the route is Pull direction, the source is Cloud storage
-    /// where per-file hash computation requires downloading. In this case,
-    /// metadata-based change detection (size comparison) should be used instead.
-    pub fn has_src_shell(&self) -> bool {
-        self.src_shell.is_some()
-    }
-
-    /// Whether the source is Cloud storage (Pull + no shell).
-    ///
-    /// Cloud sources cannot compute content hashes without downloading files.
-    /// Use metadata-based change detection (size, mtime) instead.
-    pub fn is_cloud_source(&self) -> bool {
-        self.is_pull() && !self.has_src_shell()
+    /// Access the underlying storage backend.
+    pub(crate) fn backend(&self) -> &dyn StorageBackend {
+        &*self.backend
     }
 
     /// Transfer a file along this route.
@@ -241,7 +214,10 @@ impl TransferRoute {
                     }
                     .into()
                 })?;
-                self.backend.push(&src_path, dest_str).await
+                self.backend
+                    .push(&src_path, dest_str)
+                    .await
+                    .map_err(Into::into)
             }
             TransferDirection::Pull => {
                 let src_str = src_path.to_str().ok_or_else(|| -> SyncError {
@@ -253,7 +229,10 @@ impl TransferRoute {
                     }
                     .into()
                 })?;
-                self.backend.pull(src_str, &dest_path).await
+                self.backend
+                    .pull(src_str, &dest_path)
+                    .await
+                    .map_err(Into::into)
             }
         }
     }
@@ -278,7 +257,7 @@ impl TransferRoute {
                     }
                     .into()
                 })?;
-                self.backend.delete(dest_str).await
+                self.backend.delete(dest_str).await.map_err(Into::into)
             }
             TransferDirection::Pull => {
                 // dest is local — remove from filesystem
@@ -326,12 +305,18 @@ impl TransferRoute {
                 self.backend
                     .push_batch(&self.src_file_root, dest_root_str, relative_paths)
                     .await
+                    .into_iter()
+                    .map(|(k, v)| (k, v.map_err(Into::into)))
+                    .collect()
             }
             TransferDirection::Pull => {
                 let src_root_str = self.src_file_root.to_str().unwrap_or_default();
                 self.backend
                     .pull_batch(src_root_str, &self.dest_file_root, relative_paths)
                     .await
+                    .into_iter()
+                    .map(|(k, v)| (k, v.map_err(Into::into)))
+                    .collect()
             }
         }
     }
@@ -371,6 +356,9 @@ impl TransferRoute {
                 self.backend
                     .delete_batch(dest_root_str, relative_paths)
                     .await
+                    .into_iter()
+                    .map(|(k, v)| (k, v.map_err(Into::into)))
+                    .collect()
             }
             TransferDirection::Pull => {
                 // Pull direction: dest is local filesystem — delete individually
@@ -387,16 +375,6 @@ impl TransferRoute {
     /// Whether the backend supports efficient batch operations.
     pub fn supports_batch(&self) -> bool {
         self.backend.supports_batch()
-    }
-
-    /// The backend held by this route (for list/exists/pull operations).
-    pub fn backend(&self) -> &dyn StorageBackend {
-        self.backend.as_ref()
-    }
-
-    /// The source shell, if this route has a remote source.
-    pub fn src_shell(&self) -> Option<&dyn RemoteShell> {
-        self.src_shell.as_deref()
     }
 
     /// Check whether the source file exists for this route.
@@ -431,331 +409,6 @@ impl TransferRoute {
                 Ok(output.success)
             }
         }
-    }
-
-    /// Check whether the destination file exists for this route.
-    ///
-    /// - Push (dest = cloud): uses `backend.exists()`
-    /// - Pull (dest = local): uses `tokio::fs::try_exists`
-    ///
-    /// Returns `Ok(true)` if file exists, `Ok(false)` if not.
-    pub async fn dest_file_exists(&self, relative_path: &str) -> Result<bool, SyncError> {
-        Self::validate_relative_path(relative_path)?;
-        let dest_path = Self::safe_join(&self.dest_file_root, relative_path);
-
-        match self.direction {
-            TransferDirection::Push => {
-                // Dest is cloud — use backend
-                let dest_str = dest_path.to_str().ok_or_else(|| -> SyncError {
-                    InfraError::Transfer {
-                        reason: format!(
-                            "dest path is not valid UTF-8: {}",
-                            dest_path.to_string_lossy()
-                        ),
-                    }
-                    .into()
-                })?;
-                self.backend.exists(dest_str).await
-            }
-            TransferDirection::Pull => {
-                // Dest is local — filesystem check
-                tokio::fs::try_exists(&dest_path)
-                    .await
-                    .map_err(SyncError::from)
-            }
-        }
-    }
-
-    /// Inspect a source file: compute hash and size via RemoteShell.
-    ///
-    /// - Local source: delegates to the provided `local_hasher`
-    /// - Remote source: uses `sha256sum` + `stat --format=%s` (GNU coreutils) via shell
-    ///
-    /// Returns `(file_hash, file_size)`. `content_hash` is not available
-    /// for remote files (would require PNG parsing on remote host).
-    ///
-    /// # Platform assumption
-    ///
-    /// `stat --format=%s` is GNU coreutils syntax (Linux).
-    /// BSD `stat` uses `-f%z` instead. RunPod containers use Linux,
-    /// so this is safe for the current use case. If BSD support is
-    /// needed, detect the platform or use `wc -c < file` as fallback.
-    ///
-    /// # WARNING: Hash algorithm mismatch
-    ///
-    /// Local files are hashed with DJB2 (via `ContentHasher`), while remote
-    /// files use SHA-256 (via `sha256sum`). This means **the same file will
-    /// produce different `file_hash` values** depending on whether it was
-    /// registered locally (`notify()`) or remotely (`notify_remote()`).
-    ///
-    /// Consequence: `find_duplicate()` cannot detect cross-origin duplicates.
-    /// A file notified on pod and the same file notified locally will be
-    /// treated as two distinct entries.
-    ///
-    /// Future fix: unify hash algorithm (e.g. SHA-256 everywhere) or store
-    /// algorithm identifier alongside the hash for cross-comparison.
-    pub async fn inspect_src_file(
-        &self,
-        relative_path: &str,
-        local_hasher: &dyn crate::infra::hasher::ContentHasher,
-    ) -> Result<(crate::infra::hasher::HashResult, Option<u64>), SyncError> {
-        Self::validate_relative_path(relative_path)?;
-        let full_path = self.src_file_root.join(relative_path);
-
-        match &self.src_shell {
-            None => {
-                // Local: use ContentHasher (DJB2 + PNG semantic hash)
-                let result = local_hasher.hash_file(&full_path)?;
-                let size = tokio::fs::metadata(&full_path).await.map(|m| m.len()).ok();
-                Ok((result, size))
-            }
-            Some(shell) => {
-                // Remote: sha256sum for file_hash, stat for size
-                let path_str = full_path.to_str().ok_or_else(|| -> SyncError {
-                    InfraError::Transfer {
-                        reason: format!(
-                            "src path is not valid UTF-8: {}",
-                            full_path.to_string_lossy()
-                        ),
-                    }
-                    .into()
-                })?;
-
-                let hash_output = shell.exec(&["sha256sum", path_str], Some(30)).await?;
-                if !hash_output.success {
-                    return Err(InfraError::Hash {
-                        op: "remote",
-                        reason: format!(
-                            "sha256sum failed on remote: {}",
-                            hash_output.stderr.trim()
-                        ),
-                    }
-                    .into());
-                }
-                let file_hash = hash_output
-                    .stdout
-                    .split_whitespace()
-                    .next()
-                    .ok_or_else(|| -> SyncError {
-                        InfraError::Hash {
-                            op: "remote",
-                            reason: "sha256sum returned empty output".into(),
-                        }
-                        .into()
-                    })?
-                    .to_string();
-
-                // stat for file size (GNU format)
-                let stat_output = shell
-                    .exec(&["stat", "--format=%s", path_str], Some(10))
-                    .await?;
-                let file_size = if stat_output.success {
-                    stat_output.stdout.trim().parse::<u64>().ok()
-                } else {
-                    None
-                };
-
-                Ok((
-                    crate::infra::hasher::HashResult {
-                        file_hash,
-                        content_hash: None, // PNG semantic hash not available remotely
-                    },
-                    file_size,
-                ))
-            }
-        }
-    }
-
-    /// List all files at the source location of this route.
-    ///
-    /// Returns relative paths from `src_file_root`.
-    ///
-    /// - Push + no src_shell → local filesystem recursive scan
-    /// - Push + src_shell → `find <src_file_root> -type f` via shell
-    /// - Pull → `backend.list(src_file_root)` (source is on the remote/cloud side)
-    pub async fn list_src_files(&self) -> Result<Vec<SrcFile>, SyncError> {
-        match self.direction {
-            TransferDirection::Pull => {
-                // Source is on the remote/cloud side — use backend.list()
-                let root_str = self.src_file_root.to_str().ok_or_else(|| -> SyncError {
-                    InfraError::Transfer {
-                        reason: format!(
-                            "src_file_root is not valid UTF-8: {}",
-                            self.src_file_root.to_string_lossy()
-                        ),
-                    }
-                    .into()
-                })?;
-                let remote_files = self.backend.list(root_str).await?;
-                Ok(remote_files
-                    .into_iter()
-                    .map(|rf| SrcFile {
-                        relative_path: rf.path,
-                        size: rf.size,
-                        modified_at: rf.modified_at,
-                    })
-                    .collect())
-            }
-            TransferDirection::Push => match &self.src_shell {
-                None => {
-                    // Local filesystem recursive scan
-                    self.list_local_files().await
-                }
-                Some(shell) => {
-                    // Remote host: `find <root> -type f` via shell
-                    let root_str = self.src_file_root.to_str().ok_or_else(|| -> SyncError {
-                        InfraError::Transfer {
-                            reason: format!(
-                                "src_file_root is not valid UTF-8: {}",
-                                self.src_file_root.to_string_lossy()
-                            ),
-                        }
-                        .into()
-                    })?;
-                    let output = shell
-                        .exec(
-                            &["find", root_str, "-type", "f", "-printf", "%P\\n"],
-                            Some(60),
-                        )
-                        .await?;
-                    if !output.success {
-                        return Err(SyncError::from(InfraError::Transfer {
-                            reason: format!(
-                                "remote find failed (exit={:?}): {}",
-                                output.exit_code,
-                                output.stderr.trim()
-                            ),
-                        }));
-                    }
-                    Ok(output
-                        .stdout
-                        .lines()
-                        .filter(|l| !l.is_empty())
-                        .map(|l| SrcFile {
-                            relative_path: l.to_string(),
-                            size: None, // size resolved later via inspect_src_file
-                            modified_at: None,
-                        })
-                        .collect())
-                }
-            },
-        }
-    }
-
-    /// Recursive local directory listing (relative paths from src_file_root).
-    ///
-    /// Resilient: individual entry failures (permission denied, broken symlinks,
-    /// FUSE mount errors) are logged and skipped — they never abort the scan.
-    /// Only the initial `read_dir(root)` failure propagates as `Err`.
-    async fn list_local_files(&self) -> Result<Vec<SrcFile>, SyncError> {
-        let root = &self.src_file_root;
-        if !root.is_dir() {
-            return Ok(Vec::new());
-        }
-
-        let mut result = Vec::new();
-        let mut stack = vec![root.to_path_buf()];
-
-        while let Some(dir) = stack.pop() {
-            let mut read_dir = match tokio::fs::read_dir(&dir).await {
-                Ok(rd) => rd,
-                Err(e) => {
-                    // Skip unreadable subdirectories (permission denied, etc.)
-                    // but propagate root-level failure.
-                    if dir == *root {
-                        return Err(SyncError::from(e));
-                    }
-                    tracing::warn!(
-                        dir = %dir.display(),
-                        error = %e,
-                        "skipping unreadable directory during scan"
-                    );
-                    continue;
-                }
-            };
-            loop {
-                let entry = match read_dir.next_entry().await {
-                    Ok(Some(e)) => e,
-                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::warn!(
-                            dir = %dir.display(),
-                            error = %e,
-                            "skipping entry due to read error"
-                        );
-                        continue;
-                    }
-                };
-                let ft = match entry.file_type().await {
-                    Ok(ft) => ft,
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %entry.path().display(),
-                            error = %e,
-                            "skipping entry: file_type failed"
-                        );
-                        continue;
-                    }
-                };
-                // Symlinks: follow to resolve actual type.
-                // DirEntry::file_type() does NOT follow symlinks on Unix,
-                // so symlinks appear as is_symlink()=true, is_file()=false.
-                // We follow them via metadata() to get the target type.
-                let (effective_ft, is_symlink) = if ft.is_symlink() {
-                    match tokio::fs::metadata(entry.path()).await {
-                        Ok(meta) => (meta.file_type(), true),
-                        Err(e) => {
-                            // Broken symlink — target doesn't exist
-                            tracing::debug!(
-                                path = %entry.path().display(),
-                                error = %e,
-                                "skipping broken symlink"
-                            );
-                            continue;
-                        }
-                    }
-                } else {
-                    (ft, false)
-                };
-
-                if effective_ft.is_dir() {
-                    if is_symlink {
-                        // Symlink → directory: skip to avoid infinite loops
-                        // (e.g. workspace → ../repo creates cycles).
-                        tracing::debug!(
-                            path = %entry.path().display(),
-                            "skipping symlink to directory"
-                        );
-                    } else {
-                        stack.push(entry.path());
-                    }
-                } else if effective_ft.is_file() {
-                    if let Ok(rel) = entry.path().strip_prefix(root) {
-                        if let Some(s) = rel.to_str() {
-                            let meta = tokio::fs::metadata(entry.path()).await.ok();
-                            // Truncate to seconds: SQLite stores timestamps
-                            // with SecondsFormat::Secs, so sub-second precision
-                            // would cause incremental scan mtime mismatches.
-                            let modified_at = meta.as_ref().and_then(|m| {
-                                m.modified().ok().map(|st| {
-                                    let dt = chrono::DateTime::<chrono::Utc>::from(st);
-                                    chrono::DateTime::from_timestamp(dt.timestamp(), 0)
-                                        .unwrap_or(dt)
-                                })
-                            });
-                            result.push(SrcFile {
-                                relative_path: s.to_string(),
-                                size: meta.map(|m| m.len()),
-                                modified_at,
-                            });
-                        }
-                    }
-                }
-                // sockets, fifos, etc. — silently skipped
-            }
-        }
-
-        Ok(result)
     }
 
     // --- internal helpers ---

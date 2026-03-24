@@ -2,11 +2,10 @@
 
 use rusqlite::Connection;
 
-use crate::application::error::SyncError;
 use crate::infra::error::InfraError;
 
 /// Per-connection initialization: PRAGMAs that must be set on every connection.
-pub(crate) fn init_connection(conn: &mut Connection) -> Result<(), SyncError> {
+pub(crate) fn init_connection(conn: &mut Connection) -> Result<(), InfraError> {
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA foreign_keys = ON;
@@ -20,7 +19,7 @@ pub(crate) fn init_connection(conn: &mut Connection) -> Result<(), SyncError> {
     Ok(())
 }
 
-fn create_tables(conn: &mut Connection) -> Result<(), SyncError> {
+fn create_tables(conn: &mut Connection) -> Result<(), InfraError> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS sync_remotes (
@@ -99,6 +98,16 @@ fn create_tables(conn: &mut Connection) -> Result<(), SyncError> {
         CREATE INDEX IF NOT EXISTS idx_transfers_file_dest ON transfers(file_id, dest, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_transfers_state ON transfers(state);
         CREATE INDEX IF NOT EXISTS idx_transfers_depends_on ON transfers(depends_on);
+
+        CREATE TABLE IF NOT EXISTS sync_tasks (
+            task_id     TEXT PRIMARY KEY,
+            status      TEXT NOT NULL DEFAULT 'pending',
+            phase       TEXT NOT NULL DEFAULT '',
+            result_json TEXT,
+            error       TEXT,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        );
         ",
     )
     .map_err(|e| InfraError::Store {

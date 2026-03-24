@@ -81,6 +81,7 @@ impl RouteGraph {
     }
 
     /// Add a directed edge with default cost. Self-loops are silently ignored.
+    #[cfg(test)]
     pub fn add(&mut self, src: LocationId, dest: LocationId) {
         self.add_with_cost(src, dest, EdgeCost::default());
     }
@@ -93,6 +94,7 @@ impl RouteGraph {
     }
 
     /// Remove a directed edge. No-op if the edge does not exist.
+    #[cfg(test)]
     pub fn remove(&mut self, src: &LocationId, dest: &LocationId) {
         if let Some(dests) = self.adj.get_mut(src) {
             dests.remove(dest);
@@ -103,6 +105,7 @@ impl RouteGraph {
     }
 
     /// Whether a direct edge exists from `src` to `dest`.
+    #[cfg(test)]
     pub fn has(&self, src: &LocationId, dest: &LocationId) -> bool {
         self.adj
             .get(src)
@@ -110,6 +113,7 @@ impl RouteGraph {
     }
 
     /// Get the cost of an edge, if it exists.
+    #[cfg(test)]
     pub fn edge_cost(&self, src: &LocationId, dest: &LocationId) -> Option<&EdgeCost> {
         self.adj.get(src).and_then(|dests| dests.get(dest))
     }
@@ -126,6 +130,7 @@ impl RouteGraph {
     ///
     /// The result does **not** include `origin` itself, even if there is a
     /// cycle back to it.
+    #[cfg(test)]
     pub fn reachable_from(&self, origin: &LocationId) -> HashSet<LocationId> {
         self.bfs_from(origin).into_iter().collect()
     }
@@ -390,16 +395,13 @@ impl RouteGraph {
     }
 
     /// Number of edges.
+    #[cfg(test)]
     pub fn edge_count(&self) -> usize {
         self.adj.values().map(|dests| dests.len()).sum()
     }
 }
 
 impl super::plan::Topology for RouteGraph {
-    fn reachable_from(&self, origin: &LocationId) -> HashSet<LocationId> {
-        self.reachable_from(origin)
-    }
-
     fn optimal_tree(
         &self,
         origin: &LocationId,

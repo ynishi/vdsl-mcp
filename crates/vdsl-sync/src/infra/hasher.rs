@@ -12,7 +12,6 @@
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::application::error::SyncError;
 use crate::infra::error::InfraError;
 
 /// Result of hashing a file.
@@ -33,7 +32,7 @@ pub trait ContentHasher: Send + Sync {
     ///
     /// `file_hash` is always computed. `content_hash` is computed
     /// only for supported formats (e.g. PNG).
-    fn hash_file(&self, path: &Path) -> Result<HashResult, SyncError>;
+    fn hash_file(&self, path: &Path) -> Result<HashResult, InfraError>;
 }
 
 /// Default hasher: DJB2 for all files + PNG IHDR+IDAT semantic hash.
@@ -44,7 +43,7 @@ pub trait ContentHasher: Send + Sync {
 pub struct Djb2Hasher;
 
 impl ContentHasher for Djb2Hasher {
-    fn hash_file(&self, path: &Path) -> Result<HashResult, SyncError> {
+    fn hash_file(&self, path: &Path) -> Result<HashResult, InfraError> {
         let file_hash = djb2_file_hash(path)?;
 
         // content_hash is format-specific. Currently only PNG is supported.
@@ -54,9 +53,10 @@ impl ContentHasher for Djb2Hasher {
             match png_image_hash(path) {
                 Ok(h) => Some(h),
                 Err(e) => {
-                    eprintln!(
-                        "[WARN] png content_hash failed for {}: {e} — falling back to file_hash only",
-                        path.display()
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "png content_hash failed — falling back to file_hash only"
                     );
                     None
                 }
@@ -76,7 +76,7 @@ impl ContentHasher for Djb2Hasher {
 ///
 /// Reads file in 8KB chunks for memory efficiency.
 /// Returns 16-char hex string (`%016x`).
-pub fn djb2_file_hash(path: &Path) -> Result<String, SyncError> {
+pub fn djb2_file_hash(path: &Path) -> Result<String, InfraError> {
     let file = std::fs::File::open(path).map_err(|e| InfraError::Hash {
         op: "djb2",
         reason: format!("open failed: {e}"),
@@ -108,7 +108,7 @@ pub fn djb2_file_hash(path: &Path) -> Result<String, SyncError> {
 /// 1. Verify PNG signature
 /// 2. Walk chunks, for IHDR and IDAT: feed chunk_type + chunk_data into DJB2
 /// 3. Return 16-char hex string (`%016x`)
-pub fn png_image_hash(path: &Path) -> Result<String, SyncError> {
+pub fn png_image_hash(path: &Path) -> Result<String, InfraError> {
     let file = std::fs::File::open(path).map_err(|e| InfraError::Hash {
         op: "png",
         reason: format!("open failed: {e}"),
@@ -125,8 +125,7 @@ pub fn png_image_hash(path: &Path) -> Result<String, SyncError> {
         return Err(InfraError::Hash {
             op: "png",
             reason: "not a valid PNG file".into(),
-        }
-        .into());
+        });
     }
 
     let mut h: u64 = 5381;
@@ -141,8 +140,7 @@ pub fn png_image_hash(path: &Path) -> Result<String, SyncError> {
                 return Err(InfraError::Hash {
                     op: "png",
                     reason: format!("read chunk header failed: {e}"),
-                }
-                .into())
+                })
             }
         }
         // u32 → u64: always lossless (max 4_294_967_295). Further bounded by MAX_CHUNK_LEN below.
@@ -153,8 +151,7 @@ pub fn png_image_hash(path: &Path) -> Result<String, SyncError> {
             return Err(InfraError::Hash {
                 op: "png",
                 reason: format!("chunk length exceeds PNG spec maximum: {length}"),
-            }
-            .into());
+            });
         }
         let chunk_type = &header[4..8];
 
@@ -212,8 +209,7 @@ pub fn png_image_hash(path: &Path) -> Result<String, SyncError> {
         return Err(InfraError::Hash {
             op: "png",
             reason: "truncated PNG: IEND chunk not found".into(),
-        }
-        .into());
+        });
     }
 
     Ok(format!("{h:016x}"))

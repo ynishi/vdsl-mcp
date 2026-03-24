@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 
-use vdsl_sync::{FileInspection, InfraError, RemoteShell, ShellOutput, SyncError};
+use vdsl_sync::{FileInspection, InfraError, RemoteShell, ShellOutput};
 
 use super::runpod_cli::RunPodCli;
 
@@ -62,27 +62,23 @@ impl RemoteShell for RunPodCliShell {
         &self,
         args: &[&str],
         timeout_secs: Option<u64>,
-    ) -> Result<ShellOutput, SyncError> {
+    ) -> Result<ShellOutput, InfraError> {
         if args.is_empty() {
             return Err(InfraError::Transfer {
                 reason: "empty command".into(),
-            }
-            .into());
+            });
         }
 
         let result = self
             .cli
             .pod_exec(&self.pod_id, args, self.ssh_key.as_deref(), timeout_secs)
             .await
-            .map_err(|e| -> SyncError {
-                InfraError::Transfer {
-                    reason: format!(
-                        "pod exec failed on pod={}, cmd={}: {e}",
-                        self.pod_id,
-                        args.join(" ")
-                    ),
-                }
-                .into()
+            .map_err(|e| InfraError::Transfer {
+                reason: format!(
+                    "pod exec failed on pod={}, cmd={}: {e}",
+                    self.pod_id,
+                    args.join(" ")
+                ),
             })?;
 
         Ok(ShellOutput {
@@ -104,32 +100,26 @@ impl RemoteShell for RunPodCliShell {
         &self,
         script: &str,
         timeout_secs: Option<u64>,
-    ) -> Result<ShellOutput, SyncError> {
-        let ssh_key = self.ssh_key.as_deref().ok_or_else(|| -> SyncError {
-            InfraError::Transfer {
+    ) -> Result<ShellOutput, InfraError> {
+        let ssh_key = self
+            .ssh_key
+            .as_deref()
+            .ok_or_else(|| InfraError::Transfer {
                 reason: "exec_script requires ssh_key for task execution".into(),
-            }
-            .into()
-        })?;
+            })?;
 
         let task_result = self
             .cli
             .task_run_script(&self.pod_id, script, ssh_key)
             .await
-            .map_err(|e| -> SyncError {
-                InfraError::Transfer {
-                    reason: format!("exec_script task_run_script failed: {e}"),
-                }
-                .into()
+            .map_err(|e| InfraError::Transfer {
+                reason: format!("exec_script task_run_script failed: {e}"),
             })?;
 
         let job_id = task_result["id"]
             .as_str()
-            .ok_or_else(|| -> SyncError {
-                InfraError::Transfer {
-                    reason: format!("exec_script task_run returned no job id: {task_result:?}"),
-                }
-                .into()
+            .ok_or_else(|| InfraError::Transfer {
+                reason: format!("exec_script task_run returned no job id: {task_result:?}"),
             })?
             .to_string();
 
@@ -145,11 +135,8 @@ impl RemoteShell for RunPodCliShell {
                 .cli
                 .task_status(&self.pod_id, &job_id, ssh_key)
                 .await
-                .map_err(|e| -> SyncError {
-                    InfraError::Transfer {
-                        reason: format!("exec_script task_status failed: {e}"),
-                    }
-                    .into()
+                .map_err(|e| InfraError::Transfer {
+                    reason: format!("exec_script task_status failed: {e}"),
                 })?;
 
             let state = status["state"].as_str().unwrap_or("unknown");
@@ -167,8 +154,7 @@ impl RemoteShell for RunPodCliShell {
                     reason: format!(
                         "exec_script timed out after {timeout}s (job_id={job_id}, last state={state})"
                     ),
-                }
-                .into());
+                });
             }
 
             interval = (interval * 2).min(BATCH_INSPECT_POLL_MAX_SECS);
@@ -179,11 +165,8 @@ impl RemoteShell for RunPodCliShell {
             .cli
             .task_log(&self.pod_id, &job_id, ssh_key, None)
             .await
-            .map_err(|e| -> SyncError {
-                InfraError::Transfer {
-                    reason: format!("exec_script task_log failed: {e}"),
-                }
-                .into()
+            .map_err(|e| InfraError::Transfer {
+                reason: format!("exec_script task_log failed: {e}"),
             })?;
 
         let stdout = log_result["log"].as_str().unwrap_or("").to_string();
@@ -210,17 +193,17 @@ impl RemoteShell for RunPodCliShell {
         &self,
         root: &str,
         relative_paths: &[String],
-    ) -> Result<Vec<FileInspection>, SyncError> {
+    ) -> Result<Vec<FileInspection>, InfraError> {
         if relative_paths.is_empty() {
             return Ok(Vec::new());
         }
 
-        let ssh_key = self.ssh_key.as_deref().ok_or_else(|| -> SyncError {
-            InfraError::Transfer {
+        let ssh_key = self
+            .ssh_key
+            .as_deref()
+            .ok_or_else(|| InfraError::Transfer {
                 reason: "batch_inspect requires ssh_key for task execution".into(),
-            }
-            .into()
-        })?;
+            })?;
 
         // Build the inspection script: one sh that processes all files.
         // Uses task_run_script (SCP upload) to avoid shell escaping issues.
@@ -243,20 +226,14 @@ impl RemoteShell for RunPodCliShell {
             .cli
             .task_run_script(&self.pod_id, &script, ssh_key)
             .await
-            .map_err(|e| -> SyncError {
-                InfraError::Transfer {
-                    reason: format!("batch_inspect task_run failed: {e}"),
-                }
-                .into()
+            .map_err(|e| InfraError::Transfer {
+                reason: format!("batch_inspect task_run failed: {e}"),
             })?;
 
         let job_id = task_result["id"]
             .as_str()
-            .ok_or_else(|| -> SyncError {
-                InfraError::Transfer {
-                    reason: format!("batch_inspect task_run returned no job id: {task_result:?}"),
-                }
-                .into()
+            .ok_or_else(|| InfraError::Transfer {
+                reason: format!("batch_inspect task_run returned no job id: {task_result:?}"),
             })?
             .to_string();
 
@@ -279,11 +256,8 @@ impl RemoteShell for RunPodCliShell {
                 .cli
                 .task_status(&self.pod_id, &job_id, ssh_key)
                 .await
-                .map_err(|e| -> SyncError {
-                    InfraError::Transfer {
-                        reason: format!("batch_inspect task_status failed: {e}"),
-                    }
-                    .into()
+                .map_err(|e| InfraError::Transfer {
+                    reason: format!("batch_inspect task_status failed: {e}"),
                 })?;
 
             let state = status["state"].as_str().unwrap_or("unknown");
@@ -300,8 +274,7 @@ impl RemoteShell for RunPodCliShell {
                         reason: format!(
                             "batch_inspect task exited with code {exit_code}: {log_snippet}"
                         ),
-                    }
-                    .into());
+                    });
                 }
                 break;
             }
@@ -313,8 +286,7 @@ impl RemoteShell for RunPodCliShell {
                          (job_id={job_id}, last state={state}, files={})",
                         relative_paths.len()
                     ),
-                }
-                .into());
+                });
             }
 
             // Exponential backoff capped at BATCH_INSPECT_POLL_MAX_SECS
@@ -326,11 +298,8 @@ impl RemoteShell for RunPodCliShell {
             .cli
             .task_log(&self.pod_id, &job_id, ssh_key, None)
             .await
-            .map_err(|e| -> SyncError {
-                InfraError::Transfer {
-                    reason: format!("batch_inspect task_log failed: {e}"),
-                }
-                .into()
+            .map_err(|e| InfraError::Transfer {
+                reason: format!("batch_inspect task_log failed: {e}"),
             })?;
 
         let stdout = log_result["log"].as_str().unwrap_or("");

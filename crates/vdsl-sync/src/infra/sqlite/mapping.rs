@@ -5,7 +5,6 @@
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 
-use crate::application::error::SyncError;
 use crate::domain::file_type::FileType;
 use crate::domain::fingerprint::FileFingerprint;
 use crate::domain::location::LocationId;
@@ -23,15 +22,12 @@ pub(crate) fn ts_to_string(dt: DateTime<Utc>) -> String {
 }
 
 /// Parse an RFC 3339 string from SQLite into DateTime<Utc>.
-pub(crate) fn parse_ts(s: &str) -> Result<DateTime<Utc>, SyncError> {
+pub(crate) fn parse_ts(s: &str) -> Result<DateTime<Utc>, InfraError> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|_| {
-            InfraError::Store {
-                op: "sqlite",
-                reason: format!("corrupt timestamp in DB: {s:?}"),
-            }
-            .into()
+        .map_err(|_| InfraError::Store {
+            op: "sqlite",
+            reason: format!("corrupt timestamp in DB: {s:?}"),
         })
 }
 
@@ -74,7 +70,7 @@ pub(crate) fn row_to_transfer_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<T
     })
 }
 
-pub(crate) fn build_transfer(r: TransferRow) -> Result<Transfer, SyncError> {
+pub(crate) fn build_transfer(r: TransferRow) -> Result<Transfer, InfraError> {
     let src = LocationId::new(&r.src).map_err(|_| InfraError::Store {
         op: "sqlite",
         reason: format!("corrupt src in transfers: {:?} (id {})", r.src, r.id),
@@ -133,7 +129,7 @@ pub(crate) fn query_transfers(
     conn: &Connection,
     sql: &str,
     params: &[&dyn rusqlite::types::ToSql],
-) -> Result<Vec<Transfer>, SyncError> {
+) -> Result<Vec<Transfer>, InfraError> {
     let mut stmt = conn.prepare(sql).map_err(|e| InfraError::Store {
         op: "sqlite",
         reason: format!("{e}"),
@@ -182,7 +178,7 @@ pub(crate) fn row_to_topology_file_row(
     })
 }
 
-pub(crate) fn build_topology_file(r: TopologyFileRow) -> Result<TopologyFile, SyncError> {
+pub(crate) fn build_topology_file(r: TopologyFileRow) -> Result<TopologyFile, InfraError> {
     let file_type: FileType = r.file_type_str.parse().map_err(|_| InfraError::Store {
         op: "sqlite",
         reason: format!(
@@ -208,7 +204,7 @@ pub(crate) fn query_topology_files(
     conn: &Connection,
     sql: &str,
     params: &[&dyn rusqlite::types::ToSql],
-) -> Result<Vec<TopologyFile>, SyncError> {
+) -> Result<Vec<TopologyFile>, InfraError> {
     let mut stmt = conn.prepare(sql).map_err(|e| InfraError::Store {
         op: "sqlite",
         reason: format!("{e}"),
@@ -267,7 +263,7 @@ pub(crate) fn row_to_location_file_row(
     })
 }
 
-pub(crate) fn build_location_file(r: LocationFileRow) -> Result<LocationFile, SyncError> {
+pub(crate) fn build_location_file(r: LocationFileRow) -> Result<LocationFile, InfraError> {
     let location_id = LocationId::new(&r.location_id).map_err(|_| InfraError::Store {
         op: "sqlite",
         reason: format!(
@@ -316,7 +312,7 @@ pub(crate) fn query_location_files(
     conn: &Connection,
     sql: &str,
     params: &[&dyn rusqlite::types::ToSql],
-) -> Result<Vec<LocationFile>, SyncError> {
+) -> Result<Vec<LocationFile>, InfraError> {
     let mut stmt = conn.prepare(sql).map_err(|e| InfraError::Store {
         op: "sqlite",
         reason: format!("{e}"),

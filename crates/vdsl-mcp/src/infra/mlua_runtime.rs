@@ -705,7 +705,10 @@ mod inner {
                                 let db = Arc::clone(&db);
                                 let mgr = Arc::clone(&mgr);
                                 async move {
-                                    let task_id = mgr.spawn_sync(&db).await;
+                                    let task_id = mgr
+                                        .spawn_sync(&db)
+                                        .await
+                                        .map_err(|e| LuaError::external(e.to_string()))?;
                                     Ok(LuaValue::String(
                                         lua.create_string(task_id.as_str())?,
                                     ))
@@ -735,8 +738,10 @@ mod inner {
                                             vdsl_sync::LocationId::new(dest).map_err(|e| {
                                                 LuaError::external(e.to_string())
                                             })?;
-                                        let task_id =
-                                            mgr.spawn_sync_route(&db, src_id, dest_id).await;
+                                        let task_id = mgr
+                                            .spawn_sync_route(&db, src_id, dest_id)
+                                            .await
+                                            .map_err(|e| LuaError::external(e.to_string()))?;
                                         Ok(LuaValue::String(
                                             lua.create_string(task_id.as_str())?,
                                         ))
