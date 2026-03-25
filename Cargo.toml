@@ -28,4 +28,4 @@ secrecy = "0.10"
 walkdir = "2"
 
 # Internal
-vdsl-sync = { path = "crates/vdsl-sync" }
+vdsl-sync = { version = "0.2.0", path = "crates/vdsl-sync" }
