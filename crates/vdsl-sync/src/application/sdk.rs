@@ -138,6 +138,14 @@ pub trait SyncStoreSdk: Send + Sync {
     /// ファイル削除。削除されたTransfer数を返す。
     async fn delete(&self, path: &str) -> Result<usize, SyncError>;
 
+    /// アーカイブからファイル復元。
+    ///
+    /// `delete()` で archive 化されたファイル（cloud上の `vdsl/archived/{revision}/{path}`）を
+    /// 元の場所（`vdsl/output/{path}`）に moveto reverse で戻し、TopologyFile の
+    /// deleted フラグを解除する。直後の `sync()` の cloud scan により LocationFile が再登録され、
+    /// distribute → 他拠点へ再配布される。
+    async fn restore(&self, path: &str, revision: &str) -> Result<(), SyncError>;
+
     // =========================================================================
     // Query — 読み取り
     // =========================================================================

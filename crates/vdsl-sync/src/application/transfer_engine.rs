@@ -138,6 +138,15 @@ impl TransferEngine {
         self.routes.get(&(src.clone(), dest.clone()))
     }
 
+    /// First route with `archive_root` configured.
+    ///
+    /// Used by `restore()` to locate the cloud (cold-storage) route. Phase 1
+    /// assumes a single archive-enabled destination; multi-archive scenarios
+    /// would require an explicit dest argument.
+    pub fn archive_route(&self) -> Option<&TransferRoute> {
+        self.routes.values().find(|r| r.archive_root().is_some())
+    }
+
     /// Destinations ordered by BFS distance from local.
     ///
     /// Used by `execute_all()` to process chain transfers in dependency order:

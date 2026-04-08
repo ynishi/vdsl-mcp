@@ -69,6 +69,29 @@ pub trait StorageBackend: Send + Sync {
         })
     }
 
+    /// Move a file to an archive path (soft delete).
+    ///
+    /// Semantics: `src_remote_path` is moved to `archive_remote_path` atomically.
+    /// Used by cold-storage backends (B2) to preserve deleted file revisions
+    /// instead of hard-deleting them. The caller constructs the archive path
+    /// (typically `{archive_root}/{ISO8601_ts}/{relative_path}`).
+    ///
+    /// Default implementation returns `Err` — backends that don't support
+    /// archive-on-delete should leave this unimplemented; callers must check
+    /// before invoking.
+    async fn archive_move(
+        &self,
+        src_remote_path: &str,
+        archive_remote_path: &str,
+    ) -> Result<(), InfraError> {
+        Err(InfraError::Transfer {
+            reason: format!(
+                "archive_move not supported by {} backend (src={src_remote_path}, dest={archive_remote_path})",
+                self.backend_type()
+            ),
+        })
+    }
+
     /// Push multiple files in a single batch operation.
     ///
     /// `src_root` is the local base directory, `dest_root` is the remote base,

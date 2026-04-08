@@ -352,6 +352,42 @@ impl StorageBackend for RcloneBackend {
         }
     }
 
+    /// Move a file to an archive location via `rclone moveto`.
+    ///
+    /// Used for soft-delete on cold storage: the file is relocated (not copied)
+    /// to an archive prefix, preserving content with a new path/revision.
+    /// `rclone moveto` is atomic at the object-store level for B2/S3.
+    async fn archive_move(
+        &self,
+        src_remote_path: &str,
+        archive_remote_path: &str,
+    ) -> Result<(), InfraError> {
+        let src = self.remote_path(src_remote_path)?;
+        let dest = self.remote_path(archive_remote_path)?;
+        match self
+            .exec_rclone(&["moveto", &src, &dest, "--retries", "1"])
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                // rclone exit 4 (not found) = already absent at src.
+                // Archive goal (original absent) is satisfied, though the
+                // revision record is missing. Treat as success for idempotence.
+                if msg.contains("exit 4") || msg.contains("not found") {
+                    tracing::debug!(
+                        src = src_remote_path,
+                        dest = archive_remote_path,
+                        "rclone moveto: src already absent, treating as success"
+                    );
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
     /// Batch push using `rclone copy --files-from`.
     ///
     /// For SFTP remotes, splits into chunks of [`SFTP_BATCH_CHUNK_SIZE`] files

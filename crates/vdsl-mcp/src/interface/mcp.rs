@@ -901,6 +901,20 @@ pub struct VdslSyncGetRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslSyncDeleteRequest {
+    /// File path (relative like "output/image.png").
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslSyncRestoreRequest {
+    /// File path (relative like "output/image.png").
+    pub path: String,
+    /// Archive revision (timestamp like "20260408T141312Z").
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VdslSyncRouteRequest {
     /// Source location ID (e.g. "local", "cloud", "pod-xxx").
     pub src: String,
@@ -3997,6 +4011,58 @@ impl VdslMcpServer {
     }
 
     #[tool(
+        name = "vdsl_sync_delete",
+        description = "[sync] Mark a tracked file as deleted. \
+            Creates Delete transfers for each location that currently holds the file. \
+            Call vdsl_sync afterward to execute the delete transfers. \
+            For cloud (B2), deleted files are archived to vdsl/archived/{ISO8601_ts}/{relative_path} \
+            instead of being hard-deleted (revision-preserving soft delete). \
+            For pod, hard delete is applied. Local filesystem is NOT touched by this command.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn sync_delete(
+        &self,
+        Parameters(req): Parameters<VdslSyncDeleteRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let sdk = self.resolve_or_init_sdk().await?;
+        let created = sdk.delete(&req.path).await.map_err(Self::to_mcp_error)?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Marked for deletion: {}\nDelete transfers created: {}\n\nRun vdsl_sync to execute.",
+            req.path, created
+        ))]))
+    }
+
+    #[tool(
+        name = "vdsl_sync_restore",
+        description = "[sync] Restore a previously deleted file from cloud archive. \
+            Moves vdsl/archived/{revision}/{path} back to vdsl/output/{path} on cloud and \
+            unmarks the TopologyFile as deleted. Run vdsl_sync afterward to redistribute \
+            the restored file to other locations.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn sync_restore(
+        &self,
+        Parameters(req): Parameters<VdslSyncRestoreRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let sdk = self.resolve_or_init_sdk().await?;
+        sdk.restore(&req.path, &req.revision)
+            .await
+            .map_err(Self::to_mcp_error)?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Restored: {} (revision {})\n\nRun vdsl_sync to redistribute.",
+            req.path, req.revision
+        ))]))
+    }
+
+    #[tool(
         name = "vdsl_sync_errors",
         description = "[sync] List all failed transfers with error details. \
             Shows file ID, source, destination, error message, and attempt count. \
@@ -5130,7 +5196,11 @@ async fn build_sdk(
     .exclude(".git/**")
     .exclude(".vdsl")
     .exclude(".vdsl/**")
-    .exclude(".*");
+    .exclude(".*")
+    // Archive-on-delete: cloud (B2) は hard delete ではなく
+    // vdsl/archived/{ISO8601_ts}/{relative_path} へ moveto する。
+    // local/pod への Delete は通常通り hard delete。
+    .archive_route_to(&cloud_id, std::path::PathBuf::from("vdsl/archived"));
 
     // =========================================================================
     // Route 接続 — Local ↔ Cloud（常時）

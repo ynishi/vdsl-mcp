@@ -16,6 +16,7 @@
 //!   └── scan_excludes             — globパターン
 //! ```
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -104,6 +105,9 @@ pub struct SdkImplBuilder {
     pending_routes: Vec<PendingRoute>,
     config: Option<SyncConfig>,
     scan_excludes: Vec<glob::Pattern>,
+    /// Per-destination archive root: dest LocationId → archive path.
+    /// When set, all routes whose dest matches get archive-on-delete.
+    archive_roots: HashMap<LocationId, std::path::PathBuf>,
 }
 
 impl SdkImplBuilder {
@@ -121,7 +125,23 @@ impl SdkImplBuilder {
             pending_routes: Vec::new(),
             config: None,
             scan_excludes: Vec::new(),
+            archive_roots: HashMap::new(),
         }
+    }
+
+    /// Enable archive-on-delete for routes targeting `dest`.
+    ///
+    /// All routes whose destination is `dest` will move deleted files to
+    /// `{archive_root}/{ISO8601_ts}/{relative_path}` instead of hard-deleting.
+    /// The backend must implement `archive_move` (e.g. RcloneBackend via
+    /// `rclone moveto`).
+    pub fn archive_route_to(
+        mut self,
+        dest: &LocationId,
+        archive_root: std::path::PathBuf,
+    ) -> Self {
+        self.archive_roots.insert(dest.clone(), archive_root);
+        self
     }
 
     /// Location（拠点）追加。
@@ -221,8 +241,6 @@ impl SdkImplBuilder {
     /// 3. TransferRoute から RouteGraph + TransferEngine を構築
     /// 4. TopologyStore + TopologyScanner を構築
     pub fn build(self) -> Result<SdkImpl, SyncError> {
-        use std::collections::HashMap;
-
         let config = self.config.unwrap_or_default();
 
         // Location map: LocationId → Arc<dyn Location>
@@ -232,6 +250,8 @@ impl SdkImplBuilder {
         // Scanner 導出
         let scanners: Vec<Arc<dyn LocationScanner>> =
             self.locations.iter().map(|loc| loc.scanner()).collect();
+
+        let archive_roots = self.archive_roots;
 
         // PendingRoute → TransferRoute 変換
         let routes: Vec<TransferRoute> = self
@@ -249,14 +269,25 @@ impl SdkImplBuilder {
                     }
                 };
 
+                let archive_root_for_dest = archive_roots.get(&pr.dest).cloned();
+
                 let mut route = TransferRoute::new(
                     pr.src,
-                    pr.dest,
+                    pr.dest.clone(),
                     src_loc.file_root().to_path_buf(),
                     dest_loc.file_root().to_path_buf(),
                     pr.backend,
                 )
                 .with_cost(cost.time_per_gb, cost.priority);
+
+                if let Some(archive_root) = archive_root_for_dest {
+                    // Archive-on-delete is only meaningful for Push direction:
+                    // Pull routes delete from local filesystem and can't archive
+                    // to a remote. Silently ignore for Pull.
+                    if pr.direction == TransferDirection::Push {
+                        route = route.with_archive_root(archive_root);
+                    }
+                }
 
                 if pr.direction == TransferDirection::Pull {
                     route = route.direction(TransferDirection::Pull);
@@ -367,19 +398,58 @@ impl SdkImpl {
         let targets = self.engine.all_targets_ordered();
         debug!(targets = ?targets, "execute_bfs: BFS target order");
 
-        for target in &targets {
-            if skip_locations.contains(target) {
-                warn!(
-                    target = %target,
-                    "execute_bfs: skipping target (ensure failed)"
-                );
-                continue;
+        // Re-iterate BFS targets until no progress: chain transfers (e.g. pod→cloud)
+        // become Queued only after their parent (local→pod) completes via
+        // `unblock_dependents`. A single pass would miss them when the dependent
+        // target was visited before the parent.
+        let max_passes = targets.len().saturating_add(1).max(2);
+        for pass in 0..max_passes {
+            let mut progress = false;
+            for target in &targets {
+                if skip_locations.contains(target) {
+                    if pass == 0 {
+                        warn!(
+                            target = %target,
+                            "execute_bfs: skipping target (ensure failed)"
+                        );
+                    }
+                    continue;
+                }
+                let queued = self.transfer_store.queued_transfers(target).await?;
+                if queued.is_empty() {
+                    debug!(target = %target, pass, "execute_bfs: no queued transfers, skip");
+                    continue;
+                }
+                progress = true;
+                info!(target = %target, pass, queued = queued.len(), "execute_bfs: processing target");
+                self.process_target_batch(
+                    target,
+                    queued,
+                    &mut total_transferred,
+                    &mut total_failed,
+                    &mut all_errors,
+                )
+                .await?;
             }
-            let queued = self.transfer_store.queued_transfers(target).await?;
-            if queued.is_empty() {
-                debug!(target = %target, "execute_bfs: no queued transfers, skip");
-                continue;
+            if !progress {
+                debug!(pass, "execute_bfs: no progress, exiting");
+                break;
             }
+        }
+
+        Ok((total_transferred, total_failed, all_errors))
+    }
+
+    /// 1ターゲット分のqueued転送をprepare→sync→delete→permitの順で実行する。
+    async fn process_target_batch(
+        &self,
+        target: &crate::domain::location::LocationId,
+        queued: Vec<crate::domain::transfer::Transfer>,
+        total_transferred: &mut usize,
+        total_failed: &mut usize,
+        all_errors: &mut Vec<SyncReportError>,
+    ) -> Result<(), SyncError> {
+        {
             info!(target = %target, queued = queued.len(), "execute_bfs: processing target");
             self.report_progress(&format!("target {target}: {} queued", queued.len()));
 
@@ -409,7 +479,7 @@ impl SdkImpl {
                             dest = %transfer.dest(),
                             "execute_bfs: topology_file not found — transfer skipped"
                         );
-                        total_failed += 1;
+                        *total_failed += 1;
                         all_errors.push(SyncReportError {
                             path: transfer.file_id().to_string(),
                             error: format!("file {} not found in store", transfer.file_id()),
@@ -424,7 +494,7 @@ impl SdkImpl {
                             err = %e,
                             "execute_bfs: topology_file lookup error — transfer skipped"
                         );
-                        total_failed += 1;
+                        *total_failed += 1;
                         all_errors.push(SyncReportError {
                             path: transfer.file_id().to_string(),
                             error: e.to_string(),
@@ -461,9 +531,9 @@ impl SdkImpl {
                 );
                 self.persist_outcomes(
                     &sync_outcomes,
-                    &mut total_transferred,
-                    &mut total_failed,
-                    &mut all_errors,
+                    total_transferred,
+                    total_failed,
+                    all_errors,
                 )
                 .await?;
             }
@@ -483,22 +553,22 @@ impl SdkImpl {
                 );
                 self.persist_outcomes(
                     &delete_outcomes,
-                    &mut total_transferred,
-                    &mut total_failed,
-                    &mut all_errors,
+                    total_transferred,
+                    total_failed,
+                    all_errors,
                 )
                 .await?;
             }
 
             info!(
                 target = %target,
-                transferred = total_transferred,
-                failed = total_failed,
+                transferred = *total_transferred,
+                failed = *total_failed,
                 "execute_bfs: target batch done"
             );
         }
 
-        Ok((total_transferred, total_failed, all_errors))
+        Ok(())
     }
 
     /// TransferOutcome群をDB永続化する共通ヘルパー。
@@ -862,6 +932,34 @@ impl SyncStoreSdk for SdkImpl {
 
     async fn delete(&self, path: &str) -> Result<usize, SyncError> {
         self.topology.delete(path).await
+    }
+
+    async fn restore(&self, path: &str, revision: &str) -> Result<(), SyncError> {
+        info!(path = %path, revision = %revision, "sdk_impl::restore: start");
+
+        // 1. archive_root を持つルート（cloud宛）を engine から1件取得
+        let route = self.engine.archive_route().ok_or_else(|| -> SyncError {
+            crate::infra::error::InfraError::Transfer {
+                reason: "restore: no route with archive_root configured".into(),
+            }
+            .into()
+        })?;
+
+        // 2. 物理復元: cloud archive → cloud original
+        route.restore_from_archive(path, revision).await?;
+        info!(path = %path, "sdk_impl::restore: physical restore done");
+
+        // 3. 削除済みTopologyFileを取得して unmark
+        let deleted_tfs = self.topology_files.list_deleted().await?;
+        let mut tf = deleted_tfs
+            .into_iter()
+            .find(|t| t.relative_path() == path)
+            .ok_or_else(|| SyncError::NotRegistered(path.to_string()))?;
+        tf.unmark_deleted();
+        self.topology_files.upsert(&tf).await?;
+        info!(path = %path, file_id = %tf.id(), "sdk_impl::restore: TopologyFile unmarked");
+
+        Ok(())
     }
 
     // =========================================================================

@@ -75,6 +75,14 @@ pub struct TransferRoute {
     /// Static priority (lower = preferred when costs are equal).
     /// Default: 100 (neutral).
     priority: u32,
+    /// Archive root for soft-delete (Push direction only).
+    ///
+    /// When set, `delete()` / `delete_batch()` call
+    /// `backend.archive_move()` to move the target file to
+    /// `{archive_root}/{ISO8601_ts}/{relative_path}` instead of
+    /// hard-deleting it. Used for cold-storage routes where deleted
+    /// file revisions must be preserved.
+    archive_root: Option<PathBuf>,
 }
 
 impl TransferRoute {
@@ -117,7 +125,17 @@ impl TransferRoute {
             direction: TransferDirection::Push,
             time_per_gb: 1.0,
             priority: 100,
+            archive_root: None,
         }
+    }
+
+    /// Enable archive-on-delete for this route (Push direction only).
+    ///
+    /// Deleted files are moved to `{archive_root}/{ISO8601_ts}/{relative_path}`
+    /// instead of being hard-deleted. The backend must implement `archive_move`.
+    pub fn with_archive_root(mut self, archive_root: PathBuf) -> Self {
+        self.archive_root = Some(archive_root);
+        self
     }
 
     /// Set the transfer direction (default: Push).
@@ -185,6 +203,65 @@ impl TransferRoute {
         self.direction == TransferDirection::Pull
     }
 
+    /// Archive root for soft-delete (None if archive is disabled).
+    pub fn archive_root(&self) -> Option<&Path> {
+        self.archive_root.as_deref()
+    }
+
+    /// Restore a soft-deleted file from archive back to its original location.
+    ///
+    /// Reverses `delete()`'s archive_move:
+    /// `{archive_root}/{revision}/{relative_path}` → `{dest_file_root}/{relative_path}`.
+    ///
+    /// Push direction + archive_root must be set; otherwise returns an error.
+    pub async fn restore_from_archive(
+        &self,
+        relative_path: &str,
+        revision: &str,
+    ) -> Result<(), SyncError> {
+        Self::validate_relative_path(relative_path)?;
+        let archive_root = self.archive_root.as_ref().ok_or_else(|| -> SyncError {
+            InfraError::Transfer {
+                reason: format!(
+                    "restore_from_archive: route has no archive_root (src={}, dest={})",
+                    self.src, self.dest
+                ),
+            }
+            .into()
+        })?;
+        if self.direction != TransferDirection::Push {
+            return Err(InfraError::Transfer {
+                reason: "restore_from_archive: only Push routes are supported".into(),
+            }
+            .into());
+        }
+        let archive_full = archive_root.join(revision).join(relative_path);
+        let dest_full = Self::safe_join(&self.dest_file_root, relative_path);
+        let archive_str = archive_full
+            .to_str()
+            .ok_or_else(|| -> SyncError {
+                InfraError::Transfer {
+                    reason: format!("archive path not valid UTF-8: {}", archive_full.display()),
+                }
+                .into()
+            })?;
+        let dest_str = dest_full.to_str().ok_or_else(|| -> SyncError {
+            InfraError::Transfer {
+                reason: format!("dest path not valid UTF-8: {}", dest_full.display()),
+            }
+            .into()
+        })?;
+        tracing::info!(
+            archive = archive_str,
+            dest = dest_str,
+            "route::restore_from_archive: moveto reverse"
+        );
+        self.backend
+            .archive_move(archive_str, dest_str)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Access the underlying storage backend.
     pub(crate) fn backend(&self) -> &dyn StorageBackend {
         &*self.backend
@@ -237,17 +314,31 @@ impl TransferRoute {
         }
     }
 
+    /// Build the archive remote path for a given relative_path.
+    ///
+    /// Format: `{archive_root}/{ISO8601_ts}/{relative_path}`
+    /// Timestamp is UTC in compact basic form (e.g. `20260408T134500Z`).
+    fn build_archive_path(&self, relative_path: &str) -> Option<String> {
+        let archive_root = self.archive_root.as_ref()?;
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let archive_dest = archive_root.join(&ts).join(relative_path);
+        Some(archive_dest.to_string_lossy().into_owned())
+    }
+
     /// Delete a file at the destination of this route.
     ///
     /// For push-direction routes, deletes from the remote (dest_file_root).
     /// For pull-direction routes, deletes from the local dest.
+    /// When `archive_root` is set (Push only), deleted files are moved
+    /// to `{archive_root}/{ISO8601_ts}/{relative_path}` instead of being
+    /// hard-deleted.
     pub async fn delete(&self, relative_path: &str) -> Result<(), SyncError> {
         Self::validate_relative_path(relative_path)?;
         let dest_path = Self::safe_join(&self.dest_file_root, relative_path);
 
         match self.direction {
             TransferDirection::Push => {
-                // dest is remote — use backend.delete
+                // dest is remote — use backend.delete or archive_move
                 let dest_str = dest_path.to_str().ok_or_else(|| -> SyncError {
                     InfraError::Transfer {
                         reason: format!(
@@ -257,6 +348,18 @@ impl TransferRoute {
                     }
                     .into()
                 })?;
+                if let Some(archive_dest) = self.build_archive_path(relative_path) {
+                    tracing::debug!(
+                        src = dest_str,
+                        archive = %archive_dest,
+                        "route::delete: archive_move (soft-delete)"
+                    );
+                    return self
+                        .backend
+                        .archive_move(dest_str, &archive_dest)
+                        .await
+                        .map_err(Into::into);
+                }
                 self.backend.delete(dest_str).await.map_err(Into::into)
             }
             TransferDirection::Pull => {
@@ -352,6 +455,16 @@ impl TransferRoute {
 
         match self.direction {
             TransferDirection::Push => {
+                if self.archive_root.is_some() {
+                    // Archive mode: fall back to per-file archive_move.
+                    // No batch archive_move primitive; acceptable since deletes
+                    // are low-volume compared to sync transfers.
+                    let mut results = HashMap::with_capacity(relative_paths.len());
+                    for rel in relative_paths {
+                        results.insert(rel.clone(), self.delete(rel).await);
+                    }
+                    return results;
+                }
                 let dest_root_str = self.dest_file_root.to_str().unwrap_or_default();
                 self.backend
                     .delete_batch(dest_root_str, relative_paths)
