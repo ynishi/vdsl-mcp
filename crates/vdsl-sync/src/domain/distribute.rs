@@ -349,6 +349,17 @@ fn emit_action_for_target(
             if lf.state() == super::location_file::LocationFileState::Syncing {
                 return; // Syncing → skip
             }
+            // Missing → ファイルが消失したLocation。fp比較をバイパスして再送。
+            if lf.state() == super::location_file::LocationFileState::Missing {
+                trace!(file_id = %file_id, target = %target, source = %source, "Update (missing)");
+                actions.push(DistributeAction::Update(UpdateAction {
+                    topology_file_id: file_id.to_string(),
+                    relative_path: tf.relative_path().to_string(),
+                    target: target.clone(),
+                    source: source.clone(),
+                }));
+                return;
+            }
             let Some(fp) = latest_fp else {
                 trace!(file_id = %file_id, target = %target, "no latest fingerprint, skip Update");
                 return;
