@@ -5,20 +5,25 @@
 //! 消失していれば再構築する。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context as _;
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::{info, warn};
 use vdsl_sync::SqliteSyncStore;
 
 /// Sync用SQLite DB管理。
 ///
 /// work_dir/.vdsl/sync.db のパスを一元管理し、
 /// `ensure()` で接続の取得とファイル存在の保証を行う。
+///
+/// `generation()` はDB再構築のたびにインクリメントされる。
+/// 呼び出し元はgenerationを比較し、変化時にSDK再構築を行う。
 pub struct SyncDb {
     db_path: PathBuf,
     store: RwLock<Option<Arc<SqliteSyncStore>>>,
+    generation: AtomicU64,
 }
 
 impl SyncDb {
@@ -27,12 +32,18 @@ impl SyncDb {
         Self {
             db_path: work_dir.join(".vdsl").join("sync.db"),
             store: RwLock::new(None),
+            generation: AtomicU64::new(0),
         }
     }
 
     /// DBパスを返す。
     pub fn path(&self) -> &Path {
         &self.db_path
+    }
+
+    /// 現在のgeneration。DB再構築のたびにインクリメントされる。
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// DB接続を返す。未接続 or ファイル消失時は (再)構築する。
@@ -73,6 +84,12 @@ impl SyncDb {
                 .context("failed to open sync DB")?,
         );
         *guard = Some(Arc::clone(&store));
+        let gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        info!(
+            path = %self.db_path.display(),
+            generation = gen,
+            "sync_db: store opened (generation bumped)"
+        );
         Ok(store)
     }
 }

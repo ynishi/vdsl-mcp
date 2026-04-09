@@ -67,6 +67,9 @@ struct VdslMcpServer {
     /// pod_id used to build the current sync SDK.
     /// Compared against `last_pod_id` to detect pod changes requiring rebuild.
     sync_sdk_pod_id: Arc<Mutex<Option<String>>>,
+    /// SyncDb generation when the current SDK was built.
+    /// If SyncDb.generation() differs, SDK must be rebuilt.
+    sync_sdk_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Sync DB lifecycle manager. Ensures DB file existence on every access.
     #[cfg(feature = "mlua-backend")]
     sync_db: Arc<crate::infra::sync_db::SyncDb>,
@@ -84,6 +87,7 @@ impl VdslMcpServer {
             ephemeral: Arc::new(Mutex::new(false)),
             sync_sdk: Arc::new(tokio::sync::Mutex::new(None)),
             sync_sdk_pod_id: Arc::new(Mutex::new(None)),
+            sync_sdk_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "mlua-backend")]
             sync_db: Arc::new(crate::infra::sync_db::SyncDb::new(&default_work_dir())),
             sync_task_mgr: Arc::new(SyncTaskManager::new()),
@@ -106,10 +110,11 @@ impl VdslMcpServer {
 
     /// Resolve or lazily initialize the SyncStoreSdk.
     ///
-    /// Returns the existing SDK if pod_id hasn't changed.
+    /// Returns the existing SDK if pod_id hasn't changed AND DB generation is the same.
     /// Builds a new SDK when:
     /// - First call (no SDK exists yet)
     /// - pod_id changed since last build (route topology change)
+    /// - DB was rebuilt (generation changed — file was deleted externally)
     async fn resolve_or_init_sdk(&self) -> Result<Arc<dyn vdsl_sync::SyncStoreSdk>, McpError> {
         let mut current_pod_id = self.last_pod_id.lock().ok().and_then(|g| g.clone());
 
@@ -124,27 +129,40 @@ impl VdslMcpServer {
             }
         }
 
-        let built_pod_id = self.sync_sdk_pod_id.lock().ok().and_then(|g| g.clone());
-
-        let mut guard = self.sync_sdk.lock().await;
-
-        // Return existing SDK if pod_id unchanged AND DB file still exists.
-        if let Some(ref sdk) = *guard {
-            if built_pod_id == current_pod_id {
-                // SyncDb.ensure() がファイル存在を保証。消失時は再open。
-                let persistence = self.sync_db.ensure().await.map_err(|e| {
-                    McpError::invalid_params(format!("sync DB ensure failed: {e:#}"), None)
-                })?;
-                self.sync_task_mgr.set_store(persistence).await;
-                return Ok(sdk.clone());
-            }
-            // pod_id changed — fall through to rebuild
-        }
-
-        // Build new SDK (SyncDb.ensure() handles DB open)
+        // ensure() を先に呼ぶ。DB消失時はここで再構築+generation bump。
         let persistence = self.sync_db.ensure().await.map_err(|e| {
             McpError::invalid_params(format!("sync DB ensure failed: {e:#}"), None)
         })?;
+        let current_gen = self.sync_db.generation();
+
+        let built_pod_id = self.sync_sdk_pod_id.lock().ok().and_then(|g| g.clone());
+        let built_gen = self.sync_sdk_generation.load(std::sync::atomic::Ordering::Acquire);
+
+        let mut guard = self.sync_sdk.lock().await;
+
+        // Return existing SDK if pod_id unchanged AND generation unchanged.
+        if let Some(ref sdk) = *guard {
+            if built_pod_id == current_pod_id && built_gen == current_gen {
+                self.sync_task_mgr.set_store(persistence).await;
+                return Ok(sdk.clone());
+            }
+            if built_gen != current_gen {
+                tracing::info!(
+                    old_gen = built_gen,
+                    new_gen = current_gen,
+                    "resolve_or_init_sdk: DB generation changed — rebuilding SDK"
+                );
+            }
+            if built_pod_id != current_pod_id {
+                tracing::info!(
+                    old_pod = ?built_pod_id,
+                    new_pod = ?current_pod_id,
+                    "resolve_or_init_sdk: pod_id changed — rebuilding SDK"
+                );
+            }
+        }
+
+        // Build new SDK
         let (sdk, _) = build_sdk(&self.sync_db, current_pod_id.as_deref(), &persistence)
             .await
             .map_err(|e| {
@@ -157,6 +175,12 @@ impl VdslMcpServer {
         if let Ok(mut pid_guard) = self.sync_sdk_pod_id.lock() {
             *pid_guard = current_pod_id;
         }
+        self.sync_sdk_generation.store(current_gen, std::sync::atomic::Ordering::Release);
+
+        tracing::info!(
+            generation = current_gen,
+            "resolve_or_init_sdk: SDK built"
+        );
 
         Ok(sdk)
     }
@@ -3930,7 +3954,20 @@ impl VdslMcpServer {
         let db = self.resolve_or_init_sdk().await?;
         let summary = db.status().await.map_err(Self::to_mcp_error)?;
 
-        let mut text = format_sync_summary(&summary);
+        let mut text = String::new();
+        // DB infra info
+        let db_path = self.sync_db.path();
+        let db_size = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+        let gen = self.sync_db.generation();
+        let sdk_gen = self.sync_sdk_generation.load(std::sync::atomic::Ordering::Acquire);
+        text.push_str(&format!(
+            "DB: {} ({}KB, gen={}, sdk_gen={})\n\n",
+            db_path.display(),
+            db_size / 1024,
+            gen,
+            sdk_gen,
+        ));
+        text.push_str(&format_sync_summary(&summary));
 
         // 件数が多い場合はファイルに書き出し
         let total_detail = summary.error_entries.len() + summary.pending_entries.len();
