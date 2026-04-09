@@ -21,7 +21,7 @@ use crate::domain::location::LocationId;
 use crate::domain::topology_delta::{
     ContentChangedFile, DiscoveredFile, TopologyDelta, VanishedFile,
 };
-use crate::domain::topology_file::{ScanMatch, TopologyFile};
+use crate::domain::topology_file::TopologyFile;
 use crate::infra::backend::ProgressFn;
 use crate::infra::location_file_store::LocationFileStore;
 use crate::infra::location_scanner::{LocationScanner, ScannedFile};
@@ -244,11 +244,45 @@ fn match_and_classify(
     all_tfs: &[TopologyFile],
     matched_tf_ids: &mut std::collections::HashSet<String>,
 ) -> Option<TopologyDelta> {
+    // Pass 1: ByPath優先。同一pathのTFがあればそれを使う（IDキープ）。
+    // ByHashを先にチェックすると、同内容別パスのTFに誤マッチしRenameと誤判定する。
     for tf in all_tfs {
-        match tf.matches_scan(&entry.relative_path, &entry.fingerprint) {
-            ScanMatch::ByHash => {
-                matched_tf_ids.insert(tf.id().to_string());
-                if tf.relative_path() != entry.relative_path {
+        if tf.relative_path() == entry.relative_path {
+            matched_tf_ids.insert(tf.id().to_string());
+            if fingerprint_changed(tf, &entry.fingerprint) {
+                tracing::debug!(
+                    path = %entry.relative_path,
+                    tf_id = %tf.id(),
+                    origin = %entry.origin,
+                    size = entry.fingerprint.size,
+                    "match_and_classify: ByPath → ContentChanged"
+                );
+                return Some(TopologyDelta::ContentChanged(ContentChangedFile {
+                    topology_file_id: tf.id().to_string(),
+                    relative_path: entry.relative_path.clone(),
+                    file_type: entry.file_type,
+                    old_fingerprint: extract_tf_fingerprint(tf),
+                    new_fingerprint: entry.fingerprint.clone(),
+                    origin: entry.origin.clone(),
+                    embedded_id: entry.embedded_id.clone(),
+                }));
+            }
+            tracing::trace!(
+                path = %entry.relative_path,
+                tf_id = %tf.id(),
+                origin = %entry.origin,
+                "match_and_classify: ByPath + fingerprint unchanged → skip"
+            );
+            return None;
+        }
+    }
+
+    // Pass 2: ByHash（rename検出）。pathが一致するTFがなかった場合のみ。
+    if let Some(ref scan_cd) = entry.fingerprint.content_digest {
+        for tf in all_tfs {
+            if let Some(canonical) = tf.canonical_digest() {
+                if canonical == scan_cd {
+                    matched_tf_ids.insert(tf.id().to_string());
                     tracing::debug!(
                         scan_path = %entry.relative_path,
                         tf_path = %tf.relative_path(),
@@ -268,43 +302,7 @@ fn match_and_classify(
                         },
                     ));
                 }
-                tracing::trace!(
-                    path = %entry.relative_path,
-                    tf_id = %tf.id(),
-                    origin = %entry.origin,
-                    "match_and_classify: ByHash + same path → unchanged"
-                );
-                return None;
             }
-            ScanMatch::ByPath => {
-                matched_tf_ids.insert(tf.id().to_string());
-                if fingerprint_changed(tf, &entry.fingerprint) {
-                    tracing::debug!(
-                        path = %entry.relative_path,
-                        tf_id = %tf.id(),
-                        origin = %entry.origin,
-                        size = entry.fingerprint.size,
-                        "match_and_classify: ByPath → ContentChanged"
-                    );
-                    return Some(TopologyDelta::ContentChanged(ContentChangedFile {
-                        topology_file_id: tf.id().to_string(),
-                        relative_path: entry.relative_path.clone(),
-                        file_type: entry.file_type,
-                        old_fingerprint: extract_tf_fingerprint(tf),
-                        new_fingerprint: entry.fingerprint.clone(),
-                        origin: entry.origin.clone(),
-                        embedded_id: entry.embedded_id.clone(),
-                    }));
-                }
-                tracing::trace!(
-                    path = %entry.relative_path,
-                    tf_id = %tf.id(),
-                    origin = %entry.origin,
-                    "match_and_classify: ByPath + fingerprint unchanged → skip"
-                );
-                return None;
-            }
-            ScanMatch::NoMatch => continue,
         }
     }
 

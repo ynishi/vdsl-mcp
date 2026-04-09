@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 use vdsl_sync::{
     LocationId, ProgressFn, SqliteSyncStore, SyncReport, SyncStoreSdk, TaskId, TaskStatus,
@@ -40,7 +40,7 @@ use vdsl_sync::{
 /// バックグラウンドタスクエントリ。
 struct TaskEntry {
     status: TaskStatus<SyncReport>,
-    _handle: tokio::task::JoinHandle<()>,
+    handle: tokio::task::JoinHandle<()>,
 }
 
 /// sync 排他制御のロックキー。
@@ -81,9 +81,11 @@ impl fmt::Display for SyncBusyError {
 /// `tokio::spawn` でバックグラウンド化し、TaskId/poll で管理する。
 pub struct SyncTaskManager {
     tasks: Arc<Mutex<HashMap<TaskId, TaskEntry>>>,
-    /// DB永続化用。OnceCell で lazy 初期化。
-    /// SDK構築時に `set_store()` でセットされる。
-    store: OnceCell<Arc<SqliteSyncStore>>,
+    /// DB永続化用。SyncDb.ensure() で取得した store を毎回セットする。
+    /// DB再構築時に差し替わるため RwLock。
+    store: Arc<tokio::sync::RwLock<Option<Arc<SqliteSyncStore>>>>,
+    /// 初回 recovery 済みフラグ。
+    recovered: std::sync::atomic::AtomicBool,
     /// アクティブな sync のロック集合。タスク完了時に自動解放。
     active_locks: Arc<Mutex<HashSet<SyncLockKey>>>,
 }
@@ -98,32 +100,34 @@ impl SyncTaskManager {
     pub fn new() -> Self {
         Self {
             tasks: Arc::new(Mutex::new(HashMap::new())),
-            store: OnceCell::new(),
+            store: Arc::new(tokio::sync::RwLock::new(None)),
+            recovered: std::sync::atomic::AtomicBool::new(false),
             active_locks: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
     /// DB store を設定する。初回呼び出し時に stale running タスクを recover する。
     ///
-    /// SDK は lazy 初期化のため、サーバー起動時には store が存在しない。
-    /// `ensure_sync_sdk()` で SDK 構築時にこのメソッドを呼ぶ。
-    /// 2回目以降の呼び出しは無視される（OnceCell）。
+    /// SyncDb.ensure() で取得した store を毎回渡すこと。
+    /// DB再構築時は新しい store に差し替わる。
     pub async fn set_store(&self, store: Arc<SqliteSyncStore>) {
-        self.store
-            .get_or_init(|| async {
-                let recovered = store.recover_stale_running().await;
-                match recovered {
-                    Ok(0) => {}
-                    Ok(n) => {
-                        info!(recovered = n, "sync_tasks: recovered stale running tasks")
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "sync_tasks: failed to recover stale running tasks")
-                    }
+        // 初回のみ recovery を実行
+        if !self.recovered.load(std::sync::atomic::Ordering::Acquire) {
+            let recovered = store.recover_stale_running().await;
+            match recovered {
+                Ok(0) => {}
+                Ok(n) => {
+                    info!(recovered = n, "sync_tasks: recovered stale running tasks")
                 }
-                store
-            })
-            .await;
+                Err(e) => {
+                    warn!(error = %e, "sync_tasks: failed to recover stale running tasks")
+                }
+            }
+            self.recovered
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        let mut guard = self.store.write().await;
+        *guard = Some(store);
     }
 
     /// `SyncStoreSdk::sync()` をバックグラウンド実行。TaskId を即座に返す。
@@ -205,16 +209,61 @@ impl SyncTaskManager {
         }
 
         // 2. DB fallback
-        if let Some(store) = self.store.get() {
-            match store.load_task(id).await {
-                Ok(status) => return status,
-                Err(e) => {
-                    warn!(task_id = %id, error = %e, "sync_tasks: DB load failed, returning None");
+        {
+            let guard = self.store.read().await;
+            if let Some(ref store) = *guard {
+                match store.load_task(id).await {
+                    Ok(status) => return status,
+                    Err(e) => {
+                        warn!(task_id = %id, error = %e, "sync_tasks: DB load failed, returning None");
+                    }
                 }
             }
         }
 
         None
+    }
+
+    /// 実行中タスクをキャンセルする。
+    ///
+    /// - Pending/Running → abort + Failed("cancelled") に遷移
+    /// - Completed/Failed/不明 → false を返す（何もしない）
+    ///
+    /// abort() は tokio タスクを即座に中断する。rclone 等の外部プロセスは
+    /// Drop 実装で kill される。ロックも自動解放される（on_complete は呼ばれない
+    /// ため、ここで手動解放する）。
+    pub async fn cancel(&self, id: &TaskId) -> bool {
+        let mut map = self.tasks.lock().await;
+        let entry = match map.get_mut(id) {
+            Some(e) => e,
+            None => return false,
+        };
+
+        match &entry.status {
+            TaskStatus::Pending | TaskStatus::Running(_) => {
+                entry.handle.abort();
+                entry.status = TaskStatus::Failed("cancelled by user".to_string());
+
+                // DB 更新
+                {
+                    let guard = self.store.read().await;
+                    if let Some(ref store) = *guard {
+                        let _ = store.update_task_failed(id, "cancelled by user").await;
+                    }
+                }
+
+                info!(task_id = %id, "sync_tasks: task cancelled");
+
+                // ロック全解放（どのキーに紐づいているか追跡していないため全クリア）
+                // abort されたタスクの on_complete は呼ばれないため手動解放が必要。
+                drop(map);
+                let mut locks = self.active_locks.lock().await;
+                locks.clear();
+
+                true
+            }
+            _ => false,
+        }
     }
 
     /// ロック取得。競合する場合は `SyncBusyError` を返す。
@@ -305,7 +354,7 @@ impl SyncTaskManager {
         let id = TaskId::new();
         let tasks = Arc::clone(&self.tasks);
         let id_for_task = id.clone();
-        let store = self.store.get().cloned();
+        let store = self.store.read().await.clone();
 
         // Set progress callback on the SDK before spawning.
         let progress_cb = Self::make_progress_callback(&tasks, &store, &id);
@@ -315,7 +364,7 @@ impl SyncTaskManager {
         let placeholder_handle = tokio::spawn(async {});
         let entry = TaskEntry {
             status: TaskStatus::Pending,
-            _handle: placeholder_handle,
+            handle: placeholder_handle,
         };
 
         {
@@ -377,7 +426,7 @@ impl SyncTaskManager {
         {
             let mut map = self.tasks.lock().await;
             if let Some(entry) = map.get_mut(&id) {
-                entry._handle = handle;
+                entry.handle = handle;
             }
         }
 

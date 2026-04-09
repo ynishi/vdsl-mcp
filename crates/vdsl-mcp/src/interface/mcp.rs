@@ -67,6 +67,9 @@ struct VdslMcpServer {
     /// pod_id used to build the current sync SDK.
     /// Compared against `last_pod_id` to detect pod changes requiring rebuild.
     sync_sdk_pod_id: Arc<Mutex<Option<String>>>,
+    /// Sync DB lifecycle manager. Ensures DB file existence on every access.
+    #[cfg(feature = "mlua-backend")]
+    sync_db: Arc<crate::infra::sync_db::SyncDb>,
     /// Background task manager for sync operations.
     /// Shared between MCP tools and Lua runtime.
     sync_task_mgr: Arc<SyncTaskManager>,
@@ -81,6 +84,8 @@ impl VdslMcpServer {
             ephemeral: Arc::new(Mutex::new(false)),
             sync_sdk: Arc::new(tokio::sync::Mutex::new(None)),
             sync_sdk_pod_id: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "mlua-backend")]
+            sync_db: Arc::new(crate::infra::sync_db::SyncDb::new(&default_work_dir())),
             sync_task_mgr: Arc::new(SyncTaskManager::new()),
         }
     }
@@ -123,23 +128,29 @@ impl VdslMcpServer {
 
         let mut guard = self.sync_sdk.lock().await;
 
-        // Return existing SDK if pod_id unchanged
+        // Return existing SDK if pod_id unchanged AND DB file still exists.
         if let Some(ref sdk) = *guard {
             if built_pod_id == current_pod_id {
+                // SyncDb.ensure() がファイル存在を保証。消失時は再open。
+                let persistence = self.sync_db.ensure().await.map_err(|e| {
+                    McpError::invalid_params(format!("sync DB ensure failed: {e:#}"), None)
+                })?;
+                self.sync_task_mgr.set_store(persistence).await;
                 return Ok(sdk.clone());
             }
             // pod_id changed — fall through to rebuild
         }
 
-        // Build new SDK
-        let work_dir = default_work_dir();
-        let (sdk, persistence) = build_sdk(&work_dir, current_pod_id.as_deref())
+        // Build new SDK (SyncDb.ensure() handles DB open)
+        let persistence = self.sync_db.ensure().await.map_err(|e| {
+            McpError::invalid_params(format!("sync DB ensure failed: {e:#}"), None)
+        })?;
+        let (sdk, _) = build_sdk(&self.sync_db, current_pod_id.as_deref(), &persistence)
             .await
             .map_err(|e| {
                 McpError::invalid_params(format!("Failed to initialize sync SDK: {e:#}"), None)
             })?;
 
-        // DB store を SyncTaskManager に設定（初回のみ。stale running タスクの recovery も行う）
         self.sync_task_mgr.set_store(persistence).await;
 
         *guard = Some(sdk.clone());
@@ -926,6 +937,20 @@ pub struct VdslSyncRouteRequest {
 pub struct VdslSyncPollRequest {
     /// Task ID returned by vdsl_sync or vdsl_sync_route.
     pub task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslSyncCancelRequest {
+    /// Task ID of the sync task to cancel.
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslSyncLogsRequest {
+    /// Number of lines to return from the end of the log. Default 50.
+    pub lines: Option<u32>,
+    /// Filter pattern (grep). Only lines containing this string are returned.
+    pub filter: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -4123,25 +4148,23 @@ impl VdslMcpServer {
         let status = self.sync_task_mgr.poll(&task_id).await;
         match status {
             None => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Unknown task_id: {}\n\nTask may have been created in a previous session.",
+                "Unknown task_id: {}",
                 req.task_id
             ))])),
             Some(vdsl_sync::TaskStatus::Pending) => {
-                Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Status: pending\nlog: {}",
-                    current_log_path()
-                ))]))
+                Ok(CallToolResult::success(vec![Content::text(
+                    "Status: pending\n\nUse vdsl_sync_logs to check details.".to_string(),
+                )]))
             }
             Some(vdsl_sync::TaskStatus::Running(phase)) => {
+                let display_phase = if phase.is_empty() { "starting".to_string() } else { phase };
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Status: running\nPhase: {phase}\nlog: {}",
-                    current_log_path()
+                    "Status: running\nPhase: {display_phase}\n\nUse vdsl_sync_logs for details, vdsl_sync_cancel to abort.",
                 ))]))
             }
             Some(vdsl_sync::TaskStatus::Failed(msg)) => {
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Status: failed\nError: {msg}\nlog: {}",
-                    current_log_path()
+                    "Status: failed\nError: {msg}\n\nUse vdsl_sync_logs for details.",
                 ))]))
             }
             Some(vdsl_sync::TaskStatus::Completed(result)) => {
@@ -4161,6 +4184,85 @@ impl VdslMcpServer {
                 Ok(CallToolResult::success(vec![Content::text(text)]))
             }
         }
+    }
+
+    #[tool(
+        name = "vdsl_sync_cancel",
+        description = "[sync] Cancel a running sync task. \
+            Immediately aborts the background sync identified by task_id. \
+            Returns whether the cancellation was successful. \
+            Only pending or running tasks can be cancelled.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn sync_cancel(
+        &self,
+        Parameters(req): Parameters<VdslSyncCancelRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let task_id = vdsl_sync::TaskId::parse(&req.task_id);
+        let cancelled = self.sync_task_mgr.cancel(&task_id).await;
+        if cancelled {
+            Ok(CallToolResult::success(vec![Content::text(format!(
+                "Task {} cancelled successfully.",
+                req.task_id
+            ))]))
+        } else {
+            Ok(CallToolResult::success(vec![Content::text(format!(
+                "Task {} could not be cancelled (already completed, failed, or unknown).",
+                req.task_id
+            ))]))
+        }
+    }
+
+    #[tool(
+        name = "vdsl_sync_logs",
+        description = "[sync] Read recent sync log lines. \
+            Returns the tail of the current log file. \
+            Use 'filter' to grep for specific patterns (e.g. 'ERROR', 'transfer', a filename). \
+            Default 50 lines.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn sync_logs(
+        &self,
+        Parameters(req): Parameters<VdslSyncLogsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let log_path = std::path::PathBuf::from(current_log_path());
+        if !log_path.exists() {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "Log file not found: {}",
+                log_path.display()
+            ))]));
+        }
+
+        let content = tokio::fs::read_to_string(&log_path)
+            .await
+            .map_err(|e| McpError::internal_error(format!("failed to read log: {e}"), None))?;
+
+        let lines: Vec<&str> = content.lines().collect();
+        let n = req.lines.unwrap_or(50) as usize;
+
+        let filtered: Vec<&str> = if let Some(ref pat) = req.filter {
+            let pat_lower = pat.to_lowercase();
+            lines
+                .iter()
+                .filter(|l| l.to_lowercase().contains(&pat_lower))
+                .copied()
+                .collect()
+        } else {
+            lines.clone()
+        };
+
+        let start = filtered.len().saturating_sub(n);
+        let result = filtered[start..].join("\n");
+
+        Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
     // =========================================================================
@@ -5099,8 +5201,9 @@ fn default_work_dir() -> std::path::PathBuf {
 /// SdkImpl を構築: Location[] → Scanner自動導出 → TopologyScanner → TopologyStore → TransferEngine → SdkImpl。
 #[cfg(feature = "mlua-backend")]
 async fn build_sdk(
-    work_dir: &std::path::Path,
+    sync_db: &crate::infra::sync_db::SyncDb,
     pod_id: Option<&str>,
+    persistence: &Arc<vdsl_sync::SqliteSyncStore>,
 ) -> anyhow::Result<(
     Arc<dyn vdsl_sync::SyncStoreSdk>,
     Arc<vdsl_sync::SqliteSyncStore>,
@@ -5108,7 +5211,11 @@ async fn build_sdk(
     use crate::application::pod_service::resolve_api_key;
     use crate::infra::runpod_cli::RunPodCli;
     use anyhow::Context as _;
-    use vdsl_sync::{LocationFileStore, LocationId, SqliteSyncStore, TopologyFileStore};
+    use vdsl_sync::{LocationFileStore, LocationId, TopologyFileStore};
+
+    let work_dir = sync_db.path().parent().and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("invalid sync DB path"))?;
+    let db_path = sync_db.path();
 
     // Resolve B2 credentials
     let key_id = std::env::var("VDSL_B2_KEY_ID").context("VDSL_B2_KEY_ID not set")?;
@@ -5117,20 +5224,6 @@ async fn build_sdk(
     anyhow::ensure!(!key.is_empty(), "VDSL_B2_KEY is empty");
     let bucket = std::env::var("VDSL_B2_BUCKET").context("VDSL_B2_BUCKET not set")?;
     anyhow::ensure!(!bucket.is_empty(), "VDSL_B2_BUCKET is empty");
-
-    // Sync DB path: work_dir/.vdsl/sync.db
-    let db_dir = work_dir.join(".vdsl");
-    tokio::fs::create_dir_all(&db_dir)
-        .await
-        .context("failed to create .vdsl dir")?;
-    let db_path = db_dir.join("sync.db");
-
-    // Open SQLite store
-    let persistence = std::sync::Arc::new(
-        SqliteSyncStore::open(&db_path)
-            .await
-            .context("failed to open sync DB")?,
-    );
 
     let rclone_remote = format!(":b2,account={key_id},key={key}:{bucket}");
     let cloud_id = LocationId::new("cloud").context("invalid LocationId 'cloud'")?;
@@ -5301,7 +5394,7 @@ async fn build_sdk(
 
     Ok((
         Arc::new(sdk) as Arc<dyn vdsl_sync::SyncStoreSdk>,
-        persistence,
+        Arc::clone(persistence),
     ))
 }
 
@@ -6430,13 +6523,38 @@ fn format_sync_summary(summary: &vdsl_sync::SyncSummary) -> String {
 }
 
 /// 現在のログファイルパスを返す。
-fn current_log_path() -> String {
-    let log_dir = std::env::var("VDSL_LOG_DIR").unwrap_or_else(|_| {
+fn log_dir() -> String {
+    std::env::var("VDSL_LOG_DIR").unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
         format!("{home}/.vdsl/logs")
-    });
+    })
+}
+
+/// 最新のログファイルパスを返す。
+///
+/// tracing-appenderのUTC日付とLocal日付のずれを回避するため、
+/// ファイル名の日付推定ではなく、ディレクトリ内の最新ファイルを返す。
+fn current_log_path() -> String {
+    let dir = log_dir();
+    let prefix = "vdsl-mcp.log.";
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut candidates: Vec<std::path::PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(prefix))
+            })
+            .collect();
+        candidates.sort();
+        if let Some(latest) = candidates.last() {
+            return latest.to_string_lossy().to_string();
+        }
+    }
+    // fallback: Local日付ベース
     let today = chrono::Local::now().format("%Y-%m-%d");
-    format!("{log_dir}/vdsl-mcp.log.{today}")
+    format!("{dir}/{prefix}{today}")
 }
 
 /// SyncReport（sync/force完了後）を人間可読なSummary文字列に変換する。

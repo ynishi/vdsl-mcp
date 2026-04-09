@@ -467,4 +467,263 @@ mod tests {
             .expect("unblock");
         assert_eq!(unblocked, 0);
     }
+
+    // =========================================================================
+    // E2E: 2回sync → list_deleted が0件であることを検証
+    //
+    // 再現対象: delete 3514件問題
+    // 仮説: 2回目syncでDiscoveredが新IDで生成され、
+    //        upsert path conflict retireで既存TFがdeleted化
+    // =========================================================================
+
+    #[tokio::test]
+    async fn two_syncs_should_not_create_deleted_topology_files() {
+        use crate::application::topology_store::TopologyStore;
+        use crate::domain::digest::{ByteDigest, ContentDigest};
+        use crate::domain::fingerprint::FileFingerprint;
+        use crate::domain::graph::RouteGraph;
+        use crate::domain::topology_delta::{DiscoveredFile, TopologyDelta};
+        use crate::infra::location_file_store::LocationFileStore;
+        use crate::infra::topology_file_store::TopologyFileStore;
+
+        let store = SqliteSyncStore::open_in_memory().await.expect("open");
+        let store = std::sync::Arc::new(store);
+
+        let local = loc("local");
+        let cloud = loc("cloud");
+        let mut graph = RouteGraph::new();
+        graph.add(local.clone(), cloud.clone());
+        graph.add(cloud.clone(), local.clone());
+        let locations = vec![local.clone(), cloud.clone()];
+
+        let topo = TopologyStore::new(
+            store.clone() as std::sync::Arc<dyn TopologyFileStore>,
+            store.clone() as std::sync::Arc<dyn LocationFileStore>,
+            store.clone() as std::sync::Arc<dyn crate::infra::transfer_store::TransferStore>,
+            graph,
+            locations,
+        );
+
+        // 10ファイル分のDiscovered delta
+        let make_deltas = |origin: &LocationId| -> Vec<TopologyDelta> {
+            (0..10)
+                .map(|i| {
+                    TopologyDelta::Discovered(DiscoveredFile {
+                        relative_path: format!("output/img-{i:04}.png"),
+                        file_type: FileType::Image,
+                        fingerprint: FileFingerprint {
+                            byte_digest: Some(ByteDigest::Djb2(format!("hash-{i}"))),
+                            content_digest: Some(ContentDigest(format!("hash-{i}"))),
+                            meta_digest: None,
+                            size: 1024,
+                            modified_at: None,
+                        },
+                        origin: origin.clone(),
+                        embedded_id: None,
+                    })
+                })
+                .collect()
+        };
+
+        // 1回目sync
+        let deltas1 = make_deltas(&local);
+        let result1 = topo.sync(&deltas1).await.expect("sync1");
+        assert_eq!(result1.ingested, 10, "sync1: 10 deltas ingested");
+
+        let deleted_after_sync1 = TopologyFileStore::list_deleted(&*store)
+            .await
+            .expect("list_deleted");
+        assert_eq!(
+            deleted_after_sync1.len(),
+            0,
+            "sync1: no deleted TFs expected"
+        );
+
+        // 2回目sync — 同じファイル群、同じfingerprint
+        // match_and_classify で ByPath → fingerprint unchanged → Skip となるはず
+        // → delta 0件で sync に渡される
+        // しかし実際は compute_topology_deltas を経由するので、
+        // ここでは apply_ingest に渡す Discovered を直接構築して
+        // 「2回目にDiscoveredが再生成される」シナリオをテストする
+        let deltas2 = make_deltas(&local);
+        let _result2 = topo.sync(&deltas2).await.expect("sync2");
+
+        let deleted_after_sync2 = TopologyFileStore::list_deleted(&*store)
+            .await
+            .expect("list_deleted");
+        assert_eq!(
+            deleted_after_sync2.len(),
+            0,
+            "sync2: no deleted TFs expected, but got {} (path conflict retire?)",
+            deleted_after_sync2.len()
+        );
+
+        // activeは10件のまま
+        let active = TopologyFileStore::count_active(&*store)
+            .await
+            .expect("count_active");
+        assert_eq!(active, 10, "active TFs should remain 10");
+    }
+
+    /// Discovered → Vanished → 再Discovered で deleted TF が蓄積しないことを検証
+    #[tokio::test]
+    async fn discovered_vanished_rediscovered_no_stale_deleted() {
+        use crate::application::topology_store::TopologyStore;
+        use crate::domain::digest::{ByteDigest, ContentDigest};
+        use crate::domain::fingerprint::FileFingerprint;
+        use crate::domain::graph::RouteGraph;
+        use crate::domain::topology_delta::{DiscoveredFile, TopologyDelta, VanishedFile};
+        use crate::infra::location_file_store::LocationFileStore;
+        use crate::infra::topology_file_store::TopologyFileStore;
+
+        let store = std::sync::Arc::new(
+            SqliteSyncStore::open_in_memory().await.expect("open"),
+        );
+
+        let local = loc("local");
+        let cloud = loc("cloud");
+        let mut graph = RouteGraph::new();
+        graph.add(local.clone(), cloud.clone());
+        graph.add(cloud.clone(), local.clone());
+
+        let topo = TopologyStore::new(
+            store.clone() as std::sync::Arc<dyn TopologyFileStore>,
+            store.clone() as std::sync::Arc<dyn LocationFileStore>,
+            store.clone() as std::sync::Arc<dyn crate::infra::transfer_store::TransferStore>,
+            graph,
+            vec![local.clone(), cloud.clone()],
+        );
+
+        let fp = FileFingerprint {
+            byte_digest: Some(ByteDigest::Djb2("abc".into())),
+            content_digest: Some(ContentDigest("abc".into())),
+            meta_digest: None,
+            size: 1024,
+            modified_at: None,
+        };
+
+        // sync1: Discovered
+        let d1 = vec![TopologyDelta::Discovered(DiscoveredFile {
+            relative_path: "output/test.png".into(),
+            file_type: FileType::Image,
+            fingerprint: fp.clone(),
+            origin: local.clone(),
+            embedded_id: None,
+        })];
+        topo.sync(&d1).await.expect("sync1");
+
+        let tf_id = {
+            let tfs = TopologyFileStore::list_active(&*store, None, None)
+                .await
+                .expect("list");
+            assert_eq!(tfs.len(), 1);
+            tfs[0].id().to_string()
+        };
+
+        // sync2: Vanished（ファイル消失）
+        let d2 = vec![TopologyDelta::Vanished(VanishedFile {
+            topology_file_id: tf_id.clone(),
+            relative_path: "output/test.png".into(),
+            origin: local.clone(),
+        })];
+        topo.sync(&d2).await.expect("sync2");
+
+        // Vanished後: TF自体はdeleted化しない（mark_deletedは撤回済み）
+        let deleted_after_vanish = TopologyFileStore::list_deleted(&*store)
+            .await
+            .expect("list_deleted");
+        assert_eq!(deleted_after_vanish.len(), 0, "Vanished should not mark_deleted TF");
+
+        // sync3: 再Discovered（同じファイルが戻ってきた）
+        let d3 = vec![TopologyDelta::Discovered(DiscoveredFile {
+            relative_path: "output/test.png".into(),
+            file_type: FileType::Image,
+            fingerprint: fp.clone(),
+            origin: local.clone(),
+            embedded_id: None,
+        })];
+        topo.sync(&d3).await.expect("sync3");
+
+        let deleted_after_rediscovery = TopologyFileStore::list_deleted(&*store)
+            .await
+            .expect("list_deleted");
+        assert_eq!(
+            deleted_after_rediscovery.len(),
+            0,
+            "Re-Discovered should reuse existing TF, not create path conflict. Got {} deleted.",
+            deleted_after_rediscovery.len()
+        );
+    }
+
+    /// 複数Location（local + cloud）から同一ファイルをDiscoveredで報告 → 2回sync
+    #[tokio::test]
+    async fn two_syncs_multi_origin_no_deleted() {
+        use crate::application::topology_store::TopologyStore;
+        use crate::domain::digest::{ByteDigest, ContentDigest};
+        use crate::domain::fingerprint::FileFingerprint;
+        use crate::domain::graph::RouteGraph;
+        use crate::domain::topology_delta::{DiscoveredFile, TopologyDelta};
+        use crate::infra::location_file_store::LocationFileStore;
+        use crate::infra::topology_file_store::TopologyFileStore;
+
+        let store = std::sync::Arc::new(
+            SqliteSyncStore::open_in_memory().await.expect("open"),
+        );
+
+        let local = loc("local");
+        let cloud = loc("cloud");
+        let mut graph = RouteGraph::new();
+        graph.add(local.clone(), cloud.clone());
+        graph.add(cloud.clone(), local.clone());
+
+        let topo = TopologyStore::new(
+            store.clone() as std::sync::Arc<dyn TopologyFileStore>,
+            store.clone() as std::sync::Arc<dyn LocationFileStore>,
+            store.clone() as std::sync::Arc<dyn crate::infra::transfer_store::TransferStore>,
+            graph,
+            vec![local.clone(), cloud.clone()],
+        );
+
+        let fp = |i: usize| FileFingerprint {
+            byte_digest: Some(ByteDigest::Djb2(format!("h-{i}"))),
+            content_digest: Some(ContentDigest(format!("h-{i}"))),
+            meta_digest: None,
+            size: 2048,
+            modified_at: None,
+        };
+
+        // sync1: local + cloud の両方から同一5ファイルをDiscovered
+        let mut deltas1 = Vec::new();
+        for i in 0..5 {
+            for origin in [&local, &cloud] {
+                deltas1.push(TopologyDelta::Discovered(DiscoveredFile {
+                    relative_path: format!("output/multi-{i:04}.png"),
+                    file_type: FileType::Image,
+                    fingerprint: fp(i),
+                    origin: origin.clone(),
+                    embedded_id: None,
+                }));
+            }
+        }
+        topo.sync(&deltas1).await.expect("sync1");
+
+        let deleted1 = TopologyFileStore::list_deleted(&*store)
+            .await
+            .expect("list_deleted");
+        assert_eq!(deleted1.len(), 0, "sync1: no deleted TFs");
+
+        // sync2: 同じデルタ
+        topo.sync(&deltas1).await.expect("sync2");
+
+        let deleted2 = TopologyFileStore::list_deleted(&*store)
+            .await
+            .expect("list_deleted");
+        assert_eq!(
+            deleted2.len(),
+            0,
+            "sync2: no deleted TFs, got {} — paths: {:?}",
+            deleted2.len(),
+            deleted2.iter().map(|t| t.relative_path()).collect::<Vec<_>>()
+        );
+    }
 }

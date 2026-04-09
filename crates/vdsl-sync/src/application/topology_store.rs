@@ -730,28 +730,10 @@ impl TopologyStore {
                         lf.mark_missing();
                         self.location_files.upsert(&lf).await?;
                     }
-                    // Scan-based delete propagation:
-                    // localがauthoritative sourceなので、local消失時はTopologyFileを削除済みにマーク。
-                    // 既存のdelete_transfersループが各locationへDelete Transferを発行する
-                    // (cloud → archive_move, pod → hard delete)。
-                    if v.origin.is_local() {
-                        if let Some(mut tf) = self
-                            .topology_files
-                            .get_by_id(&v.topology_file_id)
-                            .await?
-                        {
-                            if !tf.is_deleted() {
-                                tf.mark_deleted();
-                                self.topology_files.upsert(&tf).await?;
-                                debug!(
-                                    tf_id = %v.topology_file_id,
-                                    path = %v.relative_path,
-                                    "apply_ingest: Vanished on local → TopologyFile marked deleted"
-                                );
-                            }
-                        }
-                    }
                     // Vanished ではingest_originsに追加しない（消失はsourceにならない）
+                    // NOTE: scan-based delete propagation (Vanished on local → mark_deleted)
+                    // は ByHash誤判定によるpath conflict retire → 大量誤削除の問題があるため
+                    // 撤回。削除は明示 delete() API のみで行う。
                 }
             }
         }

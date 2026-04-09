@@ -242,8 +242,9 @@ impl LocationScanner for SshScanner {
         })?;
 
         // Phase 1: find でファイルリスト取得
+        // -L: symlinkをfollow（pod上の output/ が symlink の場合に対応）
         let find_cmd = format!(
-            "find '{}' -type f -not -name '.*'",
+            "find -L '{}' -type f -not -name '.*'",
             root_str.replace('\'', "'\\''")
         );
         let output = self
