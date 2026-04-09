@@ -537,6 +537,62 @@ impl StorageBackend for RcloneBackend {
         .await
     }
 
+    /// Batch archive-move using `rclone move --files-from`.
+    ///
+    /// Moves files from `src_root` to `archive_dest_root` preserving relative
+    /// paths. Uses the same chunked execution as other batch operations.
+    async fn archive_move_batch(
+        &self,
+        src_root: &str,
+        archive_dest_root: &str,
+        relative_paths: &[String],
+    ) -> HashMap<String, Result<(), InfraError>> {
+        if relative_paths.is_empty() {
+            return HashMap::new();
+        }
+
+        let src_full = match self.remote_path(src_root) {
+            Ok(r) => r,
+            Err(_) => {
+                return Self::all_batch_err(
+                    relative_paths,
+                    &format!("invalid src_root for batch archive_move: {src_root}"),
+                );
+            }
+        };
+
+        let dest_full = match self.remote_path(archive_dest_root) {
+            Ok(r) => r,
+            Err(_) => {
+                return Self::all_batch_err(
+                    relative_paths,
+                    &format!(
+                        "invalid archive_dest_root for batch archive_move: {archive_dest_root}"
+                    ),
+                );
+            }
+        };
+
+        self.exec_batch_chunked(
+            relative_paths,
+            "archive_move",
+            |chunk, list_filename, sftp_flags, _chunk_timeout| {
+                let file_list = chunk.join("\n");
+                let src = &src_full;
+                let dest = &dest_full;
+                format!(
+                    "cat <<'__VDSL_EOF__' > /tmp/{list_filename}\n\
+                     {file_list}\n\
+                     __VDSL_EOF__\n\
+                     rclone move {src} {dest} \
+                       --files-from /tmp/{list_filename} --transfers 8{sftp_flags}; \
+                     _rc=$?; rm -f /tmp/{list_filename}; exit $_rc"
+                )
+            },
+        )
+        .await
+    }
+
     fn supports_batch(&self) -> bool {
         true
     }

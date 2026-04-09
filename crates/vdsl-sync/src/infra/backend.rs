@@ -92,6 +92,37 @@ pub trait StorageBackend: Send + Sync {
         })
     }
 
+    /// Batch archive-move: relocate multiple files from `src_root` to
+    /// `archive_dest_root` preserving relative paths.
+    ///
+    /// Semantics: for each `relative_path`, moves
+    /// `{src_root}/{relative_path}` → `{archive_dest_root}/{relative_path}`.
+    ///
+    /// Default implementation falls back to sequential `archive_move()`.
+    async fn archive_move_batch(
+        &self,
+        src_root: &str,
+        archive_dest_root: &str,
+        relative_paths: &[String],
+    ) -> HashMap<String, Result<(), InfraError>> {
+        let mut results = HashMap::with_capacity(relative_paths.len());
+        for rel in relative_paths {
+            let src = if src_root.is_empty() {
+                rel.clone()
+            } else {
+                format!("{src_root}/{rel}")
+            };
+            let dest = if archive_dest_root.is_empty() {
+                rel.clone()
+            } else {
+                format!("{archive_dest_root}/{rel}")
+            };
+            let result = self.archive_move(&src, &dest).await;
+            results.insert(rel.clone(), result);
+        }
+        results
+    }
+
     /// Push multiple files in a single batch operation.
     ///
     /// `src_root` is the local base directory, `dest_root` is the remote base,

@@ -455,15 +455,31 @@ impl TransferRoute {
 
         match self.direction {
             TransferDirection::Push => {
-                if self.archive_root.is_some() {
-                    // Archive mode: fall back to per-file archive_move.
-                    // No batch archive_move primitive; acceptable since deletes
-                    // are low-volume compared to sync transfers.
-                    let mut results = HashMap::with_capacity(relative_paths.len());
-                    for rel in relative_paths {
-                        results.insert(rel.clone(), self.delete(rel).await);
-                    }
-                    return results;
+                if let Some(archive_root) = &self.archive_root {
+                    // Archive mode: batch move to {archive_root}/{ts}/
+                    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+                    let dest_root_str =
+                        self.dest_file_root.to_str().unwrap_or_default();
+                    let archive_dest = archive_root.join(&ts);
+                    let archive_dest_str =
+                        archive_dest.to_string_lossy().into_owned();
+                    tracing::debug!(
+                        src = dest_root_str,
+                        archive = %archive_dest_str,
+                        count = relative_paths.len(),
+                        "route::delete_batch: archive_move_batch (soft-delete)"
+                    );
+                    return self
+                        .backend
+                        .archive_move_batch(
+                            dest_root_str,
+                            &archive_dest_str,
+                            relative_paths,
+                        )
+                        .await
+                        .into_iter()
+                        .map(|(k, v)| (k, v.map_err(Into::into)))
+                        .collect();
                 }
                 let dest_root_str = self.dest_file_root.to_str().unwrap_or_default();
                 self.backend
