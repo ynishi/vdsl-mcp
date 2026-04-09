@@ -2,3 +2,4 @@
 workspace
 tmp
 .mcp.json
+.claude
