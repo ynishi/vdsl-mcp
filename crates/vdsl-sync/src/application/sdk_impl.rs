@@ -135,11 +135,7 @@ impl SdkImplBuilder {
     /// `{archive_root}/{ISO8601_ts}/{relative_path}` instead of hard-deleting.
     /// The backend must implement `archive_move` (e.g. RcloneBackend via
     /// `rclone moveto`).
-    pub fn archive_route_to(
-        mut self,
-        dest: &LocationId,
-        archive_root: std::path::PathBuf,
-    ) -> Self {
+    pub fn archive_route_to(mut self, dest: &LocationId, archive_root: std::path::PathBuf) -> Self {
         self.archive_roots.insert(dest.clone(), archive_root);
         self
     }
@@ -537,13 +533,8 @@ impl SdkImpl {
                     outcomes = sync_outcomes.len(),
                     "execute_bfs: sync execution done, persisting"
                 );
-                self.persist_outcomes(
-                    &sync_outcomes,
-                    total_transferred,
-                    total_failed,
-                    all_errors,
-                )
-                .await?;
+                self.persist_outcomes(&sync_outcomes, total_transferred, total_failed, all_errors)
+                    .await?;
             }
 
             // Phase B: Delete transfers → execute → DB persist
@@ -983,14 +974,23 @@ impl SyncStoreSdk for SdkImpl {
         info!(path = %path, "sdk_impl::restore: physical restore done");
 
         // 3. 削除済みTopologyFileを取得して unmark
+        //    delete transfers 完走後は TF が hard-delete されている (commit c8213ce)
+        //    ため見つからないケースがある。物理 restore は既に完了しているので
+        //    次回 full sync で cloud から再発見させれば整合が取れる。
         let deleted_tfs = self.topology_files.list_deleted().await?;
-        let mut tf = deleted_tfs
-            .into_iter()
-            .find(|t| t.relative_path() == path)
-            .ok_or_else(|| SyncError::NotRegistered(path.to_string()))?;
-        tf.unmark_deleted();
-        self.topology_files.upsert(&tf).await?;
-        info!(path = %path, file_id = %tf.id(), "sdk_impl::restore: TopologyFile unmarked");
+        match deleted_tfs.into_iter().find(|t| t.relative_path() == path) {
+            Some(mut tf) => {
+                tf.unmark_deleted();
+                self.topology_files.upsert(&tf).await?;
+                info!(path = %path, file_id = %tf.id(), "sdk_impl::restore: TopologyFile unmarked");
+            }
+            None => {
+                warn!(
+                    path = %path,
+                    "sdk_impl::restore: TopologyFile not in deleted list (likely hard-deleted after delete transfers). Physical restore succeeded — next full sync will re-register."
+                );
+            }
+        }
 
         Ok(())
     }

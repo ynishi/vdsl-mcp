@@ -110,7 +110,29 @@ impl SyncTaskManager {
     ///
     /// SyncDb.ensure() で取得した store を毎回渡すこと。
     /// DB再構築時は新しい store に差し替わる。
+    ///
+    /// # Deprecation note
+    ///
+    /// 新規コードは `set_store_for_syncd` または `set_store_no_recover` を使用すること。
+    /// - syncd 起動時: `set_store_for_syncd` (recover を実行)
+    /// - mcp fallback 経路: `set_store_no_recover` (recover しない)
+    ///
+    /// 本メソッドは既存の mcp モード (`Command::Mcp`) の互換性維持のため残している。
+    /// mcp モードは syncd プロセスが存在しない状態で起動するため、recover は安全。
     pub async fn set_store(&self, store: Arc<SqliteSyncStore>) {
+        self.set_store_for_syncd(store).await;
+    }
+
+    /// DB store を設定し、起動時 stale recover を実行する。
+    ///
+    /// syncd プロセス起動時の専用メソッド。
+    /// `AtomicBool` で初回のみ recover が実行されるため、
+    /// 複数回呼んでも recover は 1 回のみ。
+    ///
+    /// mcp と syncd が別プロセスで同時に起動した場合に
+    /// 互いのタスクを failed 化する問題を避けるため、
+    /// recover の呼び出しはこのメソッドを通じてのみ行う。
+    pub async fn set_store_for_syncd(&self, store: Arc<SqliteSyncStore>) {
         // 初回のみ recovery を実行
         if !self.recovered.load(std::sync::atomic::Ordering::Acquire) {
             let recovered = store.recover_stale_running().await;
@@ -126,6 +148,17 @@ impl SyncTaskManager {
             self.recovered
                 .store(true, std::sync::atomic::Ordering::Release);
         }
+        let mut guard = self.store.write().await;
+        *guard = Some(store);
+    }
+
+    /// DB store を設定する。recover は実行しない。
+    ///
+    /// mcp fallback 経路 (syncd spawn に失敗した場合) 専用。
+    /// syncd プロセスが既に recover を実行している状態では、
+    /// mcp 側が再度 recover すると syncd の running タスクを
+    /// failed 化してしまう。このメソッドはその問題を回避する。
+    pub async fn set_store_no_recover(&self, store: Arc<SqliteSyncStore>) {
         let mut guard = self.store.write().await;
         *guard = Some(store);
     }

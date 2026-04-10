@@ -26,10 +26,13 @@ use crate::application::storage_service::{self, StorageService, RCLONE_OP_TIMEOU
 use crate::domain::models::{format_model_catalog_with_limit, parse_model_catalog};
 use crate::domain::pod::{format_pod_list, format_volume_list};
 use crate::infra::comfyui_client::{proxy_url, ComfyUiClient};
+use crate::infra::config::SyncdConfig;
 #[cfg(feature = "mlua-backend")]
 use crate::infra::mlua_runtime::MluaRuntime;
 use crate::infra::runpod_cli::RunPodCli;
 use crate::infra::sync_tasks::SyncTaskManager;
+use crate::infra::syncd_client::SyncdClient;
+use crate::infra::syncd_spawn::{ensure_syncd_running, SyncdStatus};
 
 // =============================================================================
 // Public entry point
@@ -71,15 +74,23 @@ struct VdslMcpServer {
     /// If SyncDb.generation() differs, SDK must be rebuilt.
     sync_sdk_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Sync DB lifecycle manager. Ensures DB file existence on every access.
-    #[cfg(feature = "mlua-backend")]
     sync_db: Arc<crate::infra::sync_db::SyncDb>,
     /// Background task manager for sync operations.
     /// Shared between MCP tools and Lua runtime.
     sync_task_mgr: Arc<SyncTaskManager>,
+    /// syncd config — port, pid_file 等。probe / spawn に使用。
+    syncd_cfg: SyncdConfig,
+    /// syncd HTTP client — probe / delegate に使用。
+    syncd_client: Arc<SyncdClient>,
 }
 
 impl VdslMcpServer {
     fn new() -> Self {
+        // config は起動時に load する。失敗時は default 値で継続。
+        let app_cfg = crate::infra::config::AppConfig::load(None).unwrap_or_default();
+        let syncd_cfg = app_cfg.syncd;
+        let syncd_client = Arc::new(SyncdClient::from_config(&syncd_cfg));
+
         Self {
             tool_router: Self::tool_router(),
             last_url: Arc::new(Mutex::new(None)),
@@ -88,9 +99,10 @@ impl VdslMcpServer {
             sync_sdk: Arc::new(tokio::sync::Mutex::new(None)),
             sync_sdk_pod_id: Arc::new(Mutex::new(None)),
             sync_sdk_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            #[cfg(feature = "mlua-backend")]
             sync_db: Arc::new(crate::infra::sync_db::SyncDb::new(&default_work_dir())),
             sync_task_mgr: Arc::new(SyncTaskManager::new()),
+            syncd_cfg,
+            syncd_client,
         }
     }
 
@@ -130,20 +142,23 @@ impl VdslMcpServer {
         }
 
         // ensure() を先に呼ぶ。DB消失時はここで再構築+generation bump。
-        let persistence = self.sync_db.ensure().await.map_err(|e| {
-            McpError::invalid_params(format!("sync DB ensure failed: {e:#}"), None)
-        })?;
+        let persistence =
+            self.sync_db.ensure().await.map_err(|e| {
+                McpError::invalid_params(format!("sync DB ensure failed: {e:#}"), None)
+            })?;
         let current_gen = self.sync_db.generation();
 
         let built_pod_id = self.sync_sdk_pod_id.lock().ok().and_then(|g| g.clone());
-        let built_gen = self.sync_sdk_generation.load(std::sync::atomic::Ordering::Acquire);
+        let built_gen = self
+            .sync_sdk_generation
+            .load(std::sync::atomic::Ordering::Acquire);
 
         let mut guard = self.sync_sdk.lock().await;
 
         // Return existing SDK if pod_id unchanged AND generation unchanged.
         if let Some(ref sdk) = *guard {
             if built_pod_id == current_pod_id && built_gen == current_gen {
-                self.sync_task_mgr.set_store(persistence).await;
+                self.sync_task_mgr.set_store_no_recover(persistence).await;
                 return Ok(sdk.clone());
             }
             if built_gen != current_gen {
@@ -169,18 +184,16 @@ impl VdslMcpServer {
                 McpError::invalid_params(format!("Failed to initialize sync SDK: {e:#}"), None)
             })?;
 
-        self.sync_task_mgr.set_store(persistence).await;
+        self.sync_task_mgr.set_store_no_recover(persistence).await;
 
         *guard = Some(sdk.clone());
         if let Ok(mut pid_guard) = self.sync_sdk_pod_id.lock() {
             *pid_guard = current_pod_id;
         }
-        self.sync_sdk_generation.store(current_gen, std::sync::atomic::Ordering::Release);
+        self.sync_sdk_generation
+            .store(current_gen, std::sync::atomic::Ordering::Release);
 
-        tracing::info!(
-            generation = current_gen,
-            "resolve_or_init_sdk: SDK built"
-        );
+        tracing::info!(generation = current_gen, "resolve_or_init_sdk: SDK built");
 
         Ok(sdk)
     }
@@ -3894,6 +3907,24 @@ impl VdslMcpServer {
         )
     )]
     async fn sync(&self) -> Result<CallToolResult, McpError> {
+        // probe → syncd 委譲 / 未稼働なら spawn → fallback
+        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client).await {
+            SyncdStatus::Running => {
+                let resp = self.syncd_client.delegate_sync().await.map_err(|e| {
+                    McpError::internal_error(format!("syncd delegate_sync failed: {e}"), None)
+                })?;
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "sync spawned (via syncd).\ntask_id: {}\n\nUse vdsl_sync_poll with this task_id to check progress.",
+                    resp.task_id
+                ))]));
+            }
+            status => {
+                tracing::warn!(
+                    ?status,
+                    "syncd unavailable, falling back to direct execution"
+                );
+            }
+        }
         let db = self.resolve_or_init_sdk().await?;
         let task_id = self
             .sync_task_mgr
@@ -3923,6 +3954,31 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslSyncRouteRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // probe → syncd 委譲 / 未稼働なら spawn → fallback
+        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client).await {
+            SyncdStatus::Running => {
+                let resp = self
+                    .syncd_client
+                    .delegate_sync_route(&req.src, &req.dest)
+                    .await
+                    .map_err(|e| {
+                        McpError::internal_error(
+                            format!("syncd delegate_sync_route failed: {e}"),
+                            None,
+                        )
+                    })?;
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "sync_route spawned ({} → {}) (via syncd).\ntask_id: {}\n\nUse vdsl_sync_poll with this task_id to check progress.",
+                    req.src, req.dest, resp.task_id
+                ))]));
+            }
+            status => {
+                tracing::warn!(
+                    ?status,
+                    "syncd unavailable, falling back to direct execution"
+                );
+            }
+        }
         let db = self.resolve_or_init_sdk().await?;
         let src = vdsl_sync::LocationId::new(&req.src)
             .map_err(|e| McpError::invalid_params(format!("invalid src location: {e}"), None))?;
@@ -3959,7 +4015,9 @@ impl VdslMcpServer {
         let db_path = self.sync_db.path();
         let db_size = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
         let gen = self.sync_db.generation();
-        let sdk_gen = self.sync_sdk_generation.load(std::sync::atomic::Ordering::Acquire);
+        let sdk_gen = self
+            .sync_sdk_generation
+            .load(std::sync::atomic::Ordering::Acquire);
         text.push_str(&format!(
             "DB: {} ({}KB, gen={}, sdk_gen={})\n\n",
             db_path.display(),
@@ -4090,6 +4148,28 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslSyncDeleteRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // probe → syncd 委譲 / 未稼働なら spawn → fallback
+        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client).await {
+            SyncdStatus::Running => {
+                let created = self
+                    .syncd_client
+                    .delegate_delete(&req.path)
+                    .await
+                    .map_err(|e| {
+                        McpError::internal_error(format!("syncd delegate_delete failed: {e}"), None)
+                    })?;
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Marked for deletion: {}\nDelete transfers created: {} (via syncd)\n\nRun vdsl_sync to execute.",
+                    req.path, created
+                ))]));
+            }
+            status => {
+                tracing::warn!(
+                    ?status,
+                    "syncd unavailable, falling back to direct execution"
+                );
+            }
+        }
         let sdk = self.resolve_or_init_sdk().await?;
         let created = sdk.delete(&req.path).await.map_err(Self::to_mcp_error)?;
         Ok(CallToolResult::success(vec![Content::text(format!(
@@ -4114,6 +4194,30 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslSyncRestoreRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // probe → syncd 委譲 / 未稼働なら spawn → fallback
+        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client).await {
+            SyncdStatus::Running => {
+                self.syncd_client
+                    .delegate_restore(&req.path, &req.revision)
+                    .await
+                    .map_err(|e| {
+                        McpError::internal_error(
+                            format!("syncd delegate_restore failed: {e}"),
+                            None,
+                        )
+                    })?;
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Restored: {} (revision {}) (via syncd)\n\nRun vdsl_sync to redistribute.",
+                    req.path, req.revision
+                ))]));
+            }
+            status => {
+                tracing::warn!(
+                    ?status,
+                    "syncd unavailable, falling back to direct execution"
+                );
+            }
+        }
         let sdk = self.resolve_or_init_sdk().await?;
         sdk.restore(&req.path, &req.revision)
             .await
@@ -4181,6 +4285,38 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslSyncPollRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // syncd 稼働中はタスク状態を syncd に問い合わせる (in-memory state が syncd 側にある)
+        if self.syncd_client.probe().await {
+            let resp = self
+                .syncd_client
+                .delegate_poll(&req.task_id)
+                .await
+                .map_err(|e| {
+                    McpError::internal_error(format!("syncd delegate_poll failed: {e}"), None)
+                })?;
+            let text = match resp.status.as_str() {
+                "pending" => "Status: pending\n\nUse vdsl_sync_logs to check details.".to_string(),
+                "running" => {
+                    let phase = resp.phase.as_deref().unwrap_or("starting");
+                    format!("Status: running\nPhase: {phase}\n\nUse vdsl_sync_logs for details, vdsl_sync_cancel to abort.")
+                }
+                "failed" => format!(
+                    "Status: failed\nError: {}\n\nUse vdsl_sync_logs for details.",
+                    resp.error.as_deref().unwrap_or("unknown")
+                ),
+                "done" => {
+                    let result_text = resp
+                        .result
+                        .map(|v| {
+                            format!("\n{}", serde_json::to_string_pretty(&v).unwrap_or_default())
+                        })
+                        .unwrap_or_default();
+                    format!("Status: completed{result_text}")
+                }
+                _ => format!("Unknown task_id: {}", req.task_id),
+            };
+            return Ok(CallToolResult::success(vec![Content::text(text)]));
+        }
         let task_id = vdsl_sync::TaskId::parse(&req.task_id);
         let status = self.sync_task_mgr.poll(&task_id).await;
         match status {
@@ -4194,7 +4330,11 @@ impl VdslMcpServer {
                 )]))
             }
             Some(vdsl_sync::TaskStatus::Running(phase)) => {
-                let display_phase = if phase.is_empty() { "starting".to_string() } else { phase };
+                let display_phase = if phase.is_empty() {
+                    "starting".to_string()
+                } else {
+                    phase
+                };
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Status: running\nPhase: {display_phase}\n\nUse vdsl_sync_logs for details, vdsl_sync_cancel to abort.",
                 ))]))
@@ -4239,6 +4379,24 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslSyncCancelRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // syncd 稼働中はキャンセルを syncd に委譲する
+        if self.syncd_client.probe().await {
+            let ok = self
+                .syncd_client
+                .delegate_cancel(&req.task_id)
+                .await
+                .map_err(|e| {
+                    McpError::internal_error(format!("syncd delegate_cancel failed: {e}"), None)
+                })?;
+            return Ok(CallToolResult::success(vec![Content::text(if ok {
+                format!("Task {} cancelled successfully (via syncd).", req.task_id)
+            } else {
+                format!(
+                    "Task {} could not be cancelled (already completed, failed, or unknown).",
+                    req.task_id
+                )
+            })]));
+        }
         let task_id = vdsl_sync::TaskId::parse(&req.task_id);
         let cancelled = self.sync_task_mgr.cancel(&task_id).await;
         if cancelled {
@@ -5212,8 +5370,7 @@ async fn exec_lua_mlua(
 /// Resolve default work_dir for Store initialization.
 ///
 /// Priority: `VDSL_WORK_DIR` env var → `~/vdsl`.
-#[cfg(feature = "mlua-backend")]
-fn default_work_dir() -> std::path::PathBuf {
+pub(crate) fn default_work_dir() -> std::path::PathBuf {
     std::env::var("VDSL_WORK_DIR")
         .ok()
         .filter(|s| !s.is_empty())
@@ -5236,8 +5393,7 @@ fn default_work_dir() -> std::path::PathBuf {
 /// - `VDSL_B2_KEY_ID`, `VDSL_B2_KEY`, `VDSL_B2_BUCKET`
 ///
 /// SdkImpl を構築: Location[] → Scanner自動導出 → TopologyScanner → TopologyStore → TransferEngine → SdkImpl。
-#[cfg(feature = "mlua-backend")]
-async fn build_sdk(
+pub(crate) async fn build_sdk(
     sync_db: &crate::infra::sync_db::SyncDb,
     pod_id: Option<&str>,
     persistence: &Arc<vdsl_sync::SqliteSyncStore>,
@@ -5250,7 +5406,10 @@ async fn build_sdk(
     use anyhow::Context as _;
     use vdsl_sync::{LocationFileStore, LocationId, TopologyFileStore};
 
-    let work_dir = sync_db.path().parent().and_then(|p| p.parent())
+    let work_dir = sync_db
+        .path()
+        .parent()
+        .and_then(|p| p.parent())
         .ok_or_else(|| anyhow::anyhow!("invalid sync DB path"))?;
     let db_path = sync_db.path();
 

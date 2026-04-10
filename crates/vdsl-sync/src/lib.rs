@@ -36,7 +36,7 @@ pub use domain::view::{ErrorEntry, PendingEntry, PresenceState, PresenceView};
 // --- Builder boundary types (SdkImplBuilder construction) ---
 pub use infra::backend::{ProgressFn, StorageBackend};
 pub use infra::error::InfraError;
-pub use infra::hasher::{ContentHasher, Djb2Hasher};
+pub use infra::hasher::{ContentHasher, Djb2Hasher, HashResult};
 pub use infra::location::{CloudLocation, LocalLocation, Location, SshLocation};
 pub use infra::location_file_store::LocationFileStore;
 pub use infra::rclone::RcloneBackend;

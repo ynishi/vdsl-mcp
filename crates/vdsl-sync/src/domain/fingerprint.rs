@@ -188,6 +188,32 @@ impl FileFingerprint {
     pub fn effective_precision(&self, other: &FileFingerprint) -> FingerprintPrecision {
         std::cmp::min(self.precision(), other.precision())
     }
+
+    /// ローカルファイルのハッシュ結果から `FileFingerprint` を構築するファクトリ関数。
+    ///
+    /// `watcher` 等の外部クレートが `ByteDigest` / `ContentDigest` を直接構築せずに
+    /// `FileFingerprint` を生成するためのパブリック API。
+    ///
+    /// # Parameters
+    ///
+    /// - `file_hash`: DJB2 ハッシュ文字列 (16 文字 hex)
+    /// - `content_hash`: PNG 等のセマンティックハッシュ (Optional)
+    /// - `size`: ファイルサイズ (bytes)
+    /// - `modified_at`: 最終更新日時 (Optional)
+    pub fn from_local_hash(
+        file_hash: String,
+        content_hash: Option<String>,
+        size: u64,
+        modified_at: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self {
+            byte_digest: Some(ByteDigest::Djb2(file_hash)),
+            content_digest: content_hash.map(ContentDigest),
+            meta_digest: None,
+            size,
+            modified_at,
+        }
+    }
 }
 
 impl std::fmt::Display for FingerprintPrecision {

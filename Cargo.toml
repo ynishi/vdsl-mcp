@@ -27,5 +27,13 @@ tempfile = "3"
 secrecy = "0.10"
 walkdir = "2"
 
+config = { version = "0.14", default-features = false, features = ["toml"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+nix = { version = "0.29", features = ["process", "signal"] }
+axum = "0.8"
+notify = "8"
+notify-debouncer-full = "0.6"
+
 # Internal
 vdsl-sync = { version = "0.2.0", path = "crates/vdsl-sync" }

@@ -576,9 +576,7 @@ mod tests {
         use crate::infra::location_file_store::LocationFileStore;
         use crate::infra::topology_file_store::TopologyFileStore;
 
-        let store = std::sync::Arc::new(
-            SqliteSyncStore::open_in_memory().await.expect("open"),
-        );
+        let store = std::sync::Arc::new(SqliteSyncStore::open_in_memory().await.expect("open"));
 
         let local = loc("local");
         let cloud = loc("cloud");
@@ -632,7 +630,11 @@ mod tests {
         let deleted_after_vanish = TopologyFileStore::list_deleted(&*store)
             .await
             .expect("list_deleted");
-        assert_eq!(deleted_after_vanish.len(), 0, "Vanished should not mark_deleted TF");
+        assert_eq!(
+            deleted_after_vanish.len(),
+            0,
+            "Vanished should not mark_deleted TF"
+        );
 
         // sync3: 再Discovered（同じファイルが戻ってきた）
         let d3 = vec![TopologyDelta::Discovered(DiscoveredFile {
@@ -666,9 +668,7 @@ mod tests {
         use crate::infra::location_file_store::LocationFileStore;
         use crate::infra::topology_file_store::TopologyFileStore;
 
-        let store = std::sync::Arc::new(
-            SqliteSyncStore::open_in_memory().await.expect("open"),
-        );
+        let store = std::sync::Arc::new(SqliteSyncStore::open_in_memory().await.expect("open"));
 
         let local = loc("local");
         let cloud = loc("cloud");
@@ -723,7 +723,10 @@ mod tests {
             0,
             "sync2: no deleted TFs, got {} — paths: {:?}",
             deleted2.len(),
-            deleted2.iter().map(|t| t.relative_path()).collect::<Vec<_>>()
+            deleted2
+                .iter()
+                .map(|t| t.relative_path())
+                .collect::<Vec<_>>()
         );
     }
 }

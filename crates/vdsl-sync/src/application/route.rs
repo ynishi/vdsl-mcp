@@ -237,14 +237,12 @@ impl TransferRoute {
         }
         let archive_full = archive_root.join(revision).join(relative_path);
         let dest_full = Self::safe_join(&self.dest_file_root, relative_path);
-        let archive_str = archive_full
-            .to_str()
-            .ok_or_else(|| -> SyncError {
-                InfraError::Transfer {
-                    reason: format!("archive path not valid UTF-8: {}", archive_full.display()),
-                }
-                .into()
-            })?;
+        let archive_str = archive_full.to_str().ok_or_else(|| -> SyncError {
+            InfraError::Transfer {
+                reason: format!("archive path not valid UTF-8: {}", archive_full.display()),
+            }
+            .into()
+        })?;
         let dest_str = dest_full.to_str().ok_or_else(|| -> SyncError {
             InfraError::Transfer {
                 reason: format!("dest path not valid UTF-8: {}", dest_full.display()),
@@ -458,11 +456,9 @@ impl TransferRoute {
                 if let Some(archive_root) = &self.archive_root {
                     // Archive mode: batch move to {archive_root}/{ts}/
                     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-                    let dest_root_str =
-                        self.dest_file_root.to_str().unwrap_or_default();
+                    let dest_root_str = self.dest_file_root.to_str().unwrap_or_default();
                     let archive_dest = archive_root.join(&ts);
-                    let archive_dest_str =
-                        archive_dest.to_string_lossy().into_owned();
+                    let archive_dest_str = archive_dest.to_string_lossy().into_owned();
                     tracing::debug!(
                         src = dest_root_str,
                         archive = %archive_dest_str,
@@ -471,11 +467,7 @@ impl TransferRoute {
                     );
                     return self
                         .backend
-                        .archive_move_batch(
-                            dest_root_str,
-                            &archive_dest_str,
-                            relative_paths,
-                        )
+                        .archive_move_batch(dest_root_str, &archive_dest_str, relative_paths)
                         .await
                         .into_iter()
                         .map(|(k, v)| (k, v.map_err(Into::into)))
