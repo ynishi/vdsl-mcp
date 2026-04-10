@@ -373,7 +373,18 @@ impl LocationScanner for CloudScanner {
 
         let files: Vec<ScannedFile> = remote_files
             .into_iter()
-            .filter(|f| !excludes.iter().any(|p| p.matches(&f.path)))
+            .filter(|f| {
+                // basenameが `.` 開始のhidden fileを除外（Local/SSH scannerと挙動統一）。
+                // macOS AppleDouble (`._*`)・`.DS_Store` 等が全階層で除外される。
+                let hidden = Path::new(&f.path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with('.'));
+                if hidden {
+                    return false;
+                }
+                !excludes.iter().any(|p| p.matches(&f.path))
+            })
             .map(|f| ScannedFile {
                 file_type: infer_file_type(&f.path),
                 fingerprint: FileFingerprint {

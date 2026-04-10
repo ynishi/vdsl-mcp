@@ -5327,6 +5327,8 @@ async fn build_sdk(
     .exclude(".vdsl")
     .exclude(".vdsl/**")
     .exclude(".*")
+    .exclude("**/.*")
+    .exclude("**/*.partial")
     // Archive-on-delete: cloud (B2) は hard delete ではなく
     // vdsl/archived/{ISO8601_ts}/{relative_path} へ moveto する。
     // local/pod への Delete は通常通り hard delete。
