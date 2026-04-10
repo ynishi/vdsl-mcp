@@ -271,7 +271,7 @@ impl StorageBackend for RcloneBackend {
         // --files-only excludes directory markers (B2/S3 "folders" are 0-byte objects
         // that would be registered as files, causing phantom delete transfers).
         let output = self
-            .exec_rclone(&["lsf", "--format", "pst", "--files-only", &target])
+            .exec_rclone(&["lsf", "-R", "--format", "pst", "--files-only", &target])
             .await?;
 
         let mut files = Vec::new();
