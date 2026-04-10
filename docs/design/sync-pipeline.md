@@ -212,11 +212,16 @@ a cached SDK. Verified: clean-DB sync produced 0 delete transfers (previously 3,
 
 See commit: `fix(sync): invalidate cached SDK when SyncDb is rebuilt`
 
-### P4: Phase display becomes stale during long operations
+### P4: Phase display becomes stale during long operations (FIXED)
 
-`report_progress()` is called at the start of `process_target_batch()` and not updated during
-execution. During 3,514 per-file moveto operations, the phase string remains unchanged.
-No progress visibility.
+`report_progress()` was only called once at the start of `process_target_batch()`.
+During long batch operations, the phase string remained unchanged.
+
+**Fix**: Added `report_progress()` calls before/after sync and delete execution within
+`process_target_batch()`. Phase now transitions through: `target X: N queued` →
+`target X: syncing N files` → `target X: sync done, persisting N` →
+`target X: deleting N files` → `target X: delete done, persisting N`.
+Rclone chunk-level progress was already reported via backend callback.
 
 ## 4. Data Flow
 

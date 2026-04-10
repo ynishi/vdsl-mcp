@@ -518,12 +518,20 @@ impl SdkImpl {
 
             // Phase A: Sync transfers → execute → DB persist
             if !sync_prepared.is_empty() {
+                self.report_progress(&format!(
+                    "target {target}: syncing {} files",
+                    sync_prepared.len()
+                ));
                 info!(
                     target = %target,
                     count = sync_prepared.len(),
                     "execute_bfs: executing sync transfers"
                 );
                 let sync_outcomes = self.engine.execute_prepared(sync_prepared).await;
+                self.report_progress(&format!(
+                    "target {target}: sync done, persisting {}",
+                    sync_outcomes.len()
+                ));
                 info!(
                     target = %target,
                     outcomes = sync_outcomes.len(),
@@ -540,12 +548,20 @@ impl SdkImpl {
 
             // Phase B: Delete transfers → execute → DB persist
             if !delete_prepared.is_empty() {
+                self.report_progress(&format!(
+                    "target {target}: deleting {} files",
+                    delete_prepared.len()
+                ));
                 info!(
                     target = %target,
                     count = delete_prepared.len(),
                     "execute_bfs: executing delete transfers"
                 );
                 let delete_outcomes = self.engine.execute_prepared(delete_prepared).await;
+                self.report_progress(&format!(
+                    "target {target}: delete done, persisting {}",
+                    delete_outcomes.len()
+                ));
                 info!(
                     target = %target,
                     outcomes = delete_outcomes.len(),
