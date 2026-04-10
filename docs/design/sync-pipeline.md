@@ -100,7 +100,7 @@ Phase 3: Execute — execute_bfs()
   |
   |    Phase B: delete transfers
   |      engine.execute_prepared(delete_prepared)
-  |        +- archive_root set -> per-file archive_move (rclone moveto) *slow*
+  |        +- archive_root set -> batch archive_move (rclone move --files-from)
   |        +- archive_root unset -> batch delete (rclone delete --files-from)
   |      persist_outcomes:
   |        completed -> delete LF(dest)
@@ -183,22 +183,17 @@ TF deletion (mark_deleted) is only via explicit `delete()` API call.
 
 ## 3. Known Issues
 
-### P1: Per-file archive delete is extremely slow
+### P1: Per-file archive delete is extremely slow (FIXED)
 
-**Location**: `route.rs:456-466` `delete_batch()`
+Per-file `rclone moveto` in `delete_batch()` was O(N) rclone invocations, making bulk
+archive deletes extremely slow (3,514 files = hours).
 
-```rust
-if self.archive_root.is_some() {
-    // Archive mode: fall back to per-file archive_move.
-    for rel in relative_paths {
-        results.insert(rel.clone(), self.delete(rel).await);
-    }
-    return results;
-}
-```
+**Fix**: Added `archive_move_batch` to `StorageBackend` trait. RcloneBackend implements it
+with `rclone move --files-from`, batching all files under a single timestamp directory
+(`{archive_root}/{ts}/`). `route::delete_batch` now calls `archive_move_batch` instead of
+looping over individual `delete()` calls.
 
-Comment says "deletes are low-volume", but this assumption breaks during bulk operations
-(e.g., clean DB rebuild). 3,514 files x rclone moveto = hours.
+See commit: `perf(sync): batch archive-move via rclone move --files-from`
 
 ### P2: Delete transfers generated from stale deleted TFs
 
@@ -271,7 +266,7 @@ Location Graph:
   pod   --(Push)---> cloud    archive_root = vdsl/archived
 
 Delete behavior:
-  cloud dest:  archive_move (rclone moveto -> archived/)  *slow (per-file)* [P1]
-  pod dest:    hard delete (rclone delete batch)           fast
-  local dest:  fs::remove_file                             fast
+  cloud dest:  batch archive_move (rclone move --files-from -> archived/)
+  pod dest:    hard delete (rclone delete --files-from)
+  local dest:  fs::remove_file
 ```

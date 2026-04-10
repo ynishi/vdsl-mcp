@@ -43,6 +43,12 @@ pub trait TopologyFileStore: Send + Sync {
     /// distribute_delete_actions()で使用: 削除済みファイルのLocationFileを掃除する。
     async fn list_deleted(&self) -> Result<Vec<TopologyFile>, InfraError>;
 
+    /// 削除済みTFを物理削除。
+    ///
+    /// 全LocationFileのdelete transferが完了し、LFが0件になった後に呼ぶ。
+    /// B2 archived データは独立して残るため、restore_from_archiveで復元可能。
+    async fn hard_delete(&self, id: &str) -> Result<bool, InfraError>;
+
     /// 生存中ファイル数。
     async fn count_active(&self) -> Result<usize, InfraError>;
 

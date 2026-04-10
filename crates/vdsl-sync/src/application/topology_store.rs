@@ -930,6 +930,13 @@ mod tests {
                 .collect())
         }
 
+        async fn hard_delete(&self, id: &str) -> Result<bool, InfraError> {
+            let mut files = self.files.lock().await;
+            let len_before = files.len();
+            files.retain(|f| !(f.id() == id && f.deleted_at().is_some()));
+            Ok(files.len() < len_before)
+        }
+
         async fn count_active(&self) -> Result<usize, InfraError> {
             Ok(self
                 .files

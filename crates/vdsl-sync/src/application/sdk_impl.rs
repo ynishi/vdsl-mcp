@@ -604,6 +604,23 @@ impl SdkImpl {
                         deleted = deleted,
                         "execute_bfs: delete transfer → LocationFile removed"
                     );
+                    // 全LF削除済みならTFを物理削除（list_deleted肥大化防止）
+                    let remaining = self
+                        .location_files
+                        .list_by_file(outcome.transfer.file_id())
+                        .await?;
+                    if remaining.is_empty() {
+                        let purged = self
+                            .topology_files
+                            .hard_delete(outcome.transfer.file_id())
+                            .await?;
+                        if purged {
+                            debug!(
+                                file_id = %outcome.transfer.file_id(),
+                                "execute_bfs: all LFs gone → TopologyFile hard-deleted"
+                            );
+                        }
+                    }
                 } else {
                     // Sync完了 = dest側にファイルが存在 → LocationFile作成
                     if let Ok(Some(tf)) = self

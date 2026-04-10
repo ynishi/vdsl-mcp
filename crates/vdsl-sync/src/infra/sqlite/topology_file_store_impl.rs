@@ -188,6 +188,25 @@ impl TopologyFileStore for SqliteSyncStore {
             .map_err(map_call_err)
     }
 
+    async fn hard_delete(&self, id: &str) -> Result<bool, InfraError> {
+        let id = id.to_string();
+        self.conn
+            .call(move |conn| {
+                let deleted = conn
+                    .execute(
+                        "DELETE FROM topology_files WHERE id = ? AND deleted_at IS NOT NULL",
+                        params![id],
+                    )
+                    .map_err(|e| InfraError::Store {
+                        op: "sqlite",
+                        reason: format!("hard_delete topology_file failed: {e}"),
+                    })?;
+                Ok(deleted > 0)
+            })
+            .await
+            .map_err(map_call_err)
+    }
+
     async fn count_active(&self) -> Result<usize, InfraError> {
         self.conn
             .call(|conn| {
