@@ -138,6 +138,24 @@ impl SyncdClient {
         self.token = syncd_token::read_only(&self.token_file).ok().flatten();
     }
 
+    /// 非 2xx レスポンスを詳細なエラー (status + body snippet) に変換する。
+    ///
+    /// `reqwest::Response::error_for_status` は body を捨てるため、syncd が返す
+    /// `ApiError` JSON (例: `sync busy: ...`) が呼び出し側に届かない。
+    /// このヘルパは body 先頭 512 バイトまでを取り込んでエラー文に含める。
+    async fn check_ok(resp: reqwest::Response, label: &str) -> anyhow::Result<reqwest::Response> {
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<body read failed: {e}>"));
+        let snippet: String = body.chars().take(512).collect();
+        anyhow::bail!("{label}: HTTP {status} — {snippet}")
+    }
+
     /// syncd の生存を確認する。
     ///
     /// `GET /healthz` に最大 300ms timeout で問い合わせ、
@@ -157,14 +175,13 @@ impl SyncdClient {
     /// `POST /v1/sync` — 全体 sync を syncd に委譲する。
     pub async fn delegate_sync(&self) -> anyhow::Result<SyncTaskResponse> {
         let url = format!("{}/v1/sync", self.base_url);
-        let resp = self
+        let raw = self
             .http_post(&url)
             .timeout(Duration::from_secs(10))
             .send()
             .await
-            .context("POST /v1/sync failed")?
-            .error_for_status()
-            .context("POST /v1/sync returned error status")?;
+            .context("POST /v1/sync failed")?;
+        let resp = Self::check_ok(raw, "POST /v1/sync").await?;
         resp.json::<SyncTaskResponse>()
             .await
             .context("POST /v1/sync: failed to parse response")
@@ -181,15 +198,14 @@ impl SyncdClient {
             src: src.to_string(),
             dest: dest.to_string(),
         };
-        let resp = self
+        let raw = self
             .http_post(&url)
             .timeout(Duration::from_secs(10))
             .json(&body)
             .send()
             .await
-            .context("POST /v1/sync_route failed")?
-            .error_for_status()
-            .context("POST /v1/sync_route returned error status")?;
+            .context("POST /v1/sync_route failed")?;
+        let resp = Self::check_ok(raw, "POST /v1/sync_route").await?;
         resp.json::<SyncTaskResponse>()
             .await
             .context("POST /v1/sync_route: failed to parse response")
@@ -198,14 +214,13 @@ impl SyncdClient {
     /// `GET /v1/tasks/{task_id}` — タスクステータスを poll する。
     pub async fn delegate_poll(&self, task_id: &str) -> anyhow::Result<TaskStatusResponse> {
         let url = format!("{}/v1/tasks/{}", self.base_url, task_id);
-        let resp = self
+        let raw = self
             .http_get(&url)
             .timeout(Duration::from_secs(10))
             .send()
             .await
-            .context("GET /v1/tasks/{id} failed")?
-            .error_for_status()
-            .context("GET /v1/tasks/{id} returned error status")?;
+            .context("GET /v1/tasks/{id} failed")?;
+        let resp = Self::check_ok(raw, "GET /v1/tasks/{id}").await?;
         resp.json::<TaskStatusResponse>()
             .await
             .context("GET /v1/tasks/{id}: failed to parse response")
@@ -214,14 +229,13 @@ impl SyncdClient {
     /// `POST /v1/tasks/{task_id}/cancel` — タスクをキャンセルする。
     pub async fn delegate_cancel(&self, task_id: &str) -> anyhow::Result<bool> {
         let url = format!("{}/v1/tasks/{}/cancel", self.base_url, task_id);
-        let resp = self
+        let raw = self
             .http_post(&url)
             .timeout(Duration::from_secs(10))
             .send()
             .await
-            .context("POST /v1/tasks/{id}/cancel failed")?
-            .error_for_status()
-            .context("POST /v1/tasks/{id}/cancel returned error status")?;
+            .context("POST /v1/tasks/{id}/cancel failed")?;
+        let resp = Self::check_ok(raw, "POST /v1/tasks/{id}/cancel").await?;
         let cancel_resp = resp
             .json::<CancelResponse>()
             .await
@@ -235,15 +249,14 @@ impl SyncdClient {
         let body = DeleteRequest {
             path: path.to_string(),
         };
-        let resp = self
+        let raw = self
             .http_post(&url)
             .timeout(Duration::from_secs(10))
             .json(&body)
             .send()
             .await
-            .context("POST /v1/delete failed")?
-            .error_for_status()
-            .context("POST /v1/delete returned error status")?;
+            .context("POST /v1/delete failed")?;
+        let resp = Self::check_ok(raw, "POST /v1/delete").await?;
         let del_resp = resp
             .json::<DeleteResponse>()
             .await
@@ -258,14 +271,14 @@ impl SyncdClient {
             path: path.to_string(),
             revision: revision.to_string(),
         };
-        self.http_post(&url)
+        let raw = self
+            .http_post(&url)
             .timeout(Duration::from_secs(30))
             .json(&body)
             .send()
             .await
-            .context("POST /v1/restore failed")?
-            .error_for_status()
-            .context("POST /v1/restore returned error status")?;
+            .context("POST /v1/restore failed")?;
+        Self::check_ok(raw, "POST /v1/restore").await?;
         Ok(())
     }
 }

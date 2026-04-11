@@ -26,6 +26,12 @@
 //!
 //! エントリ登録を `tokio::spawn` の前に行い、spawned Future が
 //! 先に lock を取得しても `get_mut` が `None` を返さないことを保証する。
+//!
+//! # ロック解放 (RAII)
+//!
+//! sync ロックは `LockGuard` の `Drop` で解放される。Future が panic しても
+//! cancel によって abort されても、タスクスタックの unwind 過程で guard が
+//! drop されるため、ロックリークは発生しない。
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -74,6 +80,30 @@ impl fmt::Display for SyncBusyError {
     }
 }
 
+/// sync ロックの RAII guard。Drop 時に対応するキーを `active_locks` から除去する。
+///
+/// spawn された Future に move され、タスクの正常完了 / panic / abort いずれの
+/// ケースでも unwind 過程で drop が実行される。これによりロックは確実に解放される。
+#[derive(Debug)]
+struct LockGuard {
+    locks: Arc<std::sync::Mutex<HashSet<SyncLockKey>>>,
+    key: Option<SyncLockKey>,
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            // std::sync::Mutex: 保持期間は O(1) な set 操作のみで極めて短い。
+            // poisoned (他スレッドが panic) の場合も無視して解放を試みる。
+            let mut set = match self.locks.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            set.remove(&key);
+        }
+    }
+}
+
 /// interface層のバックグラウンドSync操作管理。
 ///
 /// SyncStoreSdk は `sync()`, `sync_route()` を
@@ -86,8 +116,11 @@ pub struct SyncTaskManager {
     store: Arc<tokio::sync::RwLock<Option<Arc<SqliteSyncStore>>>>,
     /// 初回 recovery 済みフラグ。
     recovered: std::sync::atomic::AtomicBool,
-    /// アクティブな sync のロック集合。タスク完了時に自動解放。
-    active_locks: Arc<Mutex<HashSet<SyncLockKey>>>,
+    /// アクティブな sync のロック集合。`LockGuard` の Drop で自動解放される。
+    ///
+    /// `std::sync::Mutex` を使うのは、Drop (同期 context) からロック解放するため。
+    /// 保持時間は set の insert/remove のみで極短なので blocking は実質起きない。
+    active_locks: Arc<std::sync::Mutex<HashSet<SyncLockKey>>>,
 }
 
 impl Default for SyncTaskManager {
@@ -102,7 +135,7 @@ impl SyncTaskManager {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             store: Arc::new(tokio::sync::RwLock::new(None)),
             recovered: std::sync::atomic::AtomicBool::new(false),
-            active_locks: Arc::new(Mutex::new(HashSet::new())),
+            active_locks: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -167,25 +200,13 @@ impl SyncTaskManager {
     ///
     /// 他の sync（全体 or route）が実行中の場合は `SyncBusyError` を返す。
     pub async fn spawn_sync(&self, sdk: &Arc<dyn SyncStoreSdk>) -> Result<TaskId, SyncBusyError> {
-        let lock_key = SyncLockKey::FullSync;
-        self.acquire_lock(&lock_key).await?;
-
+        let guard = self.acquire_lock(SyncLockKey::FullSync)?;
         let sdk_clone = Arc::clone(sdk);
-        let locks = Arc::clone(&self.active_locks);
-        let key_for_release = lock_key.clone();
-
         Ok(self
             .spawn_inner(
                 sdk,
                 move || async move { sdk_clone.sync().await.map_err(|e| e.to_string()) },
-                move || {
-                    let locks = locks;
-                    let key = key_for_release;
-                    async move {
-                        let mut set = locks.lock().await;
-                        set.remove(&key);
-                    }
-                },
+                guard,
             )
             .await)
     }
@@ -199,13 +220,8 @@ impl SyncTaskManager {
         src: LocationId,
         dest: LocationId,
     ) -> Result<TaskId, SyncBusyError> {
-        let lock_key = SyncLockKey::Route(dest.as_str().to_string());
-        self.acquire_lock(&lock_key).await?;
-
+        let guard = self.acquire_lock(SyncLockKey::Route(dest.as_str().to_string()))?;
         let sdk_clone = Arc::clone(sdk);
-        let locks = Arc::clone(&self.active_locks);
-        let key_for_release = lock_key.clone();
-
         Ok(self
             .spawn_inner(
                 sdk,
@@ -215,14 +231,7 @@ impl SyncTaskManager {
                         .await
                         .map_err(|e| e.to_string())
                 },
-                move || {
-                    let locks = locks;
-                    let key = key_for_release;
-                    async move {
-                        let mut set = locks.lock().await;
-                        set.remove(&key);
-                    }
-                },
+                guard,
             )
             .await)
     }
@@ -263,8 +272,8 @@ impl SyncTaskManager {
     /// - Completed/Failed/不明 → false を返す（何もしない）
     ///
     /// abort() は tokio タスクを即座に中断する。rclone 等の外部プロセスは
-    /// Drop 実装で kill される。ロックも自動解放される（on_complete は呼ばれない
-    /// ため、ここで手動解放する）。
+    /// Drop 実装で kill される。ロックは spawn 時に move した `LockGuard` の
+    /// `Drop` 経由で自動解放される (タスクスタック unwind 時)。
     pub async fn cancel(&self, id: &TaskId) -> bool {
         let mut map = self.tasks.lock().await;
         let entry = match map.get_mut(id) {
@@ -286,13 +295,6 @@ impl SyncTaskManager {
                 }
 
                 info!(task_id = %id, "sync_tasks: task cancelled");
-
-                // ロック全解放（どのキーに紐づいているか追跡していないため全クリア）
-                // abort されたタスクの on_complete は呼ばれないため手動解放が必要。
-                drop(map);
-                let mut locks = self.active_locks.lock().await;
-                locks.clear();
-
                 true
             }
             _ => false,
@@ -303,10 +305,15 @@ impl SyncTaskManager {
     ///
     /// FullSync は他の全ロックと競合する。
     /// Route(dest) は FullSync および同一 Route(dest) と競合する。
-    async fn acquire_lock(&self, key: &SyncLockKey) -> Result<(), SyncBusyError> {
-        let mut set = self.active_locks.lock().await;
+    ///
+    /// 成功時は `LockGuard` を返す。guard が drop されるとロックは解放される。
+    fn acquire_lock(&self, key: SyncLockKey) -> Result<LockGuard, SyncBusyError> {
+        let mut set = match self.active_locks.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
 
-        match key {
+        match &key {
             SyncLockKey::FullSync => {
                 // 全体 sync: 他に何かあれば拒否
                 if let Some(existing) = set.iter().next() {
@@ -332,7 +339,10 @@ impl SyncTaskManager {
         }
 
         set.insert(key.clone());
-        Ok(())
+        Ok(LockGuard {
+            locks: Arc::clone(&self.active_locks),
+            key: Some(key),
+        })
     }
 
     /// 内部共通の spawn ロジック。
@@ -372,17 +382,15 @@ impl SyncTaskManager {
         })
     }
 
-    async fn spawn_inner<F, Fut, C, CFut>(
+    async fn spawn_inner<F, Fut>(
         &self,
         sdk: &Arc<dyn SyncStoreSdk>,
         make_future: F,
-        on_complete: C,
+        lock_guard: LockGuard,
     ) -> TaskId
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<SyncReport, String>> + Send + 'static,
-        C: FnOnce() -> CFut + Send + 'static,
-        CFut: std::future::Future<Output = ()> + Send + 'static,
     {
         let id = TaskId::new();
         let tasks = Arc::clone(&self.tasks);
@@ -414,6 +422,10 @@ impl SyncTaskManager {
 
         let sdk_for_cleanup = Arc::clone(sdk);
         let handle = tokio::spawn(async move {
+            // `lock_guard` はこのスコープ内で保持され、タスク正常完了・panic・
+            // JoinHandle::abort のいずれのケースでも Drop でロックが解放される。
+            let _lock_guard = lock_guard;
+
             // Running に遷移
             {
                 let mut map = tasks.lock().await;
@@ -450,9 +462,7 @@ impl SyncTaskManager {
                     }
                 }
             }
-
-            // ロック解放
-            on_complete().await;
+            // _lock_guard が drop されロックが解放される。
         });
 
         // 実際の handle で上書き
@@ -464,5 +474,88 @@ impl SyncTaskManager {
         }
 
         id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_mgr() -> SyncTaskManager {
+        SyncTaskManager::new()
+    }
+
+    fn lock_count(mgr: &SyncTaskManager) -> usize {
+        mgr.active_locks.lock().unwrap().len()
+    }
+
+    #[test]
+    fn lock_guard_releases_on_drop() {
+        let mgr = fresh_mgr();
+        {
+            let _g = mgr
+                .acquire_lock(SyncLockKey::FullSync)
+                .expect("first lock should succeed");
+            assert_eq!(lock_count(&mgr), 1);
+        }
+        assert_eq!(lock_count(&mgr), 0, "lock should be released on drop");
+    }
+
+    #[test]
+    fn lock_guard_releases_on_panic() {
+        let mgr = fresh_mgr();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = mgr.acquire_lock(SyncLockKey::FullSync).unwrap();
+            assert_eq!(lock_count(&mgr), 1);
+            panic!("simulated sync failure");
+        }));
+        assert!(result.is_err(), "panic expected");
+        assert_eq!(
+            lock_count(&mgr),
+            0,
+            "lock must be released even when holder panics"
+        );
+    }
+
+    #[test]
+    fn full_sync_conflicts_with_existing_full_sync() {
+        let mgr = fresh_mgr();
+        let _g1 = mgr.acquire_lock(SyncLockKey::FullSync).unwrap();
+        let err = mgr
+            .acquire_lock(SyncLockKey::FullSync)
+            .expect_err("second full sync should conflict");
+        assert!(err.reason.contains("already running"));
+    }
+
+    #[test]
+    fn route_sync_allows_disjoint_dests() {
+        let mgr = fresh_mgr();
+        let _g1 = mgr
+            .acquire_lock(SyncLockKey::Route("cloud".into()))
+            .unwrap();
+        let _g2 = mgr
+            .acquire_lock(SyncLockKey::Route("pod".into()))
+            .expect("different dest should be allowed");
+        assert_eq!(lock_count(&mgr), 2);
+    }
+
+    #[test]
+    fn route_sync_blocks_same_dest_and_full_sync() {
+        let mgr = fresh_mgr();
+        let _g1 = mgr
+            .acquire_lock(SyncLockKey::Route("cloud".into()))
+            .unwrap();
+        mgr.acquire_lock(SyncLockKey::Route("cloud".into()))
+            .expect_err("same dest should conflict");
+        mgr.acquire_lock(SyncLockKey::FullSync)
+            .expect_err("full sync should conflict with any route");
+    }
+
+    #[test]
+    fn full_sync_blocks_route_sync() {
+        let mgr = fresh_mgr();
+        let _g1 = mgr.acquire_lock(SyncLockKey::FullSync).unwrap();
+        mgr.acquire_lock(SyncLockKey::Route("cloud".into()))
+            .expect_err("route should conflict while full sync is active");
     }
 }
