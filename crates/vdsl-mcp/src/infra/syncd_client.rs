@@ -13,6 +13,7 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 use crate::infra::config::SyncdConfig;
+use crate::infra::syncd_token;
 
 // =============================================================================
 // Request / Response 型
@@ -88,24 +89,53 @@ pub struct SyncdClient {
     base_url: String,
     /// reqwest::Client は内部で Arc を使用しており Clone が安価。
     http: reqwest::Client,
+    /// Bearer token — 起動時に `cfg.token_file` から読み込む。
+    /// 未設定 (None) の場合は Authorization header を付与しない。
+    token: Option<String>,
+    /// token 再読込用に保持。
+    token_file: std::path::PathBuf,
 }
 
 impl SyncdClient {
     /// SyncdConfig から SyncdClient を構築する。
     ///
-    /// # Panics
-    ///
-    /// `reqwest::Client::builder().build()` が失敗するのは TLS ライブラリの初期化が
-    /// 失敗した場合のみであり、通常は起こり得ない。ここでは expect を使用する。
-    pub fn from_config(cfg: &SyncdConfig) -> Self {
+    /// token file が存在すれば読み込み、全リクエストに `Authorization: Bearer` を付与する。
+    /// 存在しない場合は probe だけを期待した状態で構築する (syncd 未起動時の探索用)。
+    pub fn from_config(cfg: &SyncdConfig) -> anyhow::Result<Self> {
         // timeout は個別リクエストで設定するため、ここではデフォルト (no timeout) のまま。
         let http = reqwest::Client::builder()
             .build()
-            .expect("reqwest::Client build failed — TLS library initialization error");
-        Self {
+            .context("reqwest::Client build failed — TLS library initialization error")?;
+        let token = syncd_token::read_only(&cfg.token_file).ok().flatten();
+        Ok(Self {
             base_url: format!("http://127.0.0.1:{}", cfg.port),
             http,
+            token,
+            token_file: cfg.token_file.clone(),
+        })
+    }
+
+    /// 認証付き GET ビルダ。token が無ければ auth header なし (`/healthz` 用)。
+    fn http_get(&self, url: &str) -> reqwest::RequestBuilder {
+        let mut b = self.http.get(url);
+        if let Some(t) = self.token.as_deref() {
+            b = b.bearer_auth(t);
         }
+        b
+    }
+
+    /// 認証付き POST ビルダ。
+    fn http_post(&self, url: &str) -> reqwest::RequestBuilder {
+        let mut b = self.http.post(url);
+        if let Some(t) = self.token.as_deref() {
+            b = b.bearer_auth(t);
+        }
+        b
+    }
+
+    /// syncd 起動直後に token file を書いたあと、クライアント側でも再読込する。
+    pub fn refresh_token(&mut self) {
+        self.token = syncd_token::read_only(&self.token_file).ok().flatten();
     }
 
     /// syncd の生存を確認する。
@@ -113,6 +143,7 @@ impl SyncdClient {
     /// `GET /healthz` に最大 300ms timeout で問い合わせ、
     /// 200 OK が返れば `true`、それ以外 (ConnectionRefused, timeout 等) は `false`。
     pub async fn probe(&self) -> bool {
+        // `/healthz` は auth 不要 (middleware 対象外)。token が未ロードでも通る。
         let url = format!("{}/healthz", self.base_url);
         let result = self
             .http
@@ -127,8 +158,7 @@ impl SyncdClient {
     pub async fn delegate_sync(&self) -> anyhow::Result<SyncTaskResponse> {
         let url = format!("{}/v1/sync", self.base_url);
         let resp = self
-            .http
-            .post(&url)
+            .http_post(&url)
             .timeout(Duration::from_secs(10))
             .send()
             .await
@@ -152,8 +182,7 @@ impl SyncdClient {
             dest: dest.to_string(),
         };
         let resp = self
-            .http
-            .post(&url)
+            .http_post(&url)
             .timeout(Duration::from_secs(10))
             .json(&body)
             .send()
@@ -170,8 +199,7 @@ impl SyncdClient {
     pub async fn delegate_poll(&self, task_id: &str) -> anyhow::Result<TaskStatusResponse> {
         let url = format!("{}/v1/tasks/{}", self.base_url, task_id);
         let resp = self
-            .http
-            .get(&url)
+            .http_get(&url)
             .timeout(Duration::from_secs(10))
             .send()
             .await
@@ -187,8 +215,7 @@ impl SyncdClient {
     pub async fn delegate_cancel(&self, task_id: &str) -> anyhow::Result<bool> {
         let url = format!("{}/v1/tasks/{}/cancel", self.base_url, task_id);
         let resp = self
-            .http
-            .post(&url)
+            .http_post(&url)
             .timeout(Duration::from_secs(10))
             .send()
             .await
@@ -209,8 +236,7 @@ impl SyncdClient {
             path: path.to_string(),
         };
         let resp = self
-            .http
-            .post(&url)
+            .http_post(&url)
             .timeout(Duration::from_secs(10))
             .json(&body)
             .send()
@@ -232,8 +258,7 @@ impl SyncdClient {
             path: path.to_string(),
             revision: revision.to_string(),
         };
-        self.http
-            .post(&url)
+        self.http_post(&url)
             .timeout(Duration::from_secs(30))
             .json(&body)
             .send()
@@ -259,6 +284,7 @@ mod tests {
         SyncdConfig {
             port,
             pid_file: PathBuf::from("/tmp/test_syncd.pid"),
+            token_file: PathBuf::from("/tmp/test_syncd.token"),
             work_dir: None,
             debounce_ms: 500,
             log_level: "info".to_string(),
@@ -269,10 +295,8 @@ mod tests {
     #[tokio::test]
     async fn probe_returns_false_when_not_running() {
         // ポート 19999 は通常使われていないため、syncd は起動していない前提。
-        // テスト環境でそのポートを使っているプロセスがいれば false にならない可能性があるが、
-        // 通常環境では問題ない。
         let cfg = test_config(19999);
-        let client = SyncdClient::from_config(&cfg);
+        let client = SyncdClient::from_config(&cfg).expect("client build should succeed");
         let result = client.probe().await;
         assert!(
             !result,
@@ -283,7 +307,7 @@ mod tests {
     #[test]
     fn from_config_constructs_correct_base_url() {
         let cfg = test_config(7823);
-        let client = SyncdClient::from_config(&cfg);
+        let client = SyncdClient::from_config(&cfg).expect("client build should succeed");
         assert_eq!(client.base_url, "http://127.0.0.1:7823");
     }
 }

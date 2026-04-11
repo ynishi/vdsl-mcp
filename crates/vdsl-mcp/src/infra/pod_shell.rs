@@ -198,6 +198,22 @@ impl RemoteShell for RunPodCliShell {
             return Ok(Vec::new());
         }
 
+        // Defense in depth: the script body below writes file names into a
+        // shell heredoc, so a relative path containing a literal newline (let
+        // alone the `__VDSL_FILELIST__` marker) could terminate the heredoc
+        // and inject arbitrary commands executed on the pod. vdsl-sync's
+        // route-layer validator already rejects control chars, but we revalidate
+        // here so any future caller that bypasses the route layer stays safe.
+        for rel in relative_paths {
+            if rel.chars().any(|c| c.is_control()) {
+                return Err(InfraError::Transfer {
+                    reason: format!(
+                        "batch_inspect: relative path contains control character: {rel:?}"
+                    ),
+                });
+            }
+        }
+
         let ssh_key = self
             .ssh_key
             .as_deref()

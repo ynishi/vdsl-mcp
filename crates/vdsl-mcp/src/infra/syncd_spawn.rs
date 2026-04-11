@@ -168,6 +168,7 @@ mod tests {
         SyncdConfig {
             port,
             pid_file,
+            token_file: PathBuf::from("/tmp/test_syncd.token"),
             work_dir: None,
             debounce_ms: 500,
             log_level: "info".to_string(),
@@ -186,7 +187,7 @@ mod tests {
 
         // ポート 19998 は使われていない前提
         let cfg = test_config(19998, pid_path.clone());
-        let client = SyncdClient::from_config(&cfg);
+        let client = SyncdClient::from_config(&cfg).expect("client build should succeed");
 
         let status = ensure_syncd_running(&cfg, &client).await;
 

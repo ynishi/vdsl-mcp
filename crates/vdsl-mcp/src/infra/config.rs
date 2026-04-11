@@ -29,6 +29,10 @@ pub struct SyncdConfig {
     pub port: u16,
     #[serde(default = "default_pid_file")]
     pub pid_file: PathBuf,
+    /// Shared-secret token file for HTTP auth between mcp and syncd.
+    /// Generated (0600) on first start; both sides read from this path.
+    #[serde(default = "default_token_file")]
+    pub token_file: PathBuf,
     /// None の場合は `VDSL_WORK_DIR` env → `std::env::current_dir()` の順で解決する。
     #[serde(default)]
     pub work_dir: Option<PathBuf>,
@@ -43,6 +47,7 @@ impl Default for SyncdConfig {
         Self {
             port: default_port(),
             pid_file: default_pid_file(),
+            token_file: default_token_file(),
             work_dir: None,
             debounce_ms: default_debounce_ms(),
             log_level: default_log_level(),
@@ -56,6 +61,10 @@ fn default_port() -> u16 {
 
 fn default_pid_file() -> PathBuf {
     expand_tilde("~/.vdsl/syncd.pid")
+}
+
+fn default_token_file() -> PathBuf {
+    expand_tilde("~/.vdsl/syncd.token")
 }
 
 fn default_debounce_ms() -> u64 {
@@ -163,6 +172,7 @@ impl AppConfig {
 
     fn normalized(mut self) -> anyhow::Result<Self> {
         self.syncd.pid_file = expand_tilde_path(&self.syncd.pid_file);
+        self.syncd.token_file = expand_tilde_path(&self.syncd.token_file);
         if let Some(wd) = self.syncd.work_dir.take() {
             self.syncd.work_dir = Some(expand_tilde_path(&wd));
         }

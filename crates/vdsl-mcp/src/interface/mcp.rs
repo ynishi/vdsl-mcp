@@ -89,7 +89,10 @@ impl VdslMcpServer {
         // config は起動時に load する。失敗時は default 値で継続。
         let app_cfg = crate::infra::config::AppConfig::load(None).unwrap_or_default();
         let syncd_cfg = app_cfg.syncd;
-        let syncd_client = Arc::new(SyncdClient::from_config(&syncd_cfg));
+        let syncd_client = Arc::new(
+            SyncdClient::from_config(&syncd_cfg)
+                .expect("SyncdClient::from_config failed — TLS init error"),
+        );
 
         Self {
             tool_router: Self::tool_router(),

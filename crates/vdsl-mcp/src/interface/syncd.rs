@@ -1,6 +1,7 @@
 use crate::infra::config::SyncdConfig;
 use crate::infra::sync_db::SyncDb;
 use crate::infra::sync_tasks::SyncTaskManager;
+use crate::infra::syncd_token;
 use crate::interface::syncd_http::{router, SyncdState};
 use crate::interface::syncd_watcher::spawn_watcher;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,11 @@ pub async fn run(cfg: SyncdConfig, spawned_by_mcp: bool) -> anyhow::Result<()> {
     // PID file 取得 (競合検知 + 書き込み)
     let _pid_guard = PidFile::acquire(&cfg.pid_file, cfg.port)?;
 
+    // HTTP auth token: 既存があれば読み、なければ生成 (0600)
+    let auth_token = syncd_token::load_or_generate(&cfg.token_file)
+        .map_err(|e| anyhow::anyhow!("syncd: failed to prepare token file: {e}"))?;
+    info!(token_file = %cfg.token_file.display(), "syncd: auth token ready");
+
     // DB 構築 (syncd が単独所有)
     let sync_db = Arc::new(SyncDb::new(&work_dir));
     let persistence = sync_db.ensure().await?;
@@ -46,6 +52,7 @@ pub async fn run(cfg: SyncdConfig, spawned_by_mcp: bool) -> anyhow::Result<()> {
         started_at: Instant::now(),
         auto_sync_running: Arc::new(AtomicBool::new(false)),
         auto_sync_pending: Arc::new(AtomicBool::new(false)),
+        auth_token,
     });
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", cfg.port)).await?;

@@ -14,8 +14,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{Path, Request, State},
+    http::{HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -26,6 +27,7 @@ use vdsl_sync::SyncStoreSdk;
 
 use crate::infra::config::SyncdConfig;
 use crate::infra::sync_tasks::SyncTaskManager;
+use crate::infra::syncd_token;
 
 // =============================================================================
 // State
@@ -45,6 +47,9 @@ pub struct SyncdState {
     /// auto sync 完了後に追加 run が必要かを示すフラグ。
     /// running 中に新たなイベントが来た場合に立てる。
     pub auto_sync_pending: Arc<AtomicBool>,
+    /// Shared-secret bearer token for HTTP auth. Read from `cfg.token_file`
+    /// at startup. `/healthz` は auth 例外。
+    pub auth_token: String,
 }
 
 // =============================================================================
@@ -52,16 +57,55 @@ pub struct SyncdState {
 // =============================================================================
 
 /// axum Router を構築して返す。
+///
+/// `/healthz` は認証例外。その他の `/v1/*` 経路は `Authorization: Bearer <token>`
+/// を必須とする (`cfg.token_file` の値と一致すること)。トークンはループバックの
+/// 同 UID プロセスだけが `0600` ファイルを読める前提で配布する。
 pub fn router(state: Arc<SyncdState>) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
+    let authed = Router::new()
         .route("/v1/sync", post(post_sync))
         .route("/v1/sync_route", post(post_sync_route))
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/cancel", post(post_cancel))
         .route("/v1/delete", post(post_delete))
         .route("/v1/restore", post(post_restore))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_token,
+        ));
+
+    Router::new()
+        .route("/healthz", get(healthz))
+        .merge(authed)
         .with_state(state)
+}
+
+/// `Authorization: Bearer <token>` を検証する middleware。
+///
+/// header が無い / 形式不正 / トークン不一致のいずれも `401 Unauthorized`。
+/// 比較は constant-time で行う。
+async fn require_bearer_token(
+    State(state): State<Arc<SyncdState>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let header = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v: &HeaderValue| v.to_str().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let token = header
+        .strip_prefix("Bearer ")
+        .ok_or(StatusCode::UNAUTHORIZED)?
+        .trim();
+
+    if !syncd_token::constant_time_eq(token, &state.auth_token) {
+        warn!("syncd: auth rejected — token mismatch");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    Ok(next.run(req).await)
 }
 
 // =============================================================================
@@ -423,10 +467,13 @@ mod tests {
         }
     }
 
+    const TEST_TOKEN: &str = "00000000000000000000000000000000";
+
     fn test_state() -> Arc<SyncdState> {
         let cfg = SyncdConfig {
             port: 7823,
             pid_file: PathBuf::from("/tmp/test_syncd.pid"),
+            token_file: PathBuf::from("/tmp/test_syncd.token"),
             work_dir: None,
             debounce_ms: 500,
             log_level: "info".to_string(),
@@ -439,6 +486,7 @@ mod tests {
             started_at: Instant::now(),
             auto_sync_running: Arc::new(AtomicBool::new(false)),
             auto_sync_pending: Arc::new(AtomicBool::new(false)),
+            auth_token: TEST_TOKEN.to_string(),
         })
     }
 
@@ -455,5 +503,68 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn healthz_does_not_require_auth() {
+        let state = test_state();
+        let app = router(state);
+        // No Authorization header
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn v1_endpoint_without_token_returns_401() {
+        let state = test_state();
+        let app = router(state);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/sync")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn v1_endpoint_with_wrong_token_returns_401() {
+        let state = test_state();
+        let app = router(state);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/sync")
+            .header("authorization", "Bearer deadbeefdeadbeefdeadbeefdeadbeef")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn v1_endpoint_with_correct_token_passes_auth() {
+        let state = test_state();
+        let app = router(state);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/sync")
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // NoopSdk returns empty SyncReport → 200
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "auth should pass when token matches"
+        );
     }
 }

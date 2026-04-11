@@ -8,3 +8,4 @@ pub mod sync_db;
 pub mod sync_tasks;
 pub mod syncd_client;
 pub mod syncd_spawn;
+pub mod syncd_token;
