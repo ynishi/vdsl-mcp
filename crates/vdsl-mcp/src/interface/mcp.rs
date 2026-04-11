@@ -404,6 +404,23 @@ pub struct VdslConnectRequest {
     /// Useful after vdsl_pod_start or vdsl_pod_create.
     #[serde(default)]
     pub wait: bool,
+
+    /// Explicit ComfyUI install base path on the pod
+    /// (e.g. "/workspace/ComfyUI"). Takes precedence over
+    /// `auto_detect_base` when provided. Affects sync pod output root,
+    /// storage push/pull targets, and image download paths.
+    pub comfy_base: Option<String>,
+
+    /// Auto-detect ComfyUI install path via SSH when `pod_id` is known
+    /// and `comfy_base` is not explicitly supplied. Default: true.
+    /// Detection uses `readlink /proc/<pid>/cwd` and falls back to
+    /// `find /workspace -name main.py -path "*ComfyUI*"`.
+    #[serde(default = "default_auto_detect_base")]
+    pub auto_detect_base: bool,
+}
+
+fn default_auto_detect_base() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -558,15 +575,127 @@ const DEFAULT_SSH_KEY: &str = "~/.ssh/id_ed25519";
 /// Override via `VDSL_COMFYUI_BASE` env var to match your template.
 const DEFAULT_COMFYUI_BASE: &str = "/workspace/runpod-slim/ComfyUI";
 
-static COMFYUI_BASE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    std::env::var("VDSL_COMFYUI_BASE").unwrap_or_else(|_| DEFAULT_COMFYUI_BASE.to_string())
-});
-static COMFYUI_MODELS_BASE: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| format!("{}/models", *COMFYUI_BASE));
-static COMFYUI_CUSTOM_NODES: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| format!("{}/custom_nodes", *COMFYUI_BASE));
-static COMFYUI_OUTPUT_BASE: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| format!("{}/output", *COMFYUI_BASE));
+/// Runtime-mutable ComfyUI base path. Initialized from `VDSL_COMFYUI_BASE` env
+/// or `DEFAULT_COMFYUI_BASE`, and may be overwritten by `vdsl_connect` when the
+/// target pod's actual ComfyUI install path is detected or supplied.
+static COMFYUI_BASE: std::sync::LazyLock<std::sync::RwLock<String>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::RwLock::new(
+            std::env::var("VDSL_COMFYUI_BASE").unwrap_or_else(|_| DEFAULT_COMFYUI_BASE.to_string()),
+        )
+    });
+
+/// Current ComfyUI base path (cloned snapshot).
+pub(crate) fn comfyui_base() -> String {
+    COMFYUI_BASE
+        .read()
+        .map(|s| s.clone())
+        .unwrap_or_else(|_| DEFAULT_COMFYUI_BASE.to_string())
+}
+
+pub(crate) fn comfyui_models_base() -> String {
+    format!("{}/models", comfyui_base())
+}
+
+pub(crate) fn comfyui_custom_nodes() -> String {
+    format!("{}/custom_nodes", comfyui_base())
+}
+
+pub(crate) fn comfyui_output_base() -> String {
+    format!("{}/output", comfyui_base())
+}
+
+/// Overwrite the global ComfyUI base. Returns true if the value actually
+/// changed (useful for invalidating derived caches such as sync SDK).
+pub(crate) fn set_comfyui_base(new_base: &str) -> bool {
+    match COMFYUI_BASE.write() {
+        Ok(mut guard) => {
+            if *guard == new_base {
+                false
+            } else {
+                *guard = new_base.to_string();
+                true
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+/// Auto-detect ComfyUI install path on a running pod via SSH.
+///
+/// Strategy:
+/// 1. `readlink /proc/$(pgrep -f ComfyUI/main.py)/cwd` — fast path, reflects
+///    the actual running process's working directory (where ComfyUI resolves
+///    `output/`, `models/` etc. by default).
+/// 2. Fallback: `find /workspace -maxdepth 4 -name main.py -path "*ComfyUI*"`
+///    and take the parent directory of the first hit.
+///
+/// Returns `Ok(None)` when neither method locates a ComfyUI install (e.g. the
+/// pod is not running ComfyUI, or the install lives outside `/workspace`).
+async fn detect_comfyui_base(pod_id: &str) -> anyhow::Result<Option<String>> {
+    use crate::application::pod_service::resolve_api_key;
+    use crate::infra::runpod_cli::RunPodCli;
+
+    let api_key = resolve_api_key()?;
+    let cli = RunPodCli::new(api_key);
+    let ssh_key = resolve_ssh_key(None);
+
+    // Fast path: locate the python process actually running main.py.
+    //
+    // Filter on `comm` (basename of executable) starting with `python` so the
+    // wrapping ssh/bash command — which contains the literal string "main.py"
+    // in its own argv and would otherwise self-match — is excluded.
+    //
+    // Then resolve main.py's absolute path from /proc/<pid>/cmdline (handling
+    // both absolute and relative invocations) and take its parent directory.
+    // /proc/<pid>/cwd is unreliable: ComfyUI is often launched from a wrapper
+    // that chdirs elsewhere, so cwd may not equal the install dir.
+    let fast = [
+        "bash",
+        "-c",
+        r#"set -e
+pid=$(ps -eo pid=,comm=,args= | awk '$2 ~ /^python/ && /main\.py/ {print $1; exit}')
+[ -z "$pid" ] && exit 0
+cwd=$(readlink -f /proc/"$pid"/cwd 2>/dev/null || true)
+script=""
+for arg in $(tr '\0' '\n' < /proc/"$pid"/cmdline); do
+  case "$arg" in
+    *main.py) script="$arg"; break ;;
+  esac
+done
+[ -z "$script" ] && exit 0
+case "$script" in
+  /*) abs="$script" ;;
+  *)  abs="$cwd/$script" ;;
+esac
+abs=$(readlink -f "$abs" 2>/dev/null || echo "$abs")
+dirname "$abs"
+"#,
+    ];
+    if let Ok(out) = cli.pod_exec(pod_id, &fast, Some(&ssh_key), Some(15)).await {
+        let path = out.stdout.trim();
+        if !path.is_empty() && path.starts_with('/') {
+            tracing::debug!(%path, "detect_comfyui_base: /proc/cmdline");
+            return Ok(Some(path.to_string()));
+        }
+    }
+
+    // Fallback: physical search under /workspace.
+    let slow = [
+        "bash",
+        "-c",
+        "find /workspace -maxdepth 4 -type f -name main.py -path '*ComfyUI*' 2>/dev/null | head -1 | xargs -r dirname",
+    ];
+    if let Ok(out) = cli.pod_exec(pod_id, &slow, Some(&ssh_key), Some(30)).await {
+        let path = out.stdout.trim();
+        if !path.is_empty() && path.starts_with('/') {
+            tracing::debug!(%path, "detect_comfyui_base: find fallback");
+            return Ok(Some(path.to_string()));
+        }
+    }
+
+    Ok(None)
+}
 /// Max wait time for downloads (seconds).
 const DOWNLOAD_TIMEOUT_SECS: u64 = 600;
 /// Interval between download status polls (seconds).
@@ -1770,19 +1899,93 @@ impl VdslMcpServer {
         // Save successful connection for session reuse
         self.save_session(&url, req.pod_id.as_deref());
 
+        // Resolve ComfyUI install base: explicit > auto-detect (pod_id only) > current.
+        let base_note = self
+            .resolve_and_apply_comfy_base(
+                req.pod_id.as_deref(),
+                req.comfy_base.as_deref(),
+                req.auto_detect_base,
+            )
+            .await;
+
         let output = format!(
             "Connected to {url}\n\
              \nAll subsequent tools (generate, models, exec, etc.) will reuse this connection — \
              pod_id/url can be omitted.\n\
-             \nComfyUI models path: {models}\n\
+             \nComfyUI base: {base}\n\
+             Models path: {models}\n\
              Custom nodes path: {nodes}\n\
-             \n{stats_json}",
-            models = &*COMFYUI_MODELS_BASE,
-            nodes = &*COMFYUI_CUSTOM_NODES,
+             {base_note}\n\
+             {stats_json}",
+            base = comfyui_base(),
+            models = comfyui_models_base(),
+            nodes = comfyui_custom_nodes(),
+            base_note = base_note,
             stats_json =
                 serde_json::to_string_pretty(&stats).unwrap_or_else(|_| format!("{stats:?}"))
         );
         Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Resolve ComfyUI install base path and apply it to the global state.
+    ///
+    /// Priority:
+    /// 1. `explicit` — caller-supplied `comfy_base`.
+    /// 2. Auto-detect via SSH when `pod_id` is known and `auto_detect` is true.
+    /// 3. Keep current value (no change).
+    ///
+    /// On change, invalidates the cached sync SDK so the next sync call
+    /// rebuilds with the new `pod_output_root`. Returns a short human-readable
+    /// note describing what happened, for inclusion in the tool response.
+    async fn resolve_and_apply_comfy_base(
+        &self,
+        pod_id: Option<&str>,
+        explicit: Option<&str>,
+        auto_detect: bool,
+    ) -> String {
+        let current = comfyui_base();
+
+        let resolved: Option<(String, &'static str)> = if let Some(explicit) = explicit {
+            Some((explicit.to_string(), "explicit"))
+        } else if auto_detect {
+            match pod_id {
+                Some(pid) => match detect_comfyui_base(pid).await {
+                    Ok(Some(path)) => Some((path, "auto-detected")),
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "comfy_base auto-detect failed");
+                        None
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        let Some((new_base, source)) = resolved else {
+            return "(base source: env/default, not changed)".to_string();
+        };
+
+        if new_base == current {
+            return format!("(base source: {source}, unchanged)");
+        }
+
+        let changed = set_comfyui_base(&new_base);
+        if changed {
+            // Invalidate sync SDK cache — pod_output_root depends on base.
+            let mut guard = self.sync_sdk.lock().await;
+            *guard = None;
+            tracing::info!(
+                old = %current,
+                new = %new_base,
+                source = source,
+                "ComfyUI base updated; sync SDK invalidated"
+            );
+            format!("(base {source}, changed from {current} → {new_base})")
+        } else {
+            format!("(base source: {source}, unchanged)")
+        }
     }
 
     #[tool(
@@ -2275,7 +2478,9 @@ impl VdslMcpServer {
 
         let dest = format!(
             "{}/{}/{}",
-            &*COMFYUI_MODELS_BASE, dir_name, dl_info.filename
+            comfyui_models_base(),
+            dir_name,
+            dl_info.filename
         );
 
         let mut log = Vec::<String>::new();
@@ -3425,7 +3630,7 @@ impl VdslMcpServer {
             storage_service::b2_remote(&bucket, &req.source).map_err(Self::to_mcp_error)?;
         let dir_name =
             resolve_model_dir(&req.target).map_err(|e| McpError::invalid_params(e, None))?;
-        let dest = format!("{}/{dir_name}/", &*COMFYUI_MODELS_BASE);
+        let dest = format!("{}/{dir_name}/", comfyui_models_base());
 
         StorageService::new(&svc)
             .ensure_rclone(&req.pod_id, &ssh_key)
@@ -3484,9 +3689,10 @@ impl VdslMcpServer {
         let dir_name =
             resolve_model_dir(&req.source_target).map_err(|e| McpError::invalid_params(e, None))?;
 
+        let models_base = comfyui_models_base();
         let source = match req.filename {
-            Some(ref f) => format!("{}/{dir_name}/{f}", &*COMFYUI_MODELS_BASE),
-            None => format!("{}/{dir_name}/", &*COMFYUI_MODELS_BASE),
+            Some(ref f) => format!("{models_base}/{dir_name}/{f}"),
+            None => format!("{models_base}/{dir_name}/"),
         };
 
         let dest_path = req.dest_path.as_deref().unwrap_or("").trim_matches('/');
@@ -3560,7 +3766,7 @@ impl VdslMcpServer {
         let dir_name =
             resolve_model_dir(&req.source_target).map_err(|e| McpError::invalid_params(e, None))?;
 
-        let source_path = format!("{}/{dir_name}/{}", &*COMFYUI_MODELS_BASE, req.filename);
+        let source_path = format!("{}/{dir_name}/{}", comfyui_models_base(), req.filename);
         let dest_path = req.dest_path.as_deref().unwrap_or("").trim_matches('/');
         let remote_dir = if dest_path.is_empty() {
             format!("models/{dir_name}")
@@ -3823,8 +4029,8 @@ impl VdslMcpServer {
 
         // Build the remote path to list
         let remote_dir = match req.subfolder.as_deref() {
-            Some(sub) if !sub.is_empty() => format!("{}/{sub}", &*COMFYUI_OUTPUT_BASE),
-            _ => COMFYUI_OUTPUT_BASE.clone(),
+            Some(sub) if !sub.is_empty() => format!("{}/{sub}", comfyui_output_base()),
+            _ => comfyui_output_base(),
         };
 
         log.push(format!("Listing images in {remote_dir} ..."));
@@ -4978,8 +5184,8 @@ impl VdslMcpServer {
 
         // Build the search directory
         let search_dir = match req.subfolder.as_deref() {
-            Some(sub) if !sub.is_empty() => format!("{}/{sub}", &*COMFYUI_OUTPUT_BASE),
-            _ => COMFYUI_OUTPUT_BASE.clone(),
+            Some(sub) if !sub.is_empty() => format!("{}/{sub}", comfyui_output_base()),
+            _ => comfyui_output_base(),
         };
 
         // Build pngmetagrep command
@@ -5521,7 +5727,7 @@ pub(crate) async fn build_sdk(
 
     if let (Some(pid), Some(ref ak)) = (pod_id, &api_key) {
         if let Ok(pod_loc_id) = vdsl_sync::LocationId::new(format!("pod-{pid}")) {
-            let pod_output_root = std::path::PathBuf::from(format!("{}/output", *COMFYUI_BASE));
+            let pod_output_root = std::path::PathBuf::from(comfyui_output_base());
             let ssh_key = Some(resolve_ssh_key(None));
 
             // Pod Location 登録（Scanner 自動導出用）
@@ -6339,7 +6545,10 @@ async fn execute_transfers(
         // Paths are relative to ComfyUI root
         cp_commands.push(format!(
             "cp -f {}/{} {}/{}",
-            &*COMFYUI_BASE, t.from, &*COMFYUI_BASE, t.to
+            comfyui_base(),
+            t.from,
+            comfyui_base(),
+            t.to
         ));
     }
     let combined = cp_commands.join(" && ");

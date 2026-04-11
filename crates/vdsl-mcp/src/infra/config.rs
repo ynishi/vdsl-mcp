@@ -252,8 +252,10 @@ work_dir = "/tmp/test_work"
 
     #[test]
     fn merge_cli_none_fields_keep_original() {
-        let mut base = SyncdConfig::default();
-        base.port = 1234;
+        let base = SyncdConfig {
+            port: 1234,
+            ..SyncdConfig::default()
+        };
         let overrides = SyncdCliOverrides::default(); // 全 None
         let merged = base.merge_cli(overrides);
         assert_eq!(merged.port, 1234);
@@ -275,8 +277,10 @@ work_dir = "/tmp/test_work"
 
     #[test]
     fn resolved_work_dir_returns_explicit() {
-        let mut cfg = SyncdConfig::default();
-        cfg.work_dir = Some(PathBuf::from("/explicit/dir"));
+        let cfg = SyncdConfig {
+            work_dir: Some(PathBuf::from("/explicit/dir")),
+            ..SyncdConfig::default()
+        };
         let result = cfg.resolved_work_dir().unwrap();
         assert_eq!(result, PathBuf::from("/explicit/dir"));
     }
