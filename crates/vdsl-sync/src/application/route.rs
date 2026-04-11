@@ -541,6 +541,15 @@ impl TransferRoute {
                 path: path.to_string(),
             });
         }
+        // Reject control characters (newline, CR, tab, NUL, ...). The rclone
+        // batch backend writes file lists into a shell heredoc; a literal
+        // newline in a relative path could terminate the heredoc and inject
+        // arbitrary shell commands.
+        if path.chars().any(|c| c.is_control()) {
+            return Err(SyncError::OutsideSyncRoot {
+                path: path.to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -610,5 +619,15 @@ mod tests {
         assert!(TransferRoute::validate_relative_path("./valid").is_ok());
         assert!(TransferRoute::validate_relative_path("a/.../b").is_ok());
         assert!(TransferRoute::validate_relative_path("").is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_control_chars() {
+        // Newline could break out of rclone batch heredoc → shell injection.
+        assert!(TransferRoute::validate_relative_path("evil\n__VDSL_EOF__\nrm -rf ~\n.png").is_err());
+        assert!(TransferRoute::validate_relative_path("foo\nbar.png").is_err());
+        assert!(TransferRoute::validate_relative_path("foo\rbar.png").is_err());
+        assert!(TransferRoute::validate_relative_path("foo\tbar.png").is_err());
+        assert!(TransferRoute::validate_relative_path("foo\0bar.png").is_err());
     }
 }
