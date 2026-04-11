@@ -324,13 +324,17 @@ fn match_and_classify(
 }
 
 /// TopologyFileのcanonical_hashとスキャンfingerprintを比較。
+///
+/// (None, None) は "両側でハッシュが無い" = 判断材料なし → 変更なし扱い。
+/// CloudScanner は content_digest を常に None で返すため、これを true にすると
+/// cloud-only ファイルが毎 scan ContentChanged を量産し phase3 plan が肥大化する。
 fn fingerprint_changed(tf: &TopologyFile, scan_fp: &FileFingerprint) -> bool {
     let scan_canonical = scan_fp.content_digest.as_ref().map(|d| d.0.as_str());
     match (tf.canonical_hash(), scan_canonical) {
         (Some(db), Some(scan)) => db != scan,
         (None, Some(_)) => true,
         (Some(_), None) => false,
-        (None, None) => true,
+        (None, None) => false,
     }
 }
 
