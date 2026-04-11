@@ -74,6 +74,9 @@ pub struct CancelResponse {
 #[derive(Debug, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
+    /// syncd が起動時に読んだ pod_id。frontend が pod mismatch 検知に使う。
+    #[serde(default)]
+    pub pod_id: Option<String>,
 }
 
 // =============================================================================
@@ -161,15 +164,23 @@ impl SyncdClient {
     /// `GET /healthz` に最大 300ms timeout で問い合わせ、
     /// 200 OK が返れば `true`、それ以外 (ConnectionRefused, timeout 等) は `false`。
     pub async fn probe(&self) -> bool {
-        // `/healthz` は auth 不要 (middleware 対象外)。token が未ロードでも通る。
+        self.fetch_health().await.is_some()
+    }
+
+    /// `/healthz` の body を取得する。pod_id mismatch 検知用。
+    pub async fn fetch_health(&self) -> Option<HealthResponse> {
         let url = format!("{}/healthz", self.base_url);
-        let result = self
+        let resp = self
             .http
             .get(&url)
             .timeout(Duration::from_millis(300))
             .send()
-            .await;
-        matches!(result, Ok(r) if r.status().is_success())
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<HealthResponse>().await.ok()
     }
 
     /// `POST /v1/sync` — 全体 sync を syncd に委譲する。

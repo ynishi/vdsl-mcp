@@ -39,7 +39,16 @@ pub async fn run(cfg: SyncdConfig, spawned_by_mcp: bool) -> anyhow::Result<()> {
     let persistence = sync_db.ensure().await?;
 
     // SDK 構築
-    let (sdk, _) = crate::interface::mcp::build_sdk(&sync_db, None, &persistence).await?;
+    // VDSL_SYNCD_POD_ID が設定されていれば pod Location / routes を登録する (Bug #4)。
+    // frontend 側の ensure_syncd_running が spawn 時に env 伝播する。
+    let pod_id_env = std::env::var("VDSL_SYNCD_POD_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if let Some(ref pid) = pod_id_env {
+        info!(pod_id = %pid, "syncd: pod_id from env (VDSL_SYNCD_POD_ID)");
+    }
+    let (sdk, _) =
+        crate::interface::mcp::build_sdk(&sync_db, pod_id_env.as_deref(), &persistence).await?;
 
     // TaskManager 構築 (syncd 専用 — recover を実行する)
     let task_mgr = Arc::new(SyncTaskManager::new());
@@ -53,6 +62,7 @@ pub async fn run(cfg: SyncdConfig, spawned_by_mcp: bool) -> anyhow::Result<()> {
         auto_sync_running: Arc::new(AtomicBool::new(false)),
         auto_sync_pending: Arc::new(AtomicBool::new(false)),
         auth_token,
+        pod_id: pod_id_env,
     });
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", cfg.port)).await?;

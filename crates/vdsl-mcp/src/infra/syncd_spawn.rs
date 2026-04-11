@@ -52,10 +52,26 @@ pub enum SyncdStatus {
 ///    - healthz 2 秒待機 → 成功なら `Running`
 ///    - タイムアウト → `SpawnTimeout`
 /// 4. spawn 自体が失敗 → `SpawnFailed`
-pub async fn ensure_syncd_running(cfg: &SyncdConfig, client: &SyncdClient) -> SyncdStatus {
-    // 1. probe
-    if client.probe().await {
-        return SyncdStatus::Running;
+pub async fn ensure_syncd_running(
+    cfg: &SyncdConfig,
+    client: &SyncdClient,
+    pod_id: Option<&str>,
+) -> SyncdStatus {
+    // 1. probe — 既存 syncd が pod_id mismatch の場合は SIGTERM で落として再起動する (Bug #4)。
+    if let Some(health) = client.fetch_health().await {
+        let running_pod = health.pod_id.as_deref();
+        if running_pod == pod_id {
+            return SyncdStatus::Running;
+        }
+        warn!(
+            running_pod = ?running_pod,
+            requested_pod = ?pod_id,
+            "syncd: pod_id mismatch — restarting syncd to rebuild SDK with new pod"
+        );
+        if let Some(pid) = read_pid_file(&cfg.pid_file) {
+            terminate_and_wait(pid, &cfg.pid_file).await;
+        }
+        // fall through to spawn
     }
 
     // 2. PID file 確認
@@ -97,10 +113,16 @@ pub async fn ensure_syncd_running(cfg: &SyncdConfig, client: &SyncdClient) -> Sy
             }
         };
         let work_dir_str = work_dir.as_ref().map(|p| p.to_string_lossy().into_owned());
-        let envs: Vec<(&str, &str)> = match work_dir_str.as_deref() {
-            Some(s) => vec![("VDSL_WORK_DIR", s)],
-            None => vec![],
-        };
+        let mut envs: Vec<(&str, &str)> = Vec::new();
+        if let Some(s) = work_dir_str.as_deref() {
+            envs.push(("VDSL_WORK_DIR", s));
+        }
+        // pod_id を VDSL_SYNCD_POD_ID で伝播する。syncd 側はこれを読んで SDK
+        // 初期化時に pod Location / pod routes を登録する (Bug #4)。
+        // 現状は spawn 時固定: syncd 稼働中の pod 切替は反映されない。
+        if let Some(pid) = pod_id {
+            envs.push(("VDSL_SYNCD_POD_ID", pid));
+        }
         match crate::interface::syncd::spawn_detached(&exe, &args, &envs) {
             Ok(child_pid) => {
                 tracing::info!(child_pid, "syncd: spawned detached process");
@@ -141,6 +163,42 @@ pub async fn ensure_syncd_running(cfg: &SyncdConfig, client: &SyncdClient) -> Sy
 pub fn read_pid_file(path: &Path) -> Option<i32> {
     let contents = std::fs::read_to_string(path).ok()?;
     contents.lines().next()?.trim().parse().ok()
+}
+
+/// 既存 syncd を SIGTERM で停止し、プロセスが終了するまで待機する。
+///
+/// pod_id mismatch による再起動用。graceful shutdown (SIGTERM → PID file 削除) を期待し、
+/// 最大 3 秒待つ。タイムアウトしたらそのまま spawn に進む (既存 PID file は syncd が上書き)。
+#[cfg(unix)]
+async fn terminate_and_wait(pid: i32, pid_file: &Path) {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+
+    match kill(Pid::from_raw(pid), Signal::SIGTERM) {
+        Ok(()) => tracing::info!(pid, "syncd: SIGTERM sent for pod_id mismatch restart"),
+        Err(e) => {
+            warn!(pid, error = %e, "syncd: SIGTERM failed, proceeding to spawn anyway");
+            return;
+        }
+    }
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if !process_alive(pid) {
+            tracing::info!(pid, "syncd: previous process exited");
+            // PID file が残っていれば syncd spawn 側で上書きされる
+            let _ = pid_file;
+            return;
+        }
+    }
+    warn!(
+        pid,
+        "syncd: SIGTERM timed out after 3s, spawn will still proceed"
+    );
+}
+
+#[cfg(not(unix))]
+async fn terminate_and_wait(_pid: i32, _pid_file: &Path) {
+    // 非 unix は phase 1 対象外。
 }
 
 /// プロセスが生存しているかを確認する。
@@ -204,7 +262,7 @@ mod tests {
         let cfg = test_config(19998, pid_path.clone());
         let client = SyncdClient::from_config(&cfg).expect("client build should succeed");
 
-        let status = ensure_syncd_running(&cfg, &client).await;
+        let status = ensure_syncd_running(&cfg, &client, None).await;
 
         // spawn に進んだ結果として SpawnTimeout か SpawnFailed になるはず
         // (テスト環境で syncd が実際に起動することはない)

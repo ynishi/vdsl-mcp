@@ -50,6 +50,11 @@ pub struct SyncdState {
     /// Shared-secret bearer token for HTTP auth. Read from `cfg.token_file`
     /// at startup. `/healthz` は auth 例外。
     pub auth_token: String,
+    /// 起動時に env `VDSL_SYNCD_POD_ID` から読んだ pod_id。
+    /// SDK 構築時に pod Location として登録済み (Bug #4)。
+    /// frontend が pod 切替時に mismatch を検知して syncd を再起動するために `/healthz`
+    /// で公開する。
+    pub pod_id: Option<String>,
 }
 
 // =============================================================================
@@ -176,6 +181,8 @@ struct HealthResponse {
     version: &'static str,
     uptime_sec: u64,
     work_dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pod_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -243,6 +250,7 @@ async fn healthz(State(state): State<Arc<SyncdState>>) -> impl IntoResponse {
         version: env!("CARGO_PKG_VERSION"),
         uptime_sec,
         work_dir,
+        pod_id: state.pod_id.clone(),
     })
 }
 
@@ -487,6 +495,7 @@ mod tests {
             auto_sync_running: Arc::new(AtomicBool::new(false)),
             auto_sync_pending: Arc::new(AtomicBool::new(false)),
             auth_token: TEST_TOKEN.to_string(),
+            pod_id: None,
         })
     }
 

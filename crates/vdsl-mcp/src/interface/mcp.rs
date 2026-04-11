@@ -123,6 +123,14 @@ impl VdslMcpServer {
             .filter(|s| !s.is_empty())
     }
 
+    /// syncd spawn 時に env 伝播する pod_id を取得する。
+    ///
+    /// frontend 側の last_pod_id (vdsl_connect / auto-detect 経由で設定) を返す。
+    /// syncd は起動時のみ env を読むため、起動後の pod 切替は反映されない。
+    fn pod_id_for_syncd(&self) -> Option<String> {
+        self.last_pod_id.lock().ok().and_then(|g| g.clone())
+    }
+
     /// Resolve or lazily initialize the SyncStoreSdk.
     ///
     /// Returns the existing SDK if pod_id hasn't changed AND DB generation is the same.
@@ -4117,7 +4125,8 @@ impl VdslMcpServer {
     )]
     async fn sync(&self) -> Result<CallToolResult, McpError> {
         // probe → syncd 委譲 / 未稼働なら spawn → fallback
-        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client).await {
+        let pod_id_for_spawn = self.pod_id_for_syncd();
+        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client, pod_id_for_spawn.as_deref()).await {
             SyncdStatus::Running => {
                 let resp = self.syncd_client.delegate_sync().await.map_err(|e| {
                     McpError::internal_error(format!("syncd delegate_sync failed: {e}"), None)
@@ -4164,7 +4173,8 @@ impl VdslMcpServer {
         Parameters(req): Parameters<VdslSyncRouteRequest>,
     ) -> Result<CallToolResult, McpError> {
         // probe → syncd 委譲 / 未稼働なら spawn → fallback
-        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client).await {
+        let pod_id_for_spawn = self.pod_id_for_syncd();
+        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client, pod_id_for_spawn.as_deref()).await {
             SyncdStatus::Running => {
                 let resp = self
                     .syncd_client
@@ -4358,7 +4368,8 @@ impl VdslMcpServer {
         Parameters(req): Parameters<VdslSyncDeleteRequest>,
     ) -> Result<CallToolResult, McpError> {
         // probe → syncd 委譲 / 未稼働なら spawn → fallback
-        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client).await {
+        let pod_id_for_spawn = self.pod_id_for_syncd();
+        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client, pod_id_for_spawn.as_deref()).await {
             SyncdStatus::Running => {
                 let created = self
                     .syncd_client
@@ -4404,7 +4415,8 @@ impl VdslMcpServer {
         Parameters(req): Parameters<VdslSyncRestoreRequest>,
     ) -> Result<CallToolResult, McpError> {
         // probe → syncd 委譲 / 未稼働なら spawn → fallback
-        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client).await {
+        let pod_id_for_spawn = self.pod_id_for_syncd();
+        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client, pod_id_for_spawn.as_deref()).await {
             SyncdStatus::Running => {
                 self.syncd_client
                     .delegate_restore(&req.path, &req.revision)
