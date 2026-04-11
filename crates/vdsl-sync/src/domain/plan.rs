@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tracing::trace;
+use tracing::{debug, trace, warn};
 
 use super::distribute::DistributeAction;
 use super::location::LocationId;
@@ -153,6 +153,11 @@ pub fn plan_distribution(
     let empty_presences = HashSet::new();
     let mut all_transfers = Vec::new();
 
+    // Aggregate skip counters for visibility into "27 actions → 0 transfers" cases.
+    let mut skipped_all_pending = 0usize;
+    let mut skipped_all_existing = 0usize;
+    let mut unreachable_targets = 0usize;
+
     // 2. 各グループについて最適木を計算
     for (group, mut targets) in groups {
         // pending除外
@@ -161,6 +166,7 @@ pub fn plan_distribution(
         targets.retain(|t| !pending.contains(t));
 
         if targets.is_empty() {
+            skipped_all_pending += 1;
             trace!(
                 file_id = %group.file_id,
                 kind = ?group.kind,
@@ -178,15 +184,54 @@ pub fn plan_distribution(
         let mut sources = existing.clone();
         sources.insert(group.source.clone());
 
+        // Targets already present in sources are filtered out inside
+        // `optimal_tree_multi_source`. Pre-compute the effective dest set here
+        // so we can tell "unreachable" apart from "already present".
+        let effective_targets: HashSet<LocationId> = targets
+            .iter()
+            .filter(|t| !sources.contains(t))
+            .cloned()
+            .collect();
+
+        if effective_targets.is_empty() {
+            skipped_all_existing += 1;
+            trace!(
+                file_id = %group.file_id,
+                kind = ?group.kind,
+                sources = ?sources.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "plan_distribution: all targets already present in sources, skip"
+            );
+            continue;
+        }
+
         trace!(
             file_id = %group.file_id,
             kind = ?group.kind,
             sources = ?sources.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            targets = ?targets.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            targets = ?effective_targets.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
             "plan_distribution: computing optimal tree"
         );
 
         let tree_edges = topology.optimal_tree_multi_source(&sources, &targets);
+
+        // Identify unreachable targets: each effective target must appear as
+        // a `dest` in some tree edge. Missing ones were silently dropped by
+        // Dijkstra because no path exists in the graph.
+        let covered_dests: HashSet<&LocationId> = tree_edges.iter().map(|(_, d)| d).collect();
+        let missing: Vec<&LocationId> = effective_targets
+            .iter()
+            .filter(|t| !covered_dests.contains(t))
+            .collect();
+        if !missing.is_empty() {
+            unreachable_targets += missing.len();
+            warn!(
+                file_id = %group.file_id,
+                kind = ?group.kind,
+                sources = ?sources.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                unreachable = ?missing.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+                "plan_distribution: targets unreachable from sources — no route in graph, transfer not planned"
+            );
+        }
 
         trace!(
             file_id = %group.file_id,
@@ -203,10 +248,20 @@ pub fn plan_distribution(
         }
     }
 
-    trace!(
-        total_transfers = all_transfers.len(),
-        "plan_distribution: done"
-    );
+    if skipped_all_pending > 0 || skipped_all_existing > 0 || unreachable_targets > 0 {
+        debug!(
+            total_transfers = all_transfers.len(),
+            skipped_all_pending,
+            skipped_all_existing,
+            unreachable_targets,
+            "plan_distribution: done (with skips)"
+        );
+    } else {
+        trace!(
+            total_transfers = all_transfers.len(),
+            "plan_distribution: done"
+        );
+    }
     all_transfers
 }
 
