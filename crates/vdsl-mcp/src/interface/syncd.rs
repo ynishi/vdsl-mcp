@@ -243,22 +243,26 @@ fn build_default_excludes() -> anyhow::Result<Vec<glob::Pattern>> {
 }
 
 #[cfg(unix)]
-pub fn spawn_detached(exe: &Path, args: &[&str]) -> anyhow::Result<u32> {
+pub fn spawn_detached(exe: &Path, args: &[&str], envs: &[(&str, &str)]) -> anyhow::Result<u32> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+
     // SAFETY: `pre_exec` closure 内では async-signal-safe な setsid() のみを呼ぶ。
     let child = unsafe {
-        Command::new(exe)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .pre_exec(|| {
-                nix::unistd::setsid().map_err(std::io::Error::from)?;
-                Ok(())
-            })
-            .spawn()?
+        cmd.pre_exec(|| {
+            nix::unistd::setsid().map_err(std::io::Error::from)?;
+            Ok(())
+        })
+        .spawn()?
     };
 
     Ok(child.id())

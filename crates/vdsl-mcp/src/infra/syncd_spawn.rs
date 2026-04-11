@@ -86,7 +86,22 @@ pub async fn ensure_syncd_running(cfg: &SyncdConfig, client: &SyncdClient) -> Sy
     #[cfg(unix)]
     {
         let args = ["syncd", "--spawned-by-mcp"];
-        match crate::interface::syncd::spawn_detached(&exe, &args) {
+        // frontend 側で resolve した work_dir を env で伝播する。
+        // これをしないと syncd は自プロセスの CWD から current_dir() で解決し、
+        // frontend と別の .vdsl/sync.db を開いてしまう (Bug #1)。
+        let work_dir = match cfg.resolved_work_dir() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!(error = %e, "syncd: failed to resolve work_dir for env propagation");
+                None
+            }
+        };
+        let work_dir_str = work_dir.as_ref().map(|p| p.to_string_lossy().into_owned());
+        let envs: Vec<(&str, &str)> = match work_dir_str.as_deref() {
+            Some(s) => vec![("VDSL_WORK_DIR", s)],
+            None => vec![],
+        };
+        match crate::interface::syncd::spawn_detached(&exe, &args, &envs) {
             Ok(child_pid) => {
                 tracing::info!(child_pid, "syncd: spawned detached process");
                 // healthz 2 秒待機 (100ms × 20)
