@@ -107,7 +107,7 @@ mod tests {
     async fn insert_test_topology_file(store: &SqliteSyncStore, path: &str) -> TopologyFile {
         let tf =
             TopologyFile::new(path.to_string(), FileType::Image).expect("valid test topology file");
-        TopologyFileStore::upsert(&*store, &tf)
+        TopologyFileStore::upsert(store, &tf)
             .await
             .expect("insert topology file");
         tf

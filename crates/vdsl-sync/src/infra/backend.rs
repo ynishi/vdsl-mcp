@@ -277,8 +277,7 @@ pub mod memory {
                 *guard = false;
                 return Err(InfraError::Transfer {
                     reason: "mock push error".into(),
-                }
-                .into());
+                });
             }
             Ok(())
         }
@@ -293,8 +292,7 @@ pub mod memory {
                 *guard = false;
                 return Err(InfraError::Transfer {
                     reason: "mock pull error".into(),
-                }
-                .into());
+                });
             }
             Ok(())
         }
@@ -330,8 +328,7 @@ pub mod memory {
                 *guard = false;
                 return Err(InfraError::Transfer {
                     reason: "mock delete error".into(),
-                }
-                .into());
+                });
             }
             self.files.lock().await.remove(remote_path);
             Ok(())

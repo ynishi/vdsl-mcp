@@ -910,7 +910,7 @@ mod tests {
             let mut result: Vec<_> = files
                 .iter()
                 .filter(|f| f.deleted_at().is_none())
-                .filter(|f| file_type.map_or(true, |ft| f.file_type() == ft))
+                .filter(|f| file_type.is_none_or(|ft| f.file_type() == ft))
                 .cloned()
                 .collect();
             if let Some(n) = limit {

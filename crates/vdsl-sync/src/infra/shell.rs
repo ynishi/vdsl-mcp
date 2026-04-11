@@ -178,6 +178,7 @@ impl RemoteShell for LocalShell {
 
 /// Mock shell for testing — returns configurable responses.
 #[cfg(any(test, feature = "test-utils"))]
+#[allow(dead_code)]
 pub mod mock {
     use super::*;
     use std::collections::HashMap;

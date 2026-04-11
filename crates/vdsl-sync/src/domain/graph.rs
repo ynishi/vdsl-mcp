@@ -114,6 +114,7 @@ impl RouteGraph {
 
     /// Get the cost of an edge, if it exists.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn edge_cost(&self, src: &LocationId, dest: &LocationId) -> Option<&EdgeCost> {
         self.adj.get(src).and_then(|dests| dests.get(dest))
     }

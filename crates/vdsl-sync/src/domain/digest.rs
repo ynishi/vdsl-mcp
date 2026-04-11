@@ -237,21 +237,21 @@ mod tests {
     fn djb2_same_value_matches() {
         let a = ByteDigest::Djb2("abc123".into());
         let b = ByteDigest::Djb2("abc123".into());
-        assert_eq!(a.matches_same_algo(&b).unwrap(), true);
+        assert!(a.matches_same_algo(&b).unwrap());
     }
 
     #[test]
     fn djb2_different_value_no_match() {
         let a = ByteDigest::Djb2("abc123".into());
         let b = ByteDigest::Djb2("def456".into());
-        assert_eq!(a.matches_same_algo(&b).unwrap(), false);
+        assert!(!a.matches_same_algo(&b).unwrap());
     }
 
     #[test]
     fn sha256_same_value_matches() {
         let a = ByteDigest::Sha256("deadbeef".repeat(8));
         let b = ByteDigest::Sha256("deadbeef".repeat(8));
-        assert_eq!(a.matches_same_algo(&b).unwrap(), true);
+        assert!(a.matches_same_algo(&b).unwrap());
     }
 
     #[test]
