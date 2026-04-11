@@ -633,9 +633,16 @@ impl StorageBackend for RcloneBackend {
                         stderr = out.stderr.trim(),
                         "dpkg install failed, falling back to install.sh"
                     );
+                    // install.sh は rclone.zip を展開するため unzip が必要。
+                    // 一部の最小 pod イメージには unzip が無いので apt で先に入れる。
+                    let fallback_script = concat!(
+                        "(command -v unzip >/dev/null 2>&1 || ",
+                        "(apt-get update -qq && apt-get install -y -qq unzip)) && ",
+                        "curl -sL https://rclone.org/install.sh | bash",
+                    );
                     let fallback = self
                         .shell
-                        .exec_script("curl -sL https://rclone.org/install.sh | bash", Some(120))
+                        .exec_script(fallback_script, Some(180))
                         .await;
                     match &fallback {
                         Ok(o) if o.success => {
