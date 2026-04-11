@@ -1,6 +1,7 @@
-//! SQLite implementation of file/transfer/remote stores.
+//! SQLite implementation of file/transfer/task stores.
 //!
-//! Uses normalized schema: `tracked_files` + `transfers` + `sync_remotes`.
+//! Uses normalized schema: `topology_files` + `location_files` + `transfers` + `sync_tasks`.
+//! Schema versioning via `PRAGMA user_version` (see [`schema`]).
 //! Designed for single-writer (sync engine), concurrent readers OK.
 //!
 //! Uses `tokio-rusqlite` for non-blocking async access — each connection
