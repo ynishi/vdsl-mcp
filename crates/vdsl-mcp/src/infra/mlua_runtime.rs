@@ -962,6 +962,27 @@ mod inner {
             self.exec_code(&code).await
         }
 
+        /// Escape a string for safe interpolation into a Lua single-quoted literal.
+        ///
+        /// Lua single-quoted strings cannot contain literal newlines or NULs;
+        /// failing to escape them turns env-var injection into either a syntax
+        /// error or arbitrary Lua code execution. Multi-line values reach this
+        /// path via VDSL_JUDGE_RESULT (JSON) and similar runtime-controlled vars.
+        fn lua_escape_single_quoted(s: &str) -> String {
+            let mut out = String::with_capacity(s.len() + 4);
+            for c in s.chars() {
+                match c {
+                    '\\' => out.push_str("\\\\"),
+                    '\'' => out.push_str("\\'"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\0' => out.push_str("\\0"),
+                    _ => out.push(c),
+                }
+            }
+            out
+        }
+
         /// Execute with environment variables injected as Lua globals.
         ///
         /// Each `(key, value)` pair is set as a global string before execution.
@@ -972,8 +993,9 @@ mod inner {
         ) -> Result<MluaExecResult, McpError> {
             let mut preamble = String::new();
             for (k, v) in envs {
-                let escaped = v.replace('\\', "\\\\").replace('\'', "\\'");
-                preamble.push_str(&format!("_injected_env['{k}'] = '{escaped}'\n"));
+                let key = Self::lua_escape_single_quoted(k);
+                let val = Self::lua_escape_single_quoted(v);
+                preamble.push_str(&format!("_injected_env['{key}'] = '{val}'\n"));
             }
             preamble.push_str(code);
             self.exec_code(&preamble).await
