@@ -6753,7 +6753,7 @@ const VDSL_INJECT_TIMEOUT_SECS: u64 = 30;
 
 /// Lua script that reads a manifest file and injects VDSL metadata into PNGs.
 const VDSL_INJECT_LUA: &str = r#"
-local png = require("vdsl.util.png")
+local png = require("vdsl.runtime.png")
 local json = require("vdsl.util.json")
 
 local f = io.open(os.getenv("VDSL_INJECT_MANIFEST"), "r")
