@@ -131,6 +131,22 @@ impl VdslMcpServer {
         self.last_pod_id.lock().ok().and_then(|g| g.clone())
     }
 
+    /// Auto-detect a running pod and store its ID in last_pod_id.
+    ///
+    /// Must be called BEFORE ensure_syncd_running so that pod_id is available
+    /// for env propagation when spawning syncd.
+    async fn ensure_pod_detected(&self) {
+        if self.last_pod_id.lock().ok().and_then(|g| g.clone()).is_some() {
+            return; // already known
+        }
+        if let Some(detected) = Self::detect_running_pod().await {
+            tracing::info!(pod_id = %detected, "ensure_pod_detected: auto-detected running pod");
+            if let Ok(mut guard) = self.last_pod_id.lock() {
+                *guard = Some(detected);
+            }
+        }
+    }
+
     /// Resolve or lazily initialize the SyncStoreSdk.
     ///
     /// Returns the existing SDK if pod_id hasn't changed AND DB generation is the same.
@@ -4124,6 +4140,8 @@ impl VdslMcpServer {
         )
     )]
     async fn sync(&self) -> Result<CallToolResult, McpError> {
+        // auto-detect pod BEFORE syncd spawn so pod_id is available for env propagation
+        self.ensure_pod_detected().await;
         // probe → syncd 委譲 / 未稼働なら spawn → fallback
         let pod_id_for_spawn = self.pod_id_for_syncd();
         match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client, pod_id_for_spawn.as_deref()).await {
@@ -4172,6 +4190,8 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslSyncRouteRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // auto-detect pod BEFORE syncd spawn so pod_id is available for env propagation
+        self.ensure_pod_detected().await;
         // probe → syncd 委譲 / 未稼働なら spawn → fallback
         let pod_id_for_spawn = self.pod_id_for_syncd();
         match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client, pod_id_for_spawn.as_deref()).await {
@@ -4367,6 +4387,8 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslSyncDeleteRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // auto-detect pod BEFORE syncd spawn so pod_id is available for env propagation
+        self.ensure_pod_detected().await;
         // probe → syncd 委譲 / 未稼働なら spawn → fallback
         let pod_id_for_spawn = self.pod_id_for_syncd();
         match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client, pod_id_for_spawn.as_deref()).await {
@@ -4414,6 +4436,8 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslSyncRestoreRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // auto-detect pod BEFORE syncd spawn so pod_id is available for env propagation
+        self.ensure_pod_detected().await;
         // probe → syncd 委譲 / 未稼働なら spawn → fallback
         let pod_id_for_spawn = self.pod_id_for_syncd();
         match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client, pod_id_for_spawn.as_deref()).await {

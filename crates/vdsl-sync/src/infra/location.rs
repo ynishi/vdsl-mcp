@@ -204,7 +204,7 @@ impl Location for SshLocation {
     }
 
     async fn ensure(&self) -> Result<(), InfraError> {
-        let output = self.shell.exec(&["echo", "pong"], Some(10)).await?;
+        let output = self.shell.exec(&["echo", "pong"], Some(30)).await?;
         if !output.success {
             return Err(InfraError::Init(format!(
                 "SSH location '{}' unreachable (exit {}): {}",
