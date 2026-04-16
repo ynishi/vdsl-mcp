@@ -136,7 +136,13 @@ impl VdslMcpServer {
     /// Must be called BEFORE ensure_syncd_running so that pod_id is available
     /// for env propagation when spawning syncd.
     async fn ensure_pod_detected(&self) {
-        if self.last_pod_id.lock().ok().and_then(|g| g.clone()).is_some() {
+        if self
+            .last_pod_id
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .is_some()
+        {
             return; // already known
         }
         if let Some(detected) = Self::detect_running_pod().await {
@@ -4144,7 +4150,13 @@ impl VdslMcpServer {
         self.ensure_pod_detected().await;
         // probe → syncd 委譲 / 未稼働なら spawn → fallback
         let pod_id_for_spawn = self.pod_id_for_syncd();
-        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client, pod_id_for_spawn.as_deref()).await {
+        match ensure_syncd_running(
+            &self.syncd_cfg,
+            &self.syncd_client,
+            pod_id_for_spawn.as_deref(),
+        )
+        .await
+        {
             SyncdStatus::Running => {
                 let resp = self.syncd_client.delegate_sync().await.map_err(|e| {
                     McpError::internal_error(format!("syncd delegate_sync failed: {e}"), None)
@@ -4194,7 +4206,13 @@ impl VdslMcpServer {
         self.ensure_pod_detected().await;
         // probe → syncd 委譲 / 未稼働なら spawn → fallback
         let pod_id_for_spawn = self.pod_id_for_syncd();
-        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client, pod_id_for_spawn.as_deref()).await {
+        match ensure_syncd_running(
+            &self.syncd_cfg,
+            &self.syncd_client,
+            pod_id_for_spawn.as_deref(),
+        )
+        .await
+        {
             SyncdStatus::Running => {
                 let resp = self
                     .syncd_client
@@ -4391,7 +4409,13 @@ impl VdslMcpServer {
         self.ensure_pod_detected().await;
         // probe → syncd 委譲 / 未稼働なら spawn → fallback
         let pod_id_for_spawn = self.pod_id_for_syncd();
-        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client, pod_id_for_spawn.as_deref()).await {
+        match ensure_syncd_running(
+            &self.syncd_cfg,
+            &self.syncd_client,
+            pod_id_for_spawn.as_deref(),
+        )
+        .await
+        {
             SyncdStatus::Running => {
                 let created = self
                     .syncd_client
@@ -4440,7 +4464,13 @@ impl VdslMcpServer {
         self.ensure_pod_detected().await;
         // probe → syncd 委譲 / 未稼働なら spawn → fallback
         let pod_id_for_spawn = self.pod_id_for_syncd();
-        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client, pod_id_for_spawn.as_deref()).await {
+        match ensure_syncd_running(
+            &self.syncd_cfg,
+            &self.syncd_client,
+            pod_id_for_spawn.as_deref(),
+        )
+        .await
+        {
             SyncdStatus::Running => {
                 self.syncd_client
                     .delegate_restore(&req.path, &req.revision)
