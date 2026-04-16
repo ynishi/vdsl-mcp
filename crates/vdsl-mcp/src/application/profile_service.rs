@@ -21,15 +21,34 @@
 //!
 //! # Placeholder syntax (consumed by batch_service)
 //!
-//! Some steps reference values produced by earlier steps at runtime.
-//! Rather than pre-resolving, the plan embeds a placeholder:
+//! Some step argument values cannot be known at plan-construction
+//! time. Rather than pre-resolving, the plan embeds placeholder
+//! strings that `batch_service` pattern-matches at dispatch time.
+//! Two placeholder varieties exist:
 //!
 //! ```text
-//! "__result:{step_id}.{field}"
+//! "__result:{step_id}.{field}"   — resolved from the accumulated
+//!                                  results of earlier steps
+//! "__secret:{NAME}"              — resolved from the secrets map
+//!                                  (see `resolve_secrets`)
 //! ```
 //!
-//! batch_service pattern-matches these at dispatch time. Subtask 1
-//! produces them; Subtask 2 resolves them.
+//! Subtask 1 produces both; Subtask 2 resolves both.
+//!
+//! # Secrets are never in the plan
+//!
+//! [`BatchPlan`] contains no plaintext secret values. Every secret
+//! reference in `manifest.env` is emitted as the placeholder string
+//! `"__secret:NAME"` in `args.env`; the resolved value is held
+//! separately in a `HashMap<String, String>` that flows to
+//! `batch_service` via the apply handler.
+//!
+//! Redaction of the plan for logging / `dry_run` output is
+//! unnecessary because secret values are never embedded in it.
+//! Missing-secret fail-fast is preserved: the apply handler calls
+//! [`resolve_secrets`] before [`expand_phases`], so an unset env
+//! variable surfaces as [`ProfileError::MissingSecrets`] at entry
+//! rather than at step dispatch.
 //!
 //! # Cross-subtask contract (K-8)
 //!
@@ -243,24 +262,34 @@ pub fn resolve_secrets(
 
 /// Expand a manifest into a concrete [`BatchPlan`] targeting `pod_id`.
 ///
-/// `secrets` should be the output of [`resolve_secrets`]. `valid_edges`
-/// is the current SDK topology — each `sync.pull` / `sync.push` route
-/// is checked against it. Unknown edge ->
-/// [`ProfileError::InvalidManifest`] (design §2 PrimaryRoute ONLY).
+/// `valid_edges` is the current SDK topology — each
+/// `sync.pull` / `sync.push` route is checked against it. Unknown
+/// edge -> [`ProfileError::InvalidManifest`] (design §2 PrimaryRoute
+/// ONLY).
 ///
-/// `dry_run` is forwarded onto the resulting [`BatchPlan`] unchanged;
-/// secret redaction happens in batch_service at dispatch time.
+/// `dry_run` is forwarded onto the resulting [`BatchPlan`] unchanged.
+///
+/// # Secrets
+///
+/// Secret values are **not** embedded in the returned plan. Every
+/// `EnvValue::Secret { name }` in `manifest.env` is emitted as the
+/// placeholder string `"__secret:NAME"` inside `args.env`. The
+/// caller is expected to have invoked [`resolve_secrets`] separately
+/// (for fail-fast validation) and to pass the resolved map to
+/// `batch_service` for dispatch-time substitution. See module-level
+/// doc comment.
 pub fn expand_phases(
     manifest: &ProfileManifest,
     pod_id: &str,
-    secrets: &HashMap<String, String>,
     valid_edges: &[(LocationId, LocationId)],
     dry_run: bool,
 ) -> Result<BatchPlan, ProfileError> {
     let mut steps: Vec<StepEntry> = Vec::new();
 
     // Shared env object injected into every exec step.
-    let env_json = env_value(secrets);
+    // Plaintext values pass through; secrets become "__secret:NAME"
+    // placeholders resolved by batch_service at dispatch time.
+    let env_json = env_value(&manifest.env);
     let comfy_port = manifest.comfyui.port.unwrap_or(8188);
 
     // ---- Phase 1: system.apt ----
@@ -478,15 +507,25 @@ pub fn compute_profile_hash(manifest_json: &str) -> String {
 // Private helpers
 // =============================================================================
 
-/// Build a serde_json Value from the resolved secrets map.
-fn env_value(secrets: &HashMap<String, String>) -> serde_json::Value {
-    match serde_json::to_value(secrets) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(error = %e, "env_value serialization failed, using empty object");
-            serde_json::Value::Object(Default::default())
-        }
+/// Build the `args.env` JSON object for exec-style steps.
+///
+/// Plain values pass through verbatim. Secret references become
+/// `"__secret:NAME"` placeholder strings — the plan never carries
+/// plaintext secret values. `batch_service` resolves these at
+/// dispatch time using the `HashMap<String, String>` produced
+/// separately by [`resolve_secrets`].
+fn env_value(env: &HashMap<String, EnvValue>) -> serde_json::Value {
+    let mut map = serde_json::Map::with_capacity(env.len());
+    for (key, value) in env {
+        let entry = match value {
+            EnvValue::Plain(s) => serde_json::Value::String(s.clone()),
+            EnvValue::Secret(secret_ref) => {
+                serde_json::Value::String(format!("__secret:{}", secret_ref.name))
+            }
+        };
+        map.insert(key.clone(), entry);
     }
+    serde_json::Value::Object(map)
 }
 
 /// Build a standard `exec` step shape.
@@ -865,8 +904,7 @@ mod tests {
     #[test]
     fn expand_phases_minimal_manifest_emits_2_9_10() {
         let m = parse_manifest(&minimal_manifest_json()).expect("parse ok");
-        let plan =
-            expand_phases(&m, "abc", &HashMap::new(), &edges_for_pod("abc"), false).expect("ok");
+        let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), false).expect("ok");
         let ids = leaf_ids(&plan);
 
         assert!(ids.iter().any(|i| i == "2_comfyui_install"));
@@ -887,8 +925,7 @@ mod tests {
     #[test]
     fn expand_phases_full_manifest_emits_all_phases_and_correct_tools() {
         let m = full_manifest();
-        let plan =
-            expand_phases(&m, "abc", &HashMap::new(), &edges_for_pod("abc"), false).expect("ok");
+        let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), false).expect("ok");
 
         // Walk the plan and collect (id, tool) pairs for every leaf.
         let mut pairs: Vec<(String, String)> = Vec::new();
@@ -929,8 +966,7 @@ mod tests {
         // Replace valid pull with one referencing a pod that is not in the topology.
         m.sync.as_mut().unwrap().pull[0].dest = "pod-other".to_string();
 
-        let err =
-            expand_phases(&m, "abc", &HashMap::new(), &edges_for_pod("abc"), false).unwrap_err();
+        let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
         assert!(matches!(err, ProfileError::InvalidManifest(_)));
     }
 
@@ -940,8 +976,7 @@ mod tests {
         // Uppercase rejected by LocationId::new.
         m.sync.as_mut().unwrap().pull[0].src = "CLOUD".to_string();
 
-        let err =
-            expand_phases(&m, "abc", &HashMap::new(), &edges_for_pod("abc"), false).unwrap_err();
+        let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
         assert!(matches!(err, ProfileError::InvalidManifest(_)));
     }
 
@@ -950,18 +985,114 @@ mod tests {
         let mut m = full_manifest();
         m.models[0].src = "http://example.com/x.safetensors".to_string();
 
-        let err =
-            expand_phases(&m, "abc", &HashMap::new(), &edges_for_pod("abc"), false).unwrap_err();
+        let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
         assert!(matches!(err, ProfileError::InvalidManifest(_)));
     }
 
     #[test]
     fn expand_phases_forwards_dry_run_flag() {
         let m = parse_manifest(&minimal_manifest_json()).expect("parse ok");
-        let plan =
-            expand_phases(&m, "abc", &HashMap::new(), &edges_for_pod("abc"), true).expect("ok");
+        let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), true).expect("ok");
         assert!(plan.dry_run);
         assert_eq!(plan.mode, PlanMode::Seq);
+    }
+
+    /// Collect all `env` maps carried by exec-style step args.
+    fn collect_env_objects(plan: &BatchPlan) -> Vec<serde_json::Value> {
+        let mut envs: Vec<serde_json::Value> = Vec::new();
+        let collect_step = |s: &BatchStep, envs: &mut Vec<serde_json::Value>| {
+            if let Some(env) = s.args.get("env") {
+                envs.push(env.clone());
+            }
+        };
+        for entry in &plan.steps {
+            match entry {
+                StepEntry::Leaf(s) => collect_step(s, &mut envs),
+                StepEntry::Group(g) => {
+                    for s in &g.steps {
+                        collect_step(s, &mut envs);
+                    }
+                }
+            }
+        }
+        envs
+    }
+
+    #[test]
+    fn expand_phases_emits_secret_placeholders() {
+        let mut m = full_manifest();
+        m.env.insert(
+            "HF_TOKEN".to_string(),
+            EnvValue::Secret(SecretRef {
+                name: "HF_TOKEN".to_string(),
+            }),
+        );
+        m.env.insert(
+            "LOG_LEVEL".to_string(),
+            EnvValue::Plain("debug".to_string()),
+        );
+
+        let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), false).expect("ok");
+
+        // The plan serializes cleanly and contains the placeholder
+        // string — never the secret env var's real value.
+        let serialized = serde_json::to_string(&plan).expect("serialize ok");
+        assert!(
+            serialized.contains("__secret:HF_TOKEN"),
+            "expected placeholder '__secret:HF_TOKEN' in serialized plan: {serialized}"
+        );
+
+        // Every exec-style step's env carries the placeholder for the
+        // secret key and the plain value for the plain key.
+        let envs = collect_env_objects(&plan);
+        assert!(!envs.is_empty(), "expected at least one env object");
+        for env in &envs {
+            assert_eq!(
+                env.get("HF_TOKEN").and_then(|v| v.as_str()),
+                Some("__secret:HF_TOKEN"),
+                "HF_TOKEN must be emitted as placeholder, got: {env}"
+            );
+            assert_eq!(
+                env.get("LOG_LEVEL").and_then(|v| v.as_str()),
+                Some("debug"),
+                "plain env value must pass through verbatim, got: {env}"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_phases_no_secrets_param_needed() {
+        // Build a manifest referencing a secret whose env var is
+        // deliberately NOT set in this process — expand_phases must
+        // still succeed because secret resolution is deferred.
+        let var = "VDSL_MCP_TEST_UNSET_AT_EXPAND_TIME_QQ";
+        // Sanity: the var is unset. We do not touch the env either
+        // way — proving that expand_phases never reads it.
+        assert!(
+            std::env::var(var).is_err(),
+            "test precondition: '{var}' must be unset"
+        );
+
+        let mut m = full_manifest();
+        m.env.insert(
+            "TOKEN".to_string(),
+            EnvValue::Secret(SecretRef {
+                name: var.to_string(),
+            }),
+        );
+
+        let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), false)
+            .expect("expand_phases must not require the secret env var to be set");
+
+        // Placeholder reaches the env object for every exec step.
+        let envs = collect_env_objects(&plan);
+        assert!(!envs.is_empty());
+        for env in &envs {
+            assert_eq!(
+                env.get("TOKEN").and_then(|v| v.as_str()),
+                Some(format!("__secret:{var}").as_str()),
+            );
+        }
     }
 
     // ----- compute_profile_hash -----
