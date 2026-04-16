@@ -295,6 +295,9 @@ pub fn expand_phases(
     // ---- Phase 1: system.apt ----
     if let Some(system) = &manifest.system {
         if !system.apt.is_empty() {
+            for pkg in &system.apt {
+                assert_shell_safe(pkg, "system.apt")?;
+            }
             let pkgs = system.apt.join(" ");
             steps.push(StepEntry::Leaf(exec_step(
                 "1_system_apt",
@@ -309,6 +312,7 @@ pub fn expand_phases(
     }
 
     // ---- Phase 2: ComfyUI install ----
+    assert_shell_safe(&manifest.comfyui.ref_, "comfyui.ref")?;
     steps.push(StepEntry::Leaf(exec_step(
         "2_comfyui_install",
         &comfyui_install_script(&manifest.comfyui.ref_),
@@ -319,6 +323,9 @@ pub fn expand_phases(
     // ---- Phase 3: python.deps ----
     if let Some(python) = &manifest.python {
         if !python.deps.is_empty() {
+            for dep in &python.deps {
+                assert_shell_safe(dep, "python.deps")?;
+            }
             let deps = python.deps.join(" ");
             steps.push(StepEntry::Leaf(exec_step(
                 "3_python_deps",
@@ -333,6 +340,11 @@ pub fn expand_phases(
     if !manifest.custom_nodes.is_empty() {
         let mut node_steps: Vec<BatchStep> = Vec::with_capacity(manifest.custom_nodes.len());
         for (idx, node) in manifest.custom_nodes.iter().enumerate() {
+            assert_shell_safe(&node.name, "custom_nodes[].name")?;
+            assert_shell_safe(&node.repo, "custom_nodes[].repo")?;
+            if let Some(r) = &node.ref_ {
+                assert_shell_safe(r, "custom_nodes[].ref")?;
+            }
             let checkout = match &node.ref_ {
                 Some(r) => format!(" && cd {name} && git checkout {r}", name = node.name),
                 None => String::new(),
@@ -450,8 +462,11 @@ pub fn expand_phases(
     }
 
     // ---- Phase 9: ComfyUI restart (task_run + task_status pair) ----
-    let restart_script =
-        comfyui_restart_script(comfy_port, manifest.comfyui.args.as_deref().unwrap_or(""));
+    let extra_args = manifest.comfyui.args.as_deref().unwrap_or("");
+    if !extra_args.is_empty() {
+        assert_shell_safe(extra_args, "comfyui.args")?;
+    }
+    let restart_script = comfyui_restart_script(comfy_port, extra_args);
     steps.push(StepEntry::Leaf(BatchStep {
         id: "9a_task_run".to_string(),
         tool: "task_run".to_string(),
@@ -501,6 +516,33 @@ pub fn compute_profile_hash(manifest_json: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(manifest_json.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+// =============================================================================
+// Shell-safety validation
+// =============================================================================
+
+/// Characters allowed in manifest fields that are interpolated into shell
+/// scripts. Rejects shell metacharacters to prevent command injection.
+///
+/// Allowed: `[A-Za-z0-9._/@:+-]` — covers package names, git refs, URLs
+/// (after scheme strip), and file paths. Notably excludes `;`, `&`, `|`,
+/// `$`, `` ` ``, `(`, `)`, `\n`, `\r`, `'`, `"`, `\`, `{`, `}`, `<`, `>`.
+fn is_shell_safe(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-._/@:+=~ ".contains(c))
+        && !s.contains("  ")
+}
+
+fn assert_shell_safe(value: &str, field: &str) -> Result<(), ProfileError> {
+    if is_shell_safe(value) {
+        Ok(())
+    } else {
+        Err(ProfileError::InvalidManifest(format!(
+            "field '{field}' contains unsafe characters: {value:?}"
+        )))
+    }
 }
 
 // =============================================================================
@@ -583,9 +625,12 @@ fn build_model_step(
     pod_id: &str,
     env: &serde_json::Value,
 ) -> Result<BatchStep, ProfileError> {
+    assert_shell_safe(&model.subdir, "models[].subdir")?;
+    assert_shell_safe(&model.dst, "models[].dst")?;
     let dst_path = format!("/workspace/ComfyUI/models/{}/{}", model.subdir, model.dst);
 
     if let Some(rest) = model.src.strip_prefix("b2://") {
+        assert_shell_safe(rest, "models[].src (b2 path)")?;
         Ok(BatchStep {
             id: format!("7_model_{idx}"),
             tool: "sync_route".to_string(),
@@ -599,6 +644,7 @@ fn build_model_step(
             validate: None,
         })
     } else if let Some(rest) = model.src.strip_prefix("file://") {
+        assert_shell_safe(rest, "models[].src (file path)")?;
         let script = format!(
             "mkdir -p /workspace/ComfyUI/models/{subdir} && cp {src} {dst}",
             subdir = model.subdir,
@@ -1093,6 +1139,55 @@ mod tests {
                 Some(format!("__secret:{var}").as_str()),
             );
         }
+    }
+
+    // ----- shell safety -----
+
+    #[test]
+    fn shell_safe_accepts_normal_values() {
+        assert!(is_shell_safe("git"));
+        assert!(is_shell_safe("v0.3.10"));
+        assert!(is_shell_safe("https://github.com/user/repo"));
+        assert!(is_shell_safe("numpy==1.24"));
+        assert!(is_shell_safe("checkpoints"));
+        assert!(is_shell_safe("--lowvram"));
+    }
+
+    #[test]
+    fn shell_safe_rejects_injection() {
+        assert!(!is_shell_safe("curl; rm -rf /"));
+        assert!(!is_shell_safe("foo && whoami"));
+        assert!(!is_shell_safe("$(evil)"));
+        assert!(!is_shell_safe("`evil`"));
+        assert!(!is_shell_safe("foo|bar"));
+        assert!(!is_shell_safe("foo\nbar"));
+        assert!(!is_shell_safe("foo'bar"));
+        assert!(!is_shell_safe("foo\"bar"));
+        assert!(!is_shell_safe(""));
+    }
+
+    #[test]
+    fn expand_phases_rejects_unsafe_apt_package() {
+        let mut m = full_manifest();
+        m.system.as_mut().unwrap().apt = vec!["curl; rm -rf /".to_string()];
+        let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
+        assert!(matches!(err, ProfileError::InvalidManifest(_)));
+    }
+
+    #[test]
+    fn expand_phases_rejects_unsafe_custom_node_name() {
+        let mut m = full_manifest();
+        m.custom_nodes[0].name = "foo && whoami".to_string();
+        let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
+        assert!(matches!(err, ProfileError::InvalidManifest(_)));
+    }
+
+    #[test]
+    fn expand_phases_rejects_unsafe_comfyui_args() {
+        let mut m = full_manifest();
+        m.comfyui.args = Some("; rm -rf /".to_string());
+        let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
+        assert!(matches!(err, ProfileError::InvalidManifest(_)));
     }
 
     // ----- compute_profile_hash -----

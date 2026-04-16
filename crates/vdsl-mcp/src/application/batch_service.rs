@@ -180,7 +180,7 @@ async fn dispatch_step_with_server(
             let result = server.sync().await.map_err(|e| e.to_string())?;
             extract_result(result)
         }
-        "sync_route" => {
+        "sync_route" | "sync_route_register" => {
             let req: VdslSyncRouteRequest = serde_json::from_value(step.args.clone())
                 .map_err(|e| format!("bad args for sync_route: {e}"))?;
             let result = server
