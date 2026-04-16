@@ -51,7 +51,7 @@ pub async fn run() -> anyhow::Result<()> {
 // =============================================================================
 
 #[derive(Clone)]
-struct VdslMcpServer {
+pub(crate) struct VdslMcpServer {
     tool_router: ToolRouter<Self>,
     /// Last successfully connected ComfyUI URL (session state).
     /// Set by `vdsl_connect` and `vdsl_pod_setup` on success.
@@ -3060,7 +3060,7 @@ impl VdslMcpServer {
             open_world_hint = true
         )
     )]
-    async fn comfy_api(
+    pub(crate) async fn comfy_api(
         &self,
         Parameters(req): Parameters<VdslComfyApiRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -3102,7 +3102,7 @@ impl VdslMcpServer {
             open_world_hint = true
         )
     )]
-    async fn exec(
+    pub(crate) async fn exec(
         &self,
         Parameters(req): Parameters<VdslExecRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -3151,7 +3151,7 @@ impl VdslMcpServer {
             open_world_hint = true
         )
     )]
-    async fn task_run(
+    pub(crate) async fn task_run(
         &self,
         Parameters(req): Parameters<VdslTaskRunRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -3188,7 +3188,7 @@ impl VdslMcpServer {
             open_world_hint = true
         )
     )]
-    async fn task_status(
+    pub(crate) async fn task_status(
         &self,
         Parameters(req): Parameters<VdslTaskStatusRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -4145,7 +4145,7 @@ impl VdslMcpServer {
             open_world_hint = true
         )
     )]
-    async fn sync(&self) -> Result<CallToolResult, McpError> {
+    pub(crate) async fn sync(&self) -> Result<CallToolResult, McpError> {
         // auto-detect pod BEFORE syncd spawn so pod_id is available for env propagation
         self.ensure_pod_detected().await;
         // probe → syncd 委譲 / 未稼働なら spawn → fallback
@@ -4198,7 +4198,7 @@ impl VdslMcpServer {
             open_world_hint = true
         )
     )]
-    async fn sync_route(
+    pub(crate) async fn sync_route(
         &self,
         Parameters(req): Parameters<VdslSyncRouteRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -4556,7 +4556,7 @@ impl VdslMcpServer {
             open_world_hint = false
         )
     )]
-    async fn sync_poll(
+    pub(crate) async fn sync_poll(
         &self,
         Parameters(req): Parameters<VdslSyncPollRequest>,
     ) -> Result<CallToolResult, McpError> {
