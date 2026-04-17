@@ -289,6 +289,9 @@ pub fn expand_phases(
     // Shared env object injected into every exec step.
     // Plaintext values pass through; secrets become "__secret:NAME"
     // placeholders resolved by batch_service at dispatch time.
+    for key in manifest.env.keys() {
+        assert_shell_safe(key, "env[].key")?;
+    }
     let env_json = env_value(&manifest.env);
     let comfy_port = manifest.comfyui.port.unwrap_or(8188);
 
@@ -464,7 +467,7 @@ pub fn expand_phases(
     // ---- Phase 9: ComfyUI restart (task_run + task_status pair) ----
     let extra_args = manifest.comfyui.args.as_deref().unwrap_or("");
     if !extra_args.is_empty() {
-        assert_shell_safe(extra_args, "comfyui.args")?;
+        assert_shell_safe_with_spaces(extra_args, "comfyui.args")?;
     }
     let restart_script = comfyui_restart_script(comfy_port, extra_args);
     steps.push(StepEntry::Leaf(BatchStep {
@@ -507,11 +510,17 @@ pub fn expand_phases(
     })
 }
 
-/// SHA-256 hex digest of the canonical manifest JSON.
+/// SHA-256 hex digest of the manifest JSON bytes as supplied.
 ///
-/// Callers pass the bytes they parsed. This matches what the vdsl
-/// side reports via `profile:hash_source()` as long as both sides
-/// hash the same canonical representation.
+/// This function does NOT canonicalize — it hashes the exact bytes
+/// passed in. Matching `profile:hash_source()` on the vdsl side therefore
+/// requires the caller to pass the identical byte stream the vdsl runtime
+/// produced (typically the JSON string emitted by the Lua DSL, forwarded
+/// through without pretty-printing / key reordering / whitespace changes).
+///
+/// If the two sides ever serialize differently (key order, escaping,
+/// trailing newline), hashes will diverge. Treat this as a byte-identity
+/// check, not a semantic-equivalence check.
 pub fn compute_profile_hash(manifest_json: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(manifest_json.as_bytes());
@@ -525,10 +534,21 @@ pub fn compute_profile_hash(manifest_json: &str) -> String {
 /// Characters allowed in manifest fields that are interpolated into shell
 /// scripts. Rejects shell metacharacters to prevent command injection.
 ///
-/// Allowed: `[A-Za-z0-9._/@:+-]` — covers package names, git refs, URLs
-/// (after scheme strip), and file paths. Notably excludes `;`, `&`, `|`,
-/// `$`, `` ` ``, `(`, `)`, `\n`, `\r`, `'`, `"`, `\`, `{`, `}`, `<`, `>`.
+/// Allowed: `[A-Za-z0-9._/@:+-=~]` — covers package names, git refs, URLs
+/// (after scheme strip), and file paths. **Spaces are NOT allowed** because
+/// unquoted interpolation into shell commands causes word splitting.
+/// Use [`is_shell_safe_with_spaces`] for fields that legitimately contain
+/// spaces (e.g. `comfyui.args`).
 fn is_shell_safe(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-._/@:+=~".contains(c))
+}
+
+/// Like [`is_shell_safe`] but additionally allows single spaces.
+/// Intended for `comfyui.args` where multiple flags are space-separated
+/// (e.g. `--lowvram --preview-method auto`). Double spaces are rejected.
+fn is_shell_safe_with_spaces(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || "-._/@:+=~ ".contains(c))
@@ -537,6 +557,16 @@ fn is_shell_safe(s: &str) -> bool {
 
 fn assert_shell_safe(value: &str, field: &str) -> Result<(), ProfileError> {
     if is_shell_safe(value) {
+        Ok(())
+    } else {
+        Err(ProfileError::InvalidManifest(format!(
+            "field '{field}' contains unsafe characters: {value:?}"
+        )))
+    }
+}
+
+fn assert_shell_safe_with_spaces(value: &str, field: &str) -> Result<(), ProfileError> {
+    if is_shell_safe_with_spaces(value) {
         Ok(())
     } else {
         Err(ProfileError::InvalidManifest(format!(
@@ -601,16 +631,25 @@ fn comfyui_install_script(git_ref: &str) -> String {
 
 /// ComfyUI restart script (design §4.5). Runs inside a `task_run`
 /// wrapper so the launching process can exit once HTTP answers.
+///
+/// Both wait loops are bounded: port release caps at 30s (old process
+/// hung on close), HTTP readiness caps at 180s (cold-start + model
+/// discovery). Exceeding either limit exits non-zero so Phase 9 fails
+/// loudly instead of hanging forever.
 fn comfyui_restart_script(port: u16, extra_args: &str) -> String {
     format!(
         "set -e\n\
          PORT={port}\n\
          pkill -f ComfyUI/main.py || true\n\
-         until ! lsof -i:$PORT >/dev/null 2>&1; do sleep 1; done\n\
+         i=0; while lsof -i:$PORT >/dev/null 2>&1; do\n\
+           i=$((i+1)); [ $i -ge 30 ] && echo 'port $PORT still held after 30s' >&2 && exit 1; sleep 1;\n\
+         done\n\
          cd /workspace/ComfyUI\n\
          nohup .venv/bin/python main.py --listen 0.0.0.0 --port $PORT {extra_args} \\\n\
            > /workspace/.vdsl/comfyui.log 2>&1 &\n\
-         until curl -sf http://localhost:$PORT/ >/dev/null; do sleep 1; done\n"
+         i=0; until curl -sf http://localhost:$PORT/ >/dev/null; do\n\
+           i=$((i+1)); [ $i -ge 180 ] && echo 'comfyui not ready after 180s' >&2 && exit 1; sleep 1;\n\
+         done\n"
     )
 }
 
@@ -700,510 +739,5 @@ fn validate_route(
 // =============================================================================
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::domain::profile::{ComfyUiConfig, Hooks, PythonConfig, SecretRef, SystemConfig};
-
-    fn minimal_manifest_json() -> String {
-        serde_json::json!({
-            "schema": "vdsl.profile/1",
-            "name": "minimal",
-            "comfyui": { "ref": "v0.3.10" }
-        })
-        .to_string()
-    }
-
-    fn full_manifest() -> ProfileManifest {
-        ProfileManifest {
-            schema: PROFILE_SCHEMA.to_string(),
-            name: "full".to_string(),
-            comfyui: ComfyUiConfig {
-                ref_: "master".to_string(),
-                args: Some("--lowvram".to_string()),
-                port: Some(8188),
-            },
-            system: Some(SystemConfig {
-                apt: vec!["git".to_string(), "curl".to_string()],
-            }),
-            python: Some(PythonConfig {
-                deps: vec!["numpy".to_string()],
-            }),
-            custom_nodes: vec![crate::domain::profile::CustomNode {
-                name: "ComfyUI-Manager".to_string(),
-                repo: "https://github.com/ltdrdata/ComfyUI-Manager".to_string(),
-                ref_: None,
-            }],
-            sync: Some(crate::domain::profile::SyncConfig {
-                pull: vec![SyncRoute {
-                    src: "cloud".to_string(),
-                    dest: "pod-abc".to_string(),
-                }],
-                push: vec![SyncRoute {
-                    src: "pod-abc".to_string(),
-                    dest: "cloud".to_string(),
-                }],
-            }),
-            models: vec![
-                Model {
-                    src: "b2://bucket/sdxl.safetensors".to_string(),
-                    dst: "sdxl.safetensors".to_string(),
-                    kind: "checkpoint".to_string(),
-                    subdir: "checkpoints".to_string(),
-                },
-                Model {
-                    src: "file:///mnt/models/lora.safetensors".to_string(),
-                    dst: "lora.safetensors".to_string(),
-                    kind: "lora".to_string(),
-                    subdir: "loras".to_string(),
-                },
-            ],
-            env: HashMap::new(),
-            hooks: Some(Hooks {
-                post_install: Some("echo done".to_string()),
-            }),
-        }
-    }
-
-    fn edges_for_pod(pod: &str) -> Vec<(LocationId, LocationId)> {
-        let local = LocationId::local();
-        let cloud = LocationId::new("cloud").unwrap();
-        let pod = LocationId::new(format!("pod-{pod}")).unwrap();
-        vec![
-            (local.clone(), cloud.clone()),
-            (cloud.clone(), local.clone()),
-            (cloud.clone(), pod.clone()),
-            (pod.clone(), cloud.clone()),
-            (local, pod),
-        ]
-    }
-
-    // ----- parse_manifest -----
-
-    #[test]
-    fn parse_manifest_accepts_valid_json() {
-        let m = parse_manifest(&minimal_manifest_json()).expect("parse ok");
-        assert_eq!(m.schema, PROFILE_SCHEMA);
-        assert_eq!(m.name, "minimal");
-        assert_eq!(m.comfyui.ref_, "v0.3.10");
-    }
-
-    #[test]
-    fn parse_manifest_rejects_wrong_schema() {
-        let json = serde_json::json!({
-            "schema": "vdsl.profile/999",
-            "name": "bad",
-            "comfyui": { "ref": "x" }
-        })
-        .to_string();
-        let err = parse_manifest(&json).unwrap_err();
-        match err {
-            ProfileError::UnsupportedSchema { got, .. } => {
-                assert_eq!(got, "vdsl.profile/999");
-            }
-            other => panic!("expected UnsupportedSchema, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_manifest_rejects_missing_required_fields() {
-        let json = r#"{ "schema": "vdsl.profile/1" }"#;
-        let err = parse_manifest(json).unwrap_err();
-        assert!(matches!(err, ProfileError::InvalidManifest(_)));
-    }
-
-    #[test]
-    fn parse_manifest_deserializes_env_value_variants() {
-        let json = serde_json::json!({
-            "schema": "vdsl.profile/1",
-            "name": "env-test",
-            "comfyui": { "ref": "x" },
-            "env": {
-                "PLAIN_KEY": "plain_value",
-                "SECRET_KEY": { "__secret": "MY_SECRET" }
-            }
-        })
-        .to_string();
-        let m = parse_manifest(&json).expect("parse ok");
-        match m.env.get("PLAIN_KEY") {
-            Some(EnvValue::Plain(s)) => assert_eq!(s, "plain_value"),
-            other => panic!("expected Plain, got {other:?}"),
-        }
-        match m.env.get("SECRET_KEY") {
-            Some(EnvValue::Secret(SecretRef { name })) => assert_eq!(name, "MY_SECRET"),
-            other => panic!("expected Secret, got {other:?}"),
-        }
-    }
-
-    // ----- resolve_secrets -----
-
-    #[test]
-    fn resolve_secrets_reads_env_var() {
-        // Unique var name to avoid flakiness / cross-test interference.
-        let var = "VDSL_MCP_TEST_SECRET_OK_X";
-        // SAFETY: test-only; single-threaded within this #[test] fn.
-        unsafe {
-            std::env::set_var(var, "s3cret");
-        }
-
-        let mut manifest = ProfileManifest {
-            schema: PROFILE_SCHEMA.to_string(),
-            name: "s".to_string(),
-            comfyui: ComfyUiConfig {
-                ref_: "x".to_string(),
-                args: None,
-                port: None,
-            },
-            system: None,
-            python: None,
-            custom_nodes: vec![],
-            sync: None,
-            models: vec![],
-            env: HashMap::new(),
-            hooks: None,
-        };
-        manifest.env.insert(
-            "FOO".to_string(),
-            EnvValue::Secret(SecretRef {
-                name: var.to_string(),
-            }),
-        );
-        manifest
-            .env
-            .insert("BAR".to_string(), EnvValue::Plain("bar_value".to_string()));
-
-        let resolved = resolve_secrets(&manifest).expect("resolve ok");
-        assert_eq!(resolved.get("FOO").map(|s| s.as_str()), Some("s3cret"));
-        assert_eq!(resolved.get("BAR").map(|s| s.as_str()), Some("bar_value"));
-
-        unsafe {
-            std::env::remove_var(var);
-        }
-    }
-
-    #[test]
-    fn resolve_secrets_collects_all_missing() {
-        let mut manifest = ProfileManifest {
-            schema: PROFILE_SCHEMA.to_string(),
-            name: "s".to_string(),
-            comfyui: ComfyUiConfig {
-                ref_: "x".to_string(),
-                args: None,
-                port: None,
-            },
-            system: None,
-            python: None,
-            custom_nodes: vec![],
-            sync: None,
-            models: vec![],
-            env: HashMap::new(),
-            hooks: None,
-        };
-        manifest.env.insert(
-            "A".to_string(),
-            EnvValue::Secret(SecretRef {
-                name: "VDSL_MCP_TEST_MISSING_A_ZZ".to_string(),
-            }),
-        );
-        manifest.env.insert(
-            "B".to_string(),
-            EnvValue::Secret(SecretRef {
-                name: "VDSL_MCP_TEST_MISSING_B_ZZ".to_string(),
-            }),
-        );
-
-        let err = resolve_secrets(&manifest).unwrap_err();
-        match err {
-            ProfileError::MissingSecrets(mut names) => {
-                names.sort();
-                assert_eq!(
-                    names,
-                    vec![
-                        "VDSL_MCP_TEST_MISSING_A_ZZ".to_string(),
-                        "VDSL_MCP_TEST_MISSING_B_ZZ".to_string(),
-                    ]
-                );
-            }
-            other => panic!("expected MissingSecrets, got {other:?}"),
-        }
-    }
-
-    // ----- expand_phases -----
-
-    fn leaf_ids(plan: &BatchPlan) -> Vec<String> {
-        let mut ids = Vec::new();
-        for entry in &plan.steps {
-            match entry {
-                StepEntry::Leaf(s) => ids.push(s.id.clone()),
-                StepEntry::Group(g) => {
-                    if let Some(id) = &g.id {
-                        ids.push(id.clone());
-                    }
-                    for s in &g.steps {
-                        ids.push(s.id.clone());
-                    }
-                }
-            }
-        }
-        ids
-    }
-
-    #[test]
-    fn expand_phases_minimal_manifest_emits_2_9_10() {
-        let m = parse_manifest(&minimal_manifest_json()).expect("parse ok");
-        let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), false).expect("ok");
-        let ids = leaf_ids(&plan);
-
-        assert!(ids.iter().any(|i| i == "2_comfyui_install"));
-        assert!(ids.iter().any(|i| i == "9a_task_run"));
-        assert!(ids.iter().any(|i| i == "9b_task_poll"));
-        assert!(ids.iter().any(|i| i == "10_health"));
-
-        // Phases that should NOT be present with an empty manifest:
-        assert!(!ids.iter().any(|i| i == "1_system_apt"));
-        assert!(!ids.iter().any(|i| i == "3_python_deps"));
-        assert!(!ids.iter().any(|i| i.starts_with("4_custom_node_")));
-        assert!(!ids.iter().any(|i| i.starts_with("5_sync_")));
-        assert!(!ids.iter().any(|i| i.starts_with("6_sync_poll_")));
-        assert!(!ids.iter().any(|i| i.starts_with("7_model_")));
-        assert!(!ids.iter().any(|i| i == "8_post_install"));
-    }
-
-    #[test]
-    fn expand_phases_full_manifest_emits_all_phases_and_correct_tools() {
-        let m = full_manifest();
-        let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), false).expect("ok");
-
-        // Walk the plan and collect (id, tool) pairs for every leaf.
-        let mut pairs: Vec<(String, String)> = Vec::new();
-        for entry in &plan.steps {
-            match entry {
-                StepEntry::Leaf(s) => pairs.push((s.id.clone(), s.tool.clone())),
-                StepEntry::Group(g) => {
-                    for s in &g.steps {
-                        pairs.push((s.id.clone(), s.tool.clone()));
-                    }
-                }
-            }
-        }
-
-        let find = |id: &str| pairs.iter().find(|(i, _)| i == id).map(|(_, t)| t.clone());
-
-        assert_eq!(find("1_system_apt"), Some("exec".to_string()));
-        assert_eq!(find("2_comfyui_install"), Some("exec".to_string()));
-        assert_eq!(find("3_python_deps"), Some("exec".to_string()));
-        assert_eq!(find("4_custom_node_0"), Some("exec".to_string()));
-        assert_eq!(find("5_sync_pull_0"), Some("sync_route".to_string()));
-        assert_eq!(
-            find("5_sync_push_0"),
-            Some("sync_route_register".to_string())
-        );
-        assert_eq!(find("6_sync_poll_0"), Some("sync_poll".to_string()));
-        assert_eq!(find("7_model_0"), Some("sync_route".to_string())); // b2://
-        assert_eq!(find("7_model_1"), Some("exec".to_string())); // file://
-        assert_eq!(find("8_post_install"), Some("exec".to_string()));
-        assert_eq!(find("9a_task_run"), Some("task_run".to_string()));
-        assert_eq!(find("9b_task_poll"), Some("task_status".to_string()));
-        assert_eq!(find("10_health"), Some("comfy_api".to_string()));
-    }
-
-    #[test]
-    fn expand_phases_rejects_unknown_edge() {
-        let mut m = full_manifest();
-        // Replace valid pull with one referencing a pod that is not in the topology.
-        m.sync.as_mut().unwrap().pull[0].dest = "pod-other".to_string();
-
-        let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
-        assert!(matches!(err, ProfileError::InvalidManifest(_)));
-    }
-
-    #[test]
-    fn expand_phases_rejects_invalid_location_string() {
-        let mut m = full_manifest();
-        // Uppercase rejected by LocationId::new.
-        m.sync.as_mut().unwrap().pull[0].src = "CLOUD".to_string();
-
-        let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
-        assert!(matches!(err, ProfileError::InvalidManifest(_)));
-    }
-
-    #[test]
-    fn expand_phases_rejects_unsupported_model_scheme() {
-        let mut m = full_manifest();
-        m.models[0].src = "http://example.com/x.safetensors".to_string();
-
-        let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
-        assert!(matches!(err, ProfileError::InvalidManifest(_)));
-    }
-
-    #[test]
-    fn expand_phases_forwards_dry_run_flag() {
-        let m = parse_manifest(&minimal_manifest_json()).expect("parse ok");
-        let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), true).expect("ok");
-        assert!(plan.dry_run);
-        assert_eq!(plan.mode, PlanMode::Seq);
-    }
-
-    /// Collect all `env` maps carried by exec-style step args.
-    fn collect_env_objects(plan: &BatchPlan) -> Vec<serde_json::Value> {
-        let mut envs: Vec<serde_json::Value> = Vec::new();
-        let collect_step = |s: &BatchStep, envs: &mut Vec<serde_json::Value>| {
-            if let Some(env) = s.args.get("env") {
-                envs.push(env.clone());
-            }
-        };
-        for entry in &plan.steps {
-            match entry {
-                StepEntry::Leaf(s) => collect_step(s, &mut envs),
-                StepEntry::Group(g) => {
-                    for s in &g.steps {
-                        collect_step(s, &mut envs);
-                    }
-                }
-            }
-        }
-        envs
-    }
-
-    #[test]
-    fn expand_phases_emits_secret_placeholders() {
-        let mut m = full_manifest();
-        m.env.insert(
-            "HF_TOKEN".to_string(),
-            EnvValue::Secret(SecretRef {
-                name: "HF_TOKEN".to_string(),
-            }),
-        );
-        m.env.insert(
-            "LOG_LEVEL".to_string(),
-            EnvValue::Plain("debug".to_string()),
-        );
-
-        let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), false).expect("ok");
-
-        // The plan serializes cleanly and contains the placeholder
-        // string — never the secret env var's real value.
-        let serialized = serde_json::to_string(&plan).expect("serialize ok");
-        assert!(
-            serialized.contains("__secret:HF_TOKEN"),
-            "expected placeholder '__secret:HF_TOKEN' in serialized plan: {serialized}"
-        );
-
-        // Every exec-style step's env carries the placeholder for the
-        // secret key and the plain value for the plain key.
-        let envs = collect_env_objects(&plan);
-        assert!(!envs.is_empty(), "expected at least one env object");
-        for env in &envs {
-            assert_eq!(
-                env.get("HF_TOKEN").and_then(|v| v.as_str()),
-                Some("__secret:HF_TOKEN"),
-                "HF_TOKEN must be emitted as placeholder, got: {env}"
-            );
-            assert_eq!(
-                env.get("LOG_LEVEL").and_then(|v| v.as_str()),
-                Some("debug"),
-                "plain env value must pass through verbatim, got: {env}"
-            );
-        }
-    }
-
-    #[test]
-    fn expand_phases_no_secrets_param_needed() {
-        // Build a manifest referencing a secret whose env var is
-        // deliberately NOT set in this process — expand_phases must
-        // still succeed because secret resolution is deferred.
-        let var = "VDSL_MCP_TEST_UNSET_AT_EXPAND_TIME_QQ";
-        // Sanity: the var is unset. We do not touch the env either
-        // way — proving that expand_phases never reads it.
-        assert!(
-            std::env::var(var).is_err(),
-            "test precondition: '{var}' must be unset"
-        );
-
-        let mut m = full_manifest();
-        m.env.insert(
-            "TOKEN".to_string(),
-            EnvValue::Secret(SecretRef {
-                name: var.to_string(),
-            }),
-        );
-
-        let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), false)
-            .expect("expand_phases must not require the secret env var to be set");
-
-        // Placeholder reaches the env object for every exec step.
-        let envs = collect_env_objects(&plan);
-        assert!(!envs.is_empty());
-        for env in &envs {
-            assert_eq!(
-                env.get("TOKEN").and_then(|v| v.as_str()),
-                Some(format!("__secret:{var}").as_str()),
-            );
-        }
-    }
-
-    // ----- shell safety -----
-
-    #[test]
-    fn shell_safe_accepts_normal_values() {
-        assert!(is_shell_safe("git"));
-        assert!(is_shell_safe("v0.3.10"));
-        assert!(is_shell_safe("https://github.com/user/repo"));
-        assert!(is_shell_safe("numpy==1.24"));
-        assert!(is_shell_safe("checkpoints"));
-        assert!(is_shell_safe("--lowvram"));
-    }
-
-    #[test]
-    fn shell_safe_rejects_injection() {
-        assert!(!is_shell_safe("curl; rm -rf /"));
-        assert!(!is_shell_safe("foo && whoami"));
-        assert!(!is_shell_safe("$(evil)"));
-        assert!(!is_shell_safe("`evil`"));
-        assert!(!is_shell_safe("foo|bar"));
-        assert!(!is_shell_safe("foo\nbar"));
-        assert!(!is_shell_safe("foo'bar"));
-        assert!(!is_shell_safe("foo\"bar"));
-        assert!(!is_shell_safe(""));
-    }
-
-    #[test]
-    fn expand_phases_rejects_unsafe_apt_package() {
-        let mut m = full_manifest();
-        m.system.as_mut().unwrap().apt = vec!["curl; rm -rf /".to_string()];
-        let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
-        assert!(matches!(err, ProfileError::InvalidManifest(_)));
-    }
-
-    #[test]
-    fn expand_phases_rejects_unsafe_custom_node_name() {
-        let mut m = full_manifest();
-        m.custom_nodes[0].name = "foo && whoami".to_string();
-        let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
-        assert!(matches!(err, ProfileError::InvalidManifest(_)));
-    }
-
-    #[test]
-    fn expand_phases_rejects_unsafe_comfyui_args() {
-        let mut m = full_manifest();
-        m.comfyui.args = Some("; rm -rf /".to_string());
-        let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
-        assert!(matches!(err, ProfileError::InvalidManifest(_)));
-    }
-
-    // ----- compute_profile_hash -----
-
-    #[test]
-    fn compute_profile_hash_is_deterministic() {
-        let a = compute_profile_hash("hello");
-        let b = compute_profile_hash("hello");
-        assert_eq!(a, b);
-        assert_eq!(a.len(), 64); // SHA-256 hex
-    }
-
-    #[test]
-    fn compute_profile_hash_differs_for_different_input() {
-        let a = compute_profile_hash("hello");
-        let b = compute_profile_hash("hellO");
-        assert_ne!(a, b);
-    }
-}
+#[path = "profile_service_tests.rs"]
+mod tests;

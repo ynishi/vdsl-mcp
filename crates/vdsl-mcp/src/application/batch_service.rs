@@ -19,13 +19,17 @@
 // Subtask-2 lands the engine behind `pub(crate)` but does not yet wire it into
 // the MCP tool router — that happens in subtask-3 (`vdsl_batch_tools` /
 // `vdsl_profile_apply` handlers). Suppress the dead-code warnings until then;
-// subtask-3 will remove this attribute once the handlers import the service.
+// subtask-3 must remove this attribute once the handlers import the service,
+// otherwise genuine dead code will be masked.
+// TODO(subtask-3): remove `#![allow(dead_code)]` after handlers import.
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
+use futures::FutureExt;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -391,11 +395,7 @@ where
 /// Returns the first match's value, trimmed.
 fn extract_field(output: &str, field: &str) -> Option<String> {
     let patterns = if field == "task_id" {
-        vec![
-            format!("{}:", field),
-            "Job ID:".to_string(),
-            "task_id:".to_string(),
-        ]
+        vec!["task_id:".to_string(), "Job ID:".to_string()]
     } else {
         vec![format!("{}:", field)]
     };
@@ -511,11 +511,95 @@ where
     results
 }
 
-/// Dispatch a leaf with one validator-retry attempt.
+/// Resolve placeholders on `step.args` and call `dispatch` exactly once.
+/// Dispatch errors (including pre-dispatch placeholder resolution failure) are
+/// bubbled back as `Err(String)` so callers can render them uniformly.
+async fn dispatch_once<F, Fut>(
+    step: &BatchStep,
+    secrets: &HashMap<String, String>,
+    accumulated: &HashMap<String, String>,
+    dispatch: &F,
+) -> Result<String, String>
+where
+    F: Fn(BatchStep) -> Fut + Send + Sync,
+    Fut: Future<Output = Result<String, String>> + Send,
+{
+    let resolved_args = resolve_placeholders(&step.args, secrets, accumulated)
+        .map_err(|e| format!("placeholder resolution failed: {e}"))?;
+    let mut resolved_step = step.clone();
+    resolved_step.args = resolved_args;
+    dispatch(resolved_step).await
+}
+
+/// Shared post-dispatch policy: apply the validator (if any) and, on validator
+/// failure, re-dispatch once. Used by both seq and dag paths so retry semantics
+/// stay identical.
 ///
-/// If the step has a `validate` block and the first validation fails, the step
-/// is dispatched a second time and re-validated. The retry is capped at 1 —
-/// two attempts total.
+/// Preconditions: `first_output` is the text already returned by a successful
+/// initial dispatch. Dispatch errors are **not** retried — they bypass this
+/// helper entirely (retry is validator-only per spec).
+async fn finalize_with_validator_retry<F, Fut>(
+    step: &BatchStep,
+    first_output: String,
+    secrets: &HashMap<String, String>,
+    accumulated: &HashMap<String, String>,
+    dispatch: &F,
+) -> BatchStepResult
+where
+    F: Fn(BatchStep) -> Fut + Send + Sync,
+    Fut: Future<Output = Result<String, String>> + Send,
+{
+    let id = step.id.clone();
+    let Some(validation) = &step.validate else {
+        return BatchStepResult {
+            id,
+            status: StepStatus::Ok,
+            output: Some(first_output),
+            error: None,
+        };
+    };
+
+    if let Err(verr) = validate_output(&first_output, validation) {
+        tracing::warn!(step_id = %id, reason = %verr, "step validation failed, retrying once");
+        match dispatch_once(step, secrets, accumulated, dispatch).await {
+            Ok(out2) => match validate_output(&out2, validation) {
+                Ok(()) => BatchStepResult {
+                    id,
+                    status: StepStatus::Ok,
+                    output: Some(out2),
+                    error: None,
+                },
+                Err(verr2) => {
+                    tracing::warn!(step_id = %id, reason = %verr2, "step validation failed after retry");
+                    BatchStepResult {
+                        id,
+                        status: StepStatus::Failed,
+                        output: Some(out2),
+                        error: Some(format!("validation failed after retry: {verr2}")),
+                    }
+                }
+            },
+            Err(e) => BatchStepResult {
+                id,
+                status: StepStatus::Failed,
+                output: Some(first_output),
+                error: Some(e),
+            },
+        }
+    } else {
+        BatchStepResult {
+            id,
+            status: StepStatus::Ok,
+            output: Some(first_output),
+            error: None,
+        }
+    }
+}
+
+/// Dispatch a leaf with one validator-retry attempt (seq path).
+///
+/// Thin wrapper around [`dispatch_once`] + [`finalize_with_validator_retry`] so
+/// dag mode uses the same retry policy without code duplication.
 async fn run_leaf_with_validation<F, Fut>(
     step: &BatchStep,
     secrets: &HashMap<String, String>,
@@ -526,73 +610,19 @@ where
     F: Fn(BatchStep) -> Fut + Send + Sync,
     Fut: Future<Output = Result<String, String>> + Send,
 {
-    for attempt in 0..=1_u8 {
-        let resolved_args = match resolve_placeholders(&step.args, secrets, accumulated) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(step_id = %step.id, error = %e, "placeholder resolution failed");
-                return BatchStepResult {
-                    id: step.id.clone(),
-                    status: StepStatus::Failed,
-                    output: None,
-                    error: Some(format!("placeholder resolution failed: {e}")),
-                };
-            }
-        };
-        let mut resolved_step = step.clone();
-        resolved_step.args = resolved_args;
-
-        let dispatch_result = dispatch(resolved_step).await;
-
-        match dispatch_result {
-            Ok(output) => {
-                if let Some(validation) = &step.validate {
-                    if let Err(verr) = validate_output(&output, validation) {
-                        tracing::warn!(
-                            step_id = %step.id,
-                            attempt,
-                            reason = %verr,
-                            "step validation failed"
-                        );
-                        if attempt == 0 {
-                            // Retry once
-                            continue;
-                        } else {
-                            return BatchStepResult {
-                                id: step.id.clone(),
-                                status: StepStatus::Failed,
-                                output: Some(output),
-                                error: Some(format!("validation failed: {verr}")),
-                            };
-                        }
-                    }
-                }
-                return BatchStepResult {
-                    id: step.id.clone(),
-                    status: StepStatus::Ok,
-                    output: Some(output),
-                    error: None,
-                };
-            }
-            Err(err) => {
-                tracing::warn!(step_id = %step.id, attempt, error = %err, "step dispatch failed");
-                // Dispatch errors are terminal — no retry (retry is only for
-                // validator failures per spec).
-                return BatchStepResult {
-                    id: step.id.clone(),
-                    status: StepStatus::Failed,
-                    output: None,
-                    error: Some(err),
-                };
+    match dispatch_once(step, secrets, accumulated, dispatch).await {
+        Ok(output) => {
+            finalize_with_validator_retry(step, output, secrets, accumulated, dispatch).await
+        }
+        Err(err) => {
+            tracing::warn!(step_id = %step.id, error = %err, "step dispatch failed");
+            BatchStepResult {
+                id: step.id.clone(),
+                status: StepStatus::Failed,
+                output: None,
+                error: Some(err),
             }
         }
-    }
-    // Unreachable — the loop either returns or continues exactly twice.
-    BatchStepResult {
-        id: step.id.clone(),
-        status: StepStatus::Failed,
-        output: None,
-        error: Some("internal: retry loop exited unexpectedly".into()),
     }
 }
 
@@ -610,8 +640,15 @@ fn validate_output(output: &str, v: &ValidateBlock) -> Result<(), String> {
             return Err(format!("output size {len} < min_size {min}"));
         }
     }
-    // file_exists: cannot be checked without a pod round-trip; accepted.
-    let _ = &v.file_exists;
+    // file_exists: cannot be checked without a pod round-trip. Warn so plan
+    // authors who declared non-empty entries are not silently lulled into
+    // thinking the files were checked.
+    if !v.file_exists.is_empty() {
+        tracing::warn!(
+            file_exists = ?v.file_exists,
+            "validate.file_exists declared but not verified (no pod round-trip in-process); treated as no-op"
+        );
+    }
     Ok(())
 }
 
@@ -775,7 +812,10 @@ where
             let step_for_validation = step.clone();
             let dispatcher = dispatch.clone();
             in_flight.spawn(async move {
-                let out = dispatcher(resolved_step).await;
+                let out = AssertUnwindSafe(async { dispatcher(resolved_step).await })
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| Err("task panicked".to_string()));
                 (id, out, step_for_validation)
             });
         }
@@ -787,13 +827,12 @@ where
         let joined = match in_flight.join_next().await {
             Some(Ok(v)) => v,
             Some(Err(e)) => {
-                // A spawned task panicked (JoinError). We cannot recover the
-                // node id from the JoinError, so we record a sentinel Failed
-                // result to keep `processed` in sync with `total` and avoid
-                // the false-positive DagCycle error path.
+                // Panics are caught by catch_unwind inside the spawn, so this
+                // branch only fires on cancellation / runtime shutdown. Record
+                // a sentinel to keep `processed` in sync with `total`.
                 panicked_count += 1;
                 let sentinel_id = format!("__panicked_task__{panicked_count}");
-                tracing::warn!(error = %e, sentinel_id = %sentinel_id, "dag task panicked");
+                tracing::warn!(error = %e, sentinel_id = %sentinel_id, "dag task join error");
                 processed += 1;
                 results.insert(
                     sentinel_id.clone(),
@@ -801,7 +840,7 @@ where
                         id: sentinel_id,
                         status: StepStatus::Failed,
                         output: None,
-                        error: Some(format!("task panicked: {e}")),
+                        error: Some(format!("task join error: {e}")),
                     },
                 );
                 continue;
@@ -813,83 +852,9 @@ where
 
         let step_result = match out {
             Ok(output) => {
-                if let Some(validation) = &orig_step.validate {
-                    if let Err(verr) = validate_output(&output, validation) {
-                        tracing::warn!(step_id = %orig_step.id, reason = %verr, "dag step validation failed, retrying");
-                        // DAG mode retry: run once more synchronously here.
-                        let resolved_args = match resolve_placeholders(
-                            &orig_step.args,
-                            secrets,
-                            &accumulated,
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                tracing::warn!(step_id = %orig_step.id, error = %e, "placeholder resolution failed on retry");
-                                mark_descendants_skipped(&id, &adjacency, &mut skipped);
-                                propagate_dag_ready(&id, &adjacency, &mut in_degree, &mut ready);
-                                results.insert(
-                                    id.clone(),
-                                    BatchStepResult {
-                                        id: id.clone(),
-                                        status: StepStatus::Failed,
-                                        output: Some(output),
-                                        error: Some(format!(
-                                            "placeholder resolution failed on retry: {e}"
-                                        )),
-                                    },
-                                );
-                                continue;
-                            }
-                        };
-                        let mut retry_step = orig_step.clone();
-                        retry_step.args = resolved_args;
-                        match dispatch(retry_step).await {
-                            Ok(out2) => {
-                                if let Err(verr2) = validate_output(&out2, validation) {
-                                    tracing::warn!(step_id = %orig_step.id, reason = %verr2, "dag step validation failed after retry");
-                                    BatchStepResult {
-                                        id: id.clone(),
-                                        status: StepStatus::Failed,
-                                        output: Some(out2),
-                                        error: Some(format!(
-                                            "validation failed after retry: {verr2}"
-                                        )),
-                                    }
-                                } else {
-                                    accumulated.insert(id.clone(), out2.clone());
-                                    BatchStepResult {
-                                        id: id.clone(),
-                                        status: StepStatus::Ok,
-                                        output: Some(out2),
-                                        error: None,
-                                    }
-                                }
-                            }
-                            Err(e) => BatchStepResult {
-                                id: id.clone(),
-                                status: StepStatus::Failed,
-                                output: None,
-                                error: Some(e),
-                            },
-                        }
-                    } else {
-                        accumulated.insert(id.clone(), output.clone());
-                        BatchStepResult {
-                            id: id.clone(),
-                            status: StepStatus::Ok,
-                            output: Some(output),
-                            error: None,
-                        }
-                    }
-                } else {
-                    accumulated.insert(id.clone(), output.clone());
-                    BatchStepResult {
-                        id: id.clone(),
-                        status: StepStatus::Ok,
-                        output: Some(output),
-                        error: None,
-                    }
-                }
+                // Shared with seq path — identical validator + retry semantics.
+                finalize_with_validator_retry(&orig_step, output, secrets, &accumulated, &dispatch)
+                    .await
             }
             Err(err) => {
                 tracing::warn!(step_id = %id, error = %err, "dag step dispatch failed");
@@ -902,7 +867,13 @@ where
             }
         };
 
-        if step_result.status == StepStatus::Failed {
+        // Only successful outputs advance the accumulated map (used for
+        // downstream __result: lookups).
+        if step_result.status == StepStatus::Ok {
+            if let Some(ref out) = step_result.output {
+                accumulated.insert(id.clone(), out.clone());
+            }
+        } else {
             mark_descendants_skipped(&id, &adjacency, &mut skipped);
         }
         results.insert(id.clone(), step_result);
@@ -999,321 +970,5 @@ fn collect_entry_ids(entry: &StepEntry) -> Vec<String> {
 // =============================================================================
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    fn leaf(id: &str, tool: &str, args: serde_json::Value) -> BatchStep {
-        BatchStep {
-            id: id.to_string(),
-            tool: tool.to_string(),
-            args,
-            depends_on: vec![],
-            validate: None,
-        }
-    }
-
-    fn leaf_with_deps(id: &str, deps: &[&str]) -> BatchStep {
-        BatchStep {
-            id: id.to_string(),
-            tool: "exec".to_string(),
-            args: json!({"command": "true"}),
-            depends_on: deps.iter().map(|s| s.to_string()).collect(),
-            validate: None,
-        }
-    }
-
-    /// Always-OK dispatcher that records call ids.
-    fn ok_dispatcher(
-        log: Arc<tokio::sync::Mutex<Vec<String>>>,
-    ) -> impl Fn(BatchStep) -> std::pin::Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
-           + Clone
-           + Send
-           + Sync
-           + 'static {
-        move |step: BatchStep| {
-            let log = log.clone();
-            Box::pin(async move {
-                log.lock().await.push(step.id.clone());
-                Ok(format!("ok:{}", step.id))
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn execute_seq_3_steps_all_ok() {
-        let steps = vec![
-            StepEntry::Leaf(leaf("a", "exec", json!({"command": "echo a"}))),
-            StepEntry::Leaf(leaf("b", "exec", json!({"command": "echo b"}))),
-            StepEntry::Leaf(leaf("c", "exec", json!({"command": "echo c"}))),
-        ];
-        let log = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
-        let results = run_seq_generic(steps, &HashMap::new(), ok_dispatcher(log.clone())).await;
-
-        assert_eq!(results.len(), 3);
-        assert!(results.iter().all(|r| r.status == StepStatus::Ok));
-        let seen = log.lock().await.clone();
-        assert_eq!(
-            seen,
-            vec!["a".to_string(), "b".to_string(), "c".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn execute_seq_step2_fails_step3_skipped() {
-        let steps = vec![
-            StepEntry::Leaf(leaf("a", "exec", json!({}))),
-            StepEntry::Leaf(leaf("b", "exec", json!({}))),
-            StepEntry::Leaf(leaf("c", "exec", json!({}))),
-        ];
-        let dispatcher = |step: BatchStep| async move {
-            if step.id == "b" {
-                Err("boom".to_string())
-            } else {
-                Ok(format!("ok:{}", step.id))
-            }
-        };
-        let results = run_seq_generic(steps, &HashMap::new(), dispatcher).await;
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0].status, StepStatus::Ok);
-        assert_eq!(results[1].status, StepStatus::Failed);
-        assert_eq!(results[2].status, StepStatus::Skipped);
-    }
-
-    #[tokio::test]
-    async fn execute_dag_diamond_order() {
-        // A -> B, A -> C, B -> D, C -> D
-        let steps = vec![
-            leaf_with_deps("A", &[]),
-            leaf_with_deps("B", &["A"]),
-            leaf_with_deps("C", &["A"]),
-            leaf_with_deps("D", &["B", "C"]),
-        ];
-        let log = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
-        let dispatcher = ok_dispatcher(log.clone());
-        let results = run_dag_generic(steps, &HashMap::new(), dispatcher)
-            .await
-            .expect("diamond ok");
-        assert_eq!(results.len(), 4);
-        assert!(results.iter().all(|r| r.status == StepStatus::Ok));
-
-        let order = log.lock().await.clone();
-        let pos = |id: &str| order.iter().position(|s| s == id).unwrap();
-        assert!(pos("A") < pos("B"));
-        assert!(pos("A") < pos("C"));
-        assert!(pos("B") < pos("D"));
-        assert!(pos("C") < pos("D"));
-    }
-
-    #[tokio::test]
-    async fn execute_dag_cycle_detected() {
-        // A -> B, B -> A
-        let steps = vec![leaf_with_deps("A", &["B"]), leaf_with_deps("B", &["A"])];
-        let log = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
-        let err = run_dag_generic(steps, &HashMap::new(), ok_dispatcher(log))
-            .await
-            .expect_err("should detect cycle");
-        match err {
-            BatchError::DagCycle(nodes) => {
-                assert!(nodes.contains('A') && nodes.contains('B'));
-            }
-            other => panic!("expected DagCycle, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn execute_group_parallel_2_of_4_ok() {
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let max_seen = Arc::new(AtomicUsize::new(0));
-
-        let in_flight_c = in_flight.clone();
-        let max_seen_c = max_seen.clone();
-        let dispatcher = move |step: BatchStep| {
-            let inflight = in_flight_c.clone();
-            let max_seen = max_seen_c.clone();
-            async move {
-                let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
-                let prev_max = max_seen.load(Ordering::SeqCst);
-                if now > prev_max {
-                    max_seen.store(now, Ordering::SeqCst);
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                inflight.fetch_sub(1, Ordering::SeqCst);
-                Ok(format!("ok:{}", step.id))
-            }
-        };
-
-        let group = GroupBlock {
-            id: Some("g".to_string()),
-            parallel: 2,
-            steps: (0..4)
-                .map(|i| leaf(&format!("s{i}"), "exec", json!({})))
-                .collect(),
-        };
-        let results = run_group_generic(group, &HashMap::new(), &HashMap::new(), dispatcher).await;
-        assert_eq!(results.len(), 4);
-        assert!(results.iter().all(|r| r.status == StepStatus::Ok));
-        let max = max_seen.load(Ordering::SeqCst);
-        assert!(max <= 2, "parallel cap exceeded: observed {max}");
-    }
-
-    #[tokio::test]
-    async fn execute_group_1_fail_group_failed() {
-        let group = GroupBlock {
-            id: None,
-            parallel: 3,
-            steps: vec![
-                leaf("a", "exec", json!({})),
-                leaf("b", "exec", json!({})),
-                leaf("c", "exec", json!({})),
-            ],
-        };
-        let dispatcher = |step: BatchStep| async move {
-            if step.id == "b" {
-                Err("nope".to_string())
-            } else {
-                Ok("ok".to_string())
-            }
-        };
-        let results = run_group_generic(group, &HashMap::new(), &HashMap::new(), dispatcher).await;
-        assert_eq!(results.len(), 3);
-        let failed = results
-            .iter()
-            .filter(|r| r.status == StepStatus::Failed)
-            .count();
-        assert_eq!(failed, 1);
-        // The other two should still have completed as Ok (group runs them in parallel)
-        let ok = results
-            .iter()
-            .filter(|r| r.status == StepStatus::Ok)
-            .count();
-        assert_eq!(ok, 2);
-    }
-
-    #[tokio::test]
-    async fn dry_run_plan_no_execution() {
-        let steps = vec![
-            StepEntry::Leaf(leaf("a", "exec", json!({"command": "echo a"}))),
-            StepEntry::Group(GroupBlock {
-                id: Some("g".to_string()),
-                parallel: 2,
-                steps: vec![
-                    leaf("b", "exec", json!({"command": "echo b"})),
-                    leaf("c", "exec", json!({"command": "echo c"})),
-                ],
-            }),
-        ];
-        let results = dry_run_plan(&steps);
-        assert_eq!(results.len(), 3);
-        assert!(results.iter().all(|r| r.status == StepStatus::Ok));
-        // Arg is emitted verbatim.
-        assert!(results[0].output.as_ref().unwrap().contains("echo a"));
-    }
-
-    #[test]
-    fn resolve_result_placeholder() {
-        let mut accumulated = HashMap::new();
-        accumulated.insert(
-            "apt".to_string(),
-            "Job ID: abc123\nstatus: running".to_string(),
-        );
-        let args = json!({"task_id": "__result:apt.task_id"});
-        let resolved =
-            resolve_placeholders(&args, &HashMap::new(), &accumulated).expect("resolve ok");
-        assert_eq!(resolved["task_id"], "abc123");
-    }
-
-    #[test]
-    fn resolve_secret_placeholder() {
-        let mut secrets = HashMap::new();
-        secrets.insert("HF_TOKEN".to_string(), "hf_xyz".to_string());
-        let args = json!({"command": "curl -H 'Authorization: Bearer __secret:HF_TOKEN' x"});
-        let resolved = resolve_placeholders(&args, &secrets, &HashMap::new()).expect("resolve ok");
-        assert_eq!(
-            resolved["command"],
-            "curl -H 'Authorization: Bearer hf_xyz' x"
-        );
-    }
-
-    #[test]
-    fn resolve_secret_missing_returns_dispatch_error() {
-        let args = json!({"command": "__secret:NOPE"});
-        let err = resolve_placeholders(&args, &HashMap::new(), &HashMap::new()).unwrap_err();
-        assert!(err.contains("unresolved secret: NOPE"), "got: {err}");
-    }
-
-    #[test]
-    fn dry_run_step_contains_args() {
-        let s = leaf("x", "exec", json!({"command": "echo hi"}));
-        let r = dry_run_step(&s);
-        assert_eq!(r.status, StepStatus::Ok);
-        assert!(r.output.unwrap().contains("echo hi"));
-    }
-
-    /// Security: a step's output may contain a literal `__secret:NAME` string.
-    /// When a downstream step references that output via `__result:`, the
-    /// injected text must NOT be expanded by the secret resolver — it must
-    /// remain as the literal string `__secret:FAKE_NAME` in the resolved args.
-    #[test]
-    fn result_injected_secret_placeholder_not_resolved() {
-        // Step "upstream" produced output that contains a literal __secret: tag.
-        let mut accumulated = HashMap::new();
-        accumulated.insert(
-            "upstream".to_string(),
-            "value: __secret:FAKE_NAME\n".to_string(),
-        );
-        // The secret map actually contains FAKE_NAME — if the injected text
-        // were passed through the secret resolver, it would be replaced with
-        // "leaked".
-        let mut secrets = HashMap::new();
-        secrets.insert("FAKE_NAME".to_string(), "leaked".to_string());
-
-        // Downstream step references upstream output via __result:.
-        let args = json!({"command": "__result:upstream.value"});
-        let resolved = resolve_placeholders(&args, &secrets, &accumulated).expect("resolve ok");
-
-        let cmd = resolved["command"].as_str().unwrap();
-        assert!(
-            !cmd.contains("leaked"),
-            "secret was exfiltrated via __result: injection: got {cmd:?}"
-        );
-        assert!(
-            cmd.contains("__secret:FAKE_NAME"),
-            "injected __secret: placeholder should remain literal: got {cmd:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn execute_seq_validator_retry_succeeds_on_second_attempt() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let attempts_c = attempts.clone();
-        let dispatcher = move |_step: BatchStep| {
-            let a = attempts_c.clone();
-            async move {
-                let n = a.fetch_add(1, Ordering::SeqCst) + 1;
-                // First call: short output (fails min_size), second: long output.
-                if n == 1 {
-                    Ok("x".to_string())
-                } else {
-                    Ok("this is a much longer output that should pass".to_string())
-                }
-            }
-        };
-        let step = BatchStep {
-            id: "v".to_string(),
-            tool: "exec".to_string(),
-            args: json!({}),
-            depends_on: vec![],
-            validate: Some(ValidateBlock {
-                file_exists: vec![],
-                min_size: Some(10),
-            }),
-        };
-        let steps = vec![StepEntry::Leaf(step)];
-        let results = run_seq_generic(steps, &HashMap::new(), dispatcher).await;
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].status, StepStatus::Ok);
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-    }
-}
+#[path = "batch_service_tests.rs"]
+mod tests;
