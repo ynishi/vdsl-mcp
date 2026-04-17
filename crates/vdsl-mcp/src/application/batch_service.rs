@@ -16,14 +16,6 @@
 //! The core orchestration logic is generic over the dispatch function so unit
 //! tests can substitute a deterministic closure for real MCP calls.
 
-// Subtask-2 lands the engine behind `pub(crate)` but does not yet wire it into
-// the MCP tool router — that happens in subtask-3 (`vdsl_batch_tools` /
-// `vdsl_profile_apply` handlers). Suppress the dead-code warnings until then;
-// subtask-3 must remove this attribute once the handlers import the service,
-// otherwise genuine dead code will be masked.
-// TODO(subtask-3): remove `#![allow(dead_code)]` after handlers import.
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -154,8 +146,7 @@ async fn dispatch_step_with_server(
 ) -> Result<String, String> {
     match step.tool.as_str() {
         "exec" => {
-            let req: VdslExecRequest = serde_json::from_value(step.args.clone())
-                .map_err(|e| format!("bad args for exec: {e}"))?;
+            let req = build_exec_request(&step.args)?;
             let result = server
                 .exec(Parameters(req))
                 .await
@@ -213,6 +204,110 @@ async fn dispatch_step_with_server(
         }
         other => Err(format!("unknown tool: {other}")),
     }
+}
+
+/// Build a [`VdslExecRequest`] from a step's args, accepting either:
+///
+/// 1. Profile shape: `{pod_id, script, env}` — `env` is an object of
+///    `{KEY: "value" | "__secret:NAME"}`. Each entry is emitted as
+///    `export KEY='value'; ` (single-quote shell-escaped) prefixing the script,
+///    then the combined string becomes `VdslExecRequest::command`. This is how
+///    `profile_service::exec_step` emits args.
+/// 2. Direct shape: `{pod_id, command, timeout?, ssh_key?}` — deserialized
+///    verbatim into [`VdslExecRequest`]. Used by hand-crafted plans through
+///    `vdsl_batch_tools`.
+///
+/// Profile shape is detected by the presence of the `script` key. `env` values
+/// are assumed to have already passed through `resolve_placeholders`, so
+/// `__secret:NAME` tokens have been replaced with real values by the time this
+/// runs — shell-escaping here defends against metacharacters in those values.
+fn build_exec_request(args: &serde_json::Value) -> Result<VdslExecRequest, String> {
+    let map = args
+        .as_object()
+        .ok_or_else(|| "exec args must be a JSON object".to_string())?;
+
+    if map.contains_key("script") {
+        let script = map
+            .get("script")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "exec.script must be a string".to_string())?;
+        let env_prefix = build_env_prefix(map.get("env"))?;
+        let command = if env_prefix.is_empty() {
+            script.to_string()
+        } else {
+            format!("{env_prefix}{script}")
+        };
+        let pod_id = map
+            .get("pod_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let timeout = map.get("timeout").and_then(|v| v.as_u64());
+        let ssh_key = map
+            .get("ssh_key")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        Ok(VdslExecRequest {
+            command,
+            pod_id,
+            ssh_key,
+            timeout,
+        })
+    } else {
+        serde_json::from_value(args.clone()).map_err(|e| format!("bad args for exec: {e}"))
+    }
+}
+
+/// Build the `export K='V'; ...` prefix from a profile env object.
+///
+/// Values are single-quote escaped (`'` inside becomes `'"'"'`) so shell
+/// metacharacters in resolved secret values cannot break out.
+fn build_env_prefix(env: Option<&serde_json::Value>) -> Result<String, String> {
+    let Some(v) = env else {
+        return Ok(String::new());
+    };
+    if v.is_null() {
+        return Ok(String::new());
+    }
+    let map = v
+        .as_object()
+        .ok_or_else(|| "exec.env must be a JSON object".to_string())?;
+    if map.is_empty() {
+        return Ok(String::new());
+    }
+    let mut out = String::new();
+    // Sort keys for deterministic output (important for tests).
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
+    for k in keys {
+        let val = map
+            .get(k)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("exec.env[{k}] must be a string"))?;
+        out.push_str("export ");
+        out.push_str(k);
+        out.push('=');
+        out.push_str(&shell_escape_single_quote(val));
+        out.push_str("; ");
+    }
+    Ok(out)
+}
+
+/// Single-quote wrap `s` for POSIX shell, escaping any embedded single quotes.
+///
+/// The escape sequence `'"'"'` closes the single-quoted region, emits a
+/// literal `'` via a double-quoted region, then reopens single quotes.
+fn shell_escape_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str(r#"'"'"'"#);
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Extract the concatenated text content from a [`CallToolResult`].

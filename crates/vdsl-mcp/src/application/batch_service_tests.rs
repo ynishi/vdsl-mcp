@@ -377,3 +377,82 @@ async fn execute_seq_validator_retry_succeeds_on_second_attempt() {
     assert_eq!(results[0].status, StepStatus::Ok);
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
+
+// ============================================================================
+// build_exec_request (profile-shape → VdslExecRequest)
+// ============================================================================
+
+#[test]
+fn build_exec_request_profile_shape_no_env() {
+    let args = json!({
+        "pod_id": "pod_abc",
+        "script": "set -e\necho hi\n",
+        "env": {}
+    });
+    let req = build_exec_request(&args).expect("must build");
+    assert_eq!(req.pod_id.as_deref(), Some("pod_abc"));
+    assert_eq!(req.command, "set -e\necho hi\n");
+    assert_eq!(req.timeout, None);
+}
+
+#[test]
+fn build_exec_request_profile_shape_env_prefix_is_deterministic() {
+    let args = json!({
+        "pod_id": "pod_abc",
+        "script": "echo $FOO",
+        "env": {
+            "ZED": "last",
+            "ALPHA": "first"
+        }
+    });
+    let req = build_exec_request(&args).expect("must build");
+    // Keys are sorted so prefix ordering is deterministic.
+    assert_eq!(req.command, "export ALPHA='first'; export ZED='last'; echo $FOO");
+}
+
+#[test]
+fn build_exec_request_profile_shape_escapes_single_quotes_and_metachars() {
+    let args = json!({
+        "pod_id": "pod_abc",
+        "script": "echo $X",
+        "env": {
+            "X": "it's a $VAR; rm -rf /"
+        }
+    });
+    let req = build_exec_request(&args).expect("must build");
+    // Single quotes are escaped via '"'"' so the value remains a single argv
+    // and cannot break out of the quoted region.
+    assert_eq!(
+        req.command,
+        r#"export X='it'"'"'s a $VAR; rm -rf /'; echo $X"#
+    );
+}
+
+#[test]
+fn build_exec_request_direct_shape_passes_through() {
+    let args = json!({
+        "pod_id": "pod_abc",
+        "command": "ls /workspace",
+        "timeout": 60
+    });
+    let req = build_exec_request(&args).expect("must build");
+    assert_eq!(req.command, "ls /workspace");
+    assert_eq!(req.timeout, Some(60));
+}
+
+#[test]
+fn build_exec_request_rejects_non_object() {
+    let err = build_exec_request(&json!("not an object")).unwrap_err();
+    assert!(err.contains("must be a JSON object"));
+}
+
+#[test]
+fn build_exec_request_rejects_non_string_env_value() {
+    let args = json!({
+        "pod_id": "p",
+        "script": "echo",
+        "env": { "K": 42 }
+    });
+    let err = build_exec_request(&args).unwrap_err();
+    assert!(err.contains("env[K]"), "got: {err}");
+}

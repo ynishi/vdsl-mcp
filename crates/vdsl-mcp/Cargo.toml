@@ -32,6 +32,7 @@ tempfile = { workspace = true }
 chrono = { workspace = true }
 rusqlite = { workspace = true, optional = true }
 uuid = { workspace = true }
+futures = { workspace = true }
 glob = { workspace = true }
 config = { workspace = true }
 clap = { workspace = true }

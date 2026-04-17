@@ -2564,6 +2564,7 @@ dependencies = [
  "clap",
  "config",
  "dirs",
+ "futures",
  "glob",
  "mlua",
  "mlua-batteries",

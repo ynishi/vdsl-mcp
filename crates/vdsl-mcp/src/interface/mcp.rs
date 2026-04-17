@@ -1714,6 +1714,32 @@ pub struct VdslImageSearchRequest {
     pub ssh_key: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslProfileApplyRequest {
+    /// Profile manifest JSON string (schema tag "vdsl.profile/1").
+    /// Emitted by the vdsl Lua Profile DSL.
+    pub manifest: String,
+
+    /// Target RunPod pod ID (e.g. "pod_abc123def").
+    pub pod_id: String,
+
+    /// Emit the expanded BatchPlan without dispatching steps. Default: false.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslBatchToolsRequest {
+    /// Pre-built BatchPlan JSON (fields: mode ∈ {"seq","dag"}, steps[], dry_run).
+    /// Each step references an MCP tool name without the `vdsl_` prefix.
+    pub plan: serde_json::Value,
+
+    /// Optional map for `__secret:NAME` placeholder substitution.
+    /// Normally empty — vdsl_profile_apply populates this automatically.
+    #[serde(default)]
+    pub secrets: std::collections::HashMap<String, String>,
+}
+
 // =============================================================================
 // Tool implementations
 // =============================================================================
@@ -5170,6 +5196,83 @@ impl VdslMcpServer {
         }
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    // =========================================================================
+    // Profile / Batch orchestration
+    // =========================================================================
+
+    #[tool(
+        name = "vdsl_profile_apply",
+        description = "[profile] Apply a Profile manifest (schema \"vdsl.profile/1\") to a pod. \
+            Parses the manifest, resolves __secret:NAME env refs via std::env::var (fail-fast on missing), \
+            expands to a BatchPlan via the 10-phase layout, and dispatches through BatchService. \
+            Returns BatchResult JSON (plan_id + per-step status/output/error). \
+            Use dry_run=true to emit the compiled plan without dispatching any step.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn profile_apply(
+        &self,
+        Parameters(req): Parameters<VdslProfileApplyRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::application::batch_service::BatchService;
+        use crate::application::profile_service::{expand_phases, parse_manifest, resolve_secrets};
+
+        let manifest = parse_manifest(&req.manifest)
+            .map_err(|e| McpError::invalid_params(format!("profile parse: {e}"), None))?;
+        let secrets = resolve_secrets(&manifest)
+            .map_err(|e| McpError::invalid_params(format!("profile secrets: {e}"), None))?;
+        let sdk = self.resolve_or_init_sdk().await?;
+        let edges = sdk.all_edges();
+        let plan = expand_phases(&manifest, &req.pod_id, &edges, req.dry_run)
+            .map_err(|e| McpError::invalid_params(format!("profile expand: {e}"), None))?;
+
+        let svc = BatchService::new(self.clone());
+        let result = svc
+            .execute(plan, secrets)
+            .await
+            .map_err(|e| McpError::internal_error(format!("batch execute: {e}"), None))?;
+
+        let body = serde_json::to_string_pretty(&result)
+            .map_err(|e| McpError::internal_error(format!("serialize result: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
+
+    #[tool(
+        name = "vdsl_batch_tools",
+        description = "[batch] Execute a pre-built BatchPlan against this server. \
+            Accepts mode ∈ {\"seq\",\"dag\"}. __result:step_id.field and __secret:NAME placeholders \
+            are resolved at dispatch time. Normally invoked via vdsl_profile_apply; direct use \
+            is for hand-crafted plans. Returns BatchResult JSON.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn batch_tools(
+        &self,
+        Parameters(req): Parameters<VdslBatchToolsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::application::batch_service::BatchService;
+        use crate::application::profile_service::BatchPlan;
+
+        let plan: BatchPlan = serde_json::from_value(req.plan)
+            .map_err(|e| McpError::invalid_params(format!("plan parse: {e}"), None))?;
+
+        let svc = BatchService::new(self.clone());
+        let result = svc
+            .execute(plan, req.secrets)
+            .await
+            .map_err(|e| McpError::internal_error(format!("batch execute: {e}"), None))?;
+
+        let body = serde_json::to_string_pretty(&result)
+            .map_err(|e| McpError::internal_error(format!("serialize result: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 }
 
