@@ -20,7 +20,8 @@ fn full_manifest() -> ProfileManifest {
         name: "full".to_string(),
         comfyui: ComfyUiConfig {
             ref_: "master".to_string(),
-            args: Some("--lowvram".to_string()),
+            repo: None,
+            args: Some(vec!["--lowvram".to_string()]),
             port: Some(8188),
         },
         system: Some(SystemConfig {
@@ -33,15 +34,16 @@ fn full_manifest() -> ProfileManifest {
             name: "ComfyUI-Manager".to_string(),
             repo: "https://github.com/ltdrdata/ComfyUI-Manager".to_string(),
             ref_: None,
+            pip: None,
         }],
         sync: Some(crate::domain::profile::SyncConfig {
             pull: vec![SyncRoute {
                 src: "cloud".to_string(),
-                dest: "pod-abc".to_string(),
+                dst: "pod-abc".to_string(),
             }],
             push: vec![SyncRoute {
                 src: "pod-abc".to_string(),
-                dest: "cloud".to_string(),
+                dst: "cloud".to_string(),
             }],
         }),
         models: vec![
@@ -151,6 +153,7 @@ fn resolve_secrets_reads_env_var() {
         name: "s".to_string(),
         comfyui: ComfyUiConfig {
             ref_: "x".to_string(),
+            repo: None,
             args: None,
             port: None,
         },
@@ -188,6 +191,7 @@ fn resolve_secrets_collects_all_missing() {
         name: "s".to_string(),
         comfyui: ComfyUiConfig {
             ref_: "x".to_string(),
+            repo: None,
             args: None,
             port: None,
         },
@@ -255,8 +259,7 @@ fn expand_phases_minimal_manifest_emits_2_9_10() {
     let ids = leaf_ids(&plan);
 
     assert!(ids.iter().any(|i| i == "2_comfyui_install"));
-    assert!(ids.iter().any(|i| i == "9a_task_run"));
-    assert!(ids.iter().any(|i| i == "9b_task_poll"));
+    assert!(ids.iter().any(|i| i == "9_comfyui_restart"));
     assert!(ids.iter().any(|i| i == "10_health"));
 
     // Phases that should NOT be present with an empty manifest:
@@ -299,11 +302,10 @@ fn expand_phases_full_manifest_emits_all_phases_and_correct_tools() {
         Some("sync_route_register".to_string())
     );
     assert_eq!(find("6_sync_poll_0"), Some("sync_poll".to_string()));
-    assert_eq!(find("7_model_0"), Some("sync_route".to_string())); // b2://
+    assert_eq!(find("7_model_0"), Some("exec".to_string())); // b2:// → rclone exec
     assert_eq!(find("7_model_1"), Some("exec".to_string())); // file://
     assert_eq!(find("8_post_install"), Some("exec".to_string()));
-    assert_eq!(find("9a_task_run"), Some("task_run".to_string()));
-    assert_eq!(find("9b_task_poll"), Some("task_status".to_string()));
+    assert_eq!(find("9_comfyui_restart"), Some("exec".to_string()));
     assert_eq!(find("10_health"), Some("comfy_api".to_string()));
 }
 
@@ -311,7 +313,7 @@ fn expand_phases_full_manifest_emits_all_phases_and_correct_tools() {
 fn expand_phases_rejects_unknown_edge() {
     let mut m = full_manifest();
     // Replace valid pull with one referencing a pod that is not in the topology.
-    m.sync.as_mut().unwrap().pull[0].dest = "pod-other".to_string();
+    m.sync.as_mut().unwrap().pull[0].dst ="pod-other".to_string();
 
     let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
     assert!(matches!(err, ProfileError::InvalidManifest(_)));
@@ -500,10 +502,73 @@ fn expand_phases_rejects_unsafe_custom_node_name() {
     assert!(matches!(err, ProfileError::InvalidManifest(_)));
 }
 
+/// Helper: find a leaf step's `script` arg by step id.
+fn find_script<'a>(plan: &'a BatchPlan, step_id: &str) -> Option<&'a str> {
+    for entry in &plan.steps {
+        match entry {
+            StepEntry::Leaf(s) if s.id == step_id => {
+                return s.args.get("script").and_then(|v| v.as_str());
+            }
+            StepEntry::Group(g) => {
+                for s in &g.steps {
+                    if s.id == step_id {
+                        return s.args.get("script").and_then(|v| v.as_str());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[test]
+fn custom_node_pip_false_omits_pip_install() {
+    let mut m = full_manifest();
+    m.custom_nodes[0].pip = None;
+    let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), false).expect("ok");
+    let script = find_script(&plan, "4_custom_node_0").expect("step present");
+    assert!(
+        !script.contains("pip install"),
+        "pip=None should NOT emit pip install; got: {script}"
+    );
+}
+
+#[test]
+fn custom_node_pip_true_installs_requirements_with_torch_filter() {
+    let mut m = full_manifest();
+    m.custom_nodes[0].pip = Some(true);
+    let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), false).expect("ok");
+    let script = find_script(&plan, "4_custom_node_0").expect("step present");
+
+    // Must invoke pip install via the ComfyUI venv on a filtered stream.
+    assert!(
+        script.contains("/workspace/ComfyUI/.venv/bin/pip install -r /dev/stdin"),
+        "expected venv pip install from stdin; got: {script}"
+    );
+    // Must reference the node's requirements.txt.
+    assert!(
+        script.contains("custom_nodes/ComfyUI-Manager/requirements.txt"),
+        "expected requirements.txt reference; got: {script}"
+    );
+    // Must guard every torch-family package the pod's driver is pinned to.
+    for pkg in ["torch", "torchvision", "torchaudio", "xformers", "bitsandbytes", "triton"] {
+        assert!(
+            script.contains(pkg),
+            "torch-filter regex missing {pkg}; got: {script}"
+        );
+    }
+    // Must tolerate absent requirements.txt (test -f guard).
+    assert!(
+        script.contains("-f /workspace/ComfyUI/custom_nodes/ComfyUI-Manager/requirements.txt"),
+        "expected test -f guard; got: {script}"
+    );
+}
+
 #[test]
 fn expand_phases_rejects_unsafe_comfyui_args() {
     let mut m = full_manifest();
-    m.comfyui.args = Some("; rm -rf /".to_string());
+    m.comfyui.args = Some(vec!["; rm -rf /".to_string()]);
     let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
     assert!(matches!(err, ProfileError::InvalidManifest(_)));
 }

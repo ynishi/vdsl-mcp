@@ -14,7 +14,7 @@
 //! | 4 | `custom_nodes`     | group (parallel 4)    | `exec`                        |
 //! | 5 | sync routes        | group (parallel 4)    | `sync_route` / `sync_route_register` |
 //! | 6 | `sync.pull` wait   | group (parallel 4)    | `sync_poll`                   |
-//! | 7 | models             | group (parallel 4)    | `sync_route` / `exec` (cp)    |
+//! | 7 | models             | group (parallel 1)    | `exec` (rclone for b2://, cp for file://) |
 //! | 8 | `hooks.post_install` | leaf                | `exec`                        |
 //! | 9 | ComfyUI restart    | leaf pair             | `task_run` + `task_status`    |
 //! |10 | health check       | leaf                  | `comfy_api`                   |
@@ -250,6 +250,30 @@ pub fn resolve_secrets(
         }
     }
 
+    // Auto-inject B2 creds when any model uses b2://. Profiles must NOT
+    // declare these in `env` (that would leak creds into every phase's
+    // shell). Instead we pull them from the MCP process env on demand
+    // and scope them per-model-step via placeholder env (see
+    // `build_model_step`). Keeps the pod dumb: creds only exist during
+    // the rclone call, not in ~/.bashrc or any persistent location.
+    if manifest
+        .models
+        .iter()
+        .any(|m| m.src.starts_with("b2://"))
+    {
+        for name in B2_PULL_SECRET_NAMES {
+            if resolved.contains_key(*name) {
+                continue;
+            }
+            match std::env::var(name) {
+                Ok(v) if !v.is_empty() => {
+                    resolved.insert((*name).to_string(), v);
+                }
+                _ => missing.push((*name).to_string()),
+            }
+        }
+    }
+
     if !missing.is_empty() {
         missing.sort();
         missing.dedup();
@@ -259,6 +283,12 @@ pub fn resolve_secrets(
 
     Ok(resolved)
 }
+
+/// MCP-side env var names that `build_model_step` injects into a
+/// b2:// model step's per-step `env` as `__secret:NAME` placeholders.
+/// `resolve_secrets` pre-populates these in the secrets map so the
+/// apply handler fails fast if any are unset.
+const B2_PULL_SECRET_NAMES: &[&str] = &["VDSL_B2_KEY_ID", "VDSL_B2_KEY"];
 
 /// Expand a manifest into a concrete [`BatchPlan`] targeting `pod_id`.
 ///
@@ -316,9 +346,15 @@ pub fn expand_phases(
 
     // ---- Phase 2: ComfyUI install ----
     assert_shell_safe(&manifest.comfyui.ref_, "comfyui.ref")?;
+    let comfy_repo = manifest
+        .comfyui
+        .repo
+        .as_deref()
+        .unwrap_or("comfyanonymous/ComfyUI");
+    assert_shell_safe(comfy_repo, "comfyui.repo")?;
     steps.push(StepEntry::Leaf(exec_step(
         "2_comfyui_install",
-        &comfyui_install_script(&manifest.comfyui.ref_),
+        &comfyui_install_script(comfy_repo, &manifest.comfyui.ref_),
         pod_id,
         &env_json,
     )));
@@ -352,11 +388,31 @@ pub fn expand_phases(
                 Some(r) => format!(" && cd {name} && git checkout {r}", name = node.name),
                 None => String::new(),
             };
+            let clone_url = expand_repo_url(&node.repo);
+            // pip=true → install requirements.txt into ComfyUI's .venv,
+            // but filter out torch-family lines. Custom-node reqs
+            // routinely pin a torch version that upgrades the wheel
+            // past the pod's CUDA driver (seen with Impact Pack pulling
+            // torch 2.11.0 onto a driver that only supports <=2.5).
+            // The driver-matched torch was installed by Phase 2 via
+            // --system-site-packages, so we honor that pin here.
+            let pip_install = if node.pip.unwrap_or(false) {
+                format!(
+                    " && if [ -f /workspace/ComfyUI/custom_nodes/{name}/requirements.txt ]; then \
+                       grep -viE '^[[:space:]]*(torch|torchvision|torchaudio|xformers|bitsandbytes|triton)([[:space:]=<>~!;]|$)' \
+                         /workspace/ComfyUI/custom_nodes/{name}/requirements.txt \
+                         | /workspace/ComfyUI/.venv/bin/pip install -r /dev/stdin; \
+                     fi",
+                    name = node.name,
+                )
+            } else {
+                String::new()
+            };
             let script = format!(
                 "cd /workspace/ComfyUI/custom_nodes && \
-                 (test -d {name} || git clone {repo} {name}){checkout}",
+                 (test -d {name} || git clone {url} {name}){checkout}{pip_install}",
                 name = node.name,
-                repo = node.repo,
+                url = clone_url,
             );
             node_steps.push(exec_step(
                 &format!("4_custom_node_{idx}"),
@@ -384,7 +440,7 @@ pub fn expand_phases(
                 tool: "sync_route".to_string(),
                 args: serde_json::json!({
                     "src": route.src,
-                    "dest": route.dest,
+                    "dest": route.dst,
                 }),
                 depends_on: Vec::new(),
                 validate: None,
@@ -397,7 +453,7 @@ pub fn expand_phases(
                 tool: "sync_route_register".to_string(),
                 args: serde_json::json!({
                     "src": route.src,
-                    "dest": route.dest,
+                    "dest": route.dst,
                 }),
                 depends_on: Vec::new(),
                 validate: None,
@@ -437,7 +493,13 @@ pub fn expand_phases(
         }
     }
 
-    // ---- Phase 7: models (parallel group) ----
+    // ---- Phase 7: models (serial group) ----
+    // Serialized intentionally: each model is already large (GBs) and
+    // rclone parallelizes within a single transfer (multi-threaded
+    // chunks). Stacking concurrent rclones saturates network/disk and
+    // also multiplies SSH sessions per pod — both hurt more than they
+    // help. Keeping `parallel: 1` gives deterministic ordering and
+    // clearer per-step error reporting when a single model fails.
     if !manifest.models.is_empty() {
         let mut model_steps: Vec<BatchStep> = Vec::with_capacity(manifest.models.len());
         for (idx, model) in manifest.models.iter().enumerate() {
@@ -445,7 +507,7 @@ pub fn expand_phases(
         }
         steps.push(StepEntry::Group(GroupBlock {
             id: Some("7_models".to_string()),
-            parallel: 4,
+            parallel: 1,
             steps: model_steps,
         }));
     }
@@ -464,38 +526,44 @@ pub fn expand_phases(
         }
     }
 
-    // ---- Phase 9: ComfyUI restart (task_run + task_status pair) ----
-    let extra_args = manifest.comfyui.args.as_deref().unwrap_or("");
-    if !extra_args.is_empty() {
-        assert_shell_safe_with_spaces(extra_args, "comfyui.args")?;
+    // ---- Phase 9: ComfyUI restart ----
+    // Single blocking `exec` step. The restart script internally bounds
+    // itself at ~210s (30s port-free wait + 180s curl-ready wait), and
+    // launches the server via `nohup ... &` so the python process survives
+    // the SSH session exit. Using `exec` (not `task_run` + `task_status`)
+    // means Phase 10's health check fires only after the server actually
+    // answers HTTP — no race, no polling primitive needed.
+    //
+    // DSL emits args as an array of tokens; validate each token
+    // individually (no spaces) then shell-join with a single space for
+    // the launch command.
+    let args_vec = manifest
+        .comfyui
+        .args
+        .as_deref()
+        .unwrap_or(&[] as &[String]);
+    for tok in args_vec {
+        assert_shell_safe(tok, "comfyui.args[]")?;
     }
-    let restart_script = comfyui_restart_script(comfy_port, extra_args);
-    steps.push(StepEntry::Leaf(BatchStep {
-        id: "9a_task_run".to_string(),
-        tool: "task_run".to_string(),
-        args: serde_json::json!({
-            "script": restart_script,
-            "pod_id": pod_id,
-            "env": env_json,
-        }),
-        depends_on: Vec::new(),
-        validate: None,
-    }));
-    steps.push(StepEntry::Leaf(BatchStep {
-        id: "9b_task_poll".to_string(),
-        tool: "task_status".to_string(),
-        args: serde_json::json!({
-            "job_id": "__result:9a_task_run.job_id",
-        }),
-        depends_on: vec!["9a_task_run".to_string()],
-        validate: None,
-    }));
+    let extra_args = args_vec.join(" ");
+    let restart_script = comfyui_restart_script(comfy_port, &extra_args);
+    steps.push(StepEntry::Leaf(exec_step(
+        "9_comfyui_restart",
+        &restart_script,
+        pod_id,
+        &env_json,
+    )));
 
     // ---- Phase 10: health check ----
+    // Pass `pod_id` explicitly so comfy_api auto-constructs the RunPod
+    // proxy URL (`https://<pod_id>-8188.proxy.runpod.net`). Without it
+    // the tool falls through to the default "connect first" guard and
+    // fails with -32602.
     steps.push(StepEntry::Leaf(BatchStep {
         id: "10_health".to_string(),
         tool: "comfy_api".to_string(),
         args: serde_json::json!({
+            "pod_id": pod_id,
             "method": "GET",
             "path": "/object_info",
         }),
@@ -548,6 +616,7 @@ fn is_shell_safe(s: &str) -> bool {
 /// Like [`is_shell_safe`] but additionally allows single spaces.
 /// Intended for `comfyui.args` where multiple flags are space-separated
 /// (e.g. `--lowvram --preview-method auto`). Double spaces are rejected.
+#[cfg(test)]
 fn is_shell_safe_with_spaces(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
@@ -565,15 +634,6 @@ fn assert_shell_safe(value: &str, field: &str) -> Result<(), ProfileError> {
     }
 }
 
-fn assert_shell_safe_with_spaces(value: &str, field: &str) -> Result<(), ProfileError> {
-    if is_shell_safe_with_spaces(value) {
-        Ok(())
-    } else {
-        Err(ProfileError::InvalidManifest(format!(
-            "field '{field}' contains unsafe characters: {value:?}"
-        )))
-    }
-}
 
 // =============================================================================
 // Private helpers
@@ -600,8 +660,25 @@ fn env_value(env: &HashMap<String, EnvValue>) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
+/// Default per-step exec timeout (seconds). The underlying
+/// `vdsl_exec` tool defaults to 30s which is too short for install /
+/// pip / apt phases. 30 minutes covers a cold `pip install -r
+/// requirements.txt` pulling torch + native deps on a fresh venv
+/// while still failing loudly on true hangs.
+const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 3600;
+
 /// Build a standard `exec` step shape.
 fn exec_step(id: &str, script: &str, pod_id: &str, env: &serde_json::Value) -> BatchStep {
+    exec_step_with_timeout(id, script, pod_id, env, DEFAULT_EXEC_TIMEOUT_SECS)
+}
+
+fn exec_step_with_timeout(
+    id: &str,
+    script: &str,
+    pod_id: &str,
+    env: &serde_json::Value,
+    timeout_secs: u64,
+) -> BatchStep {
     BatchStep {
         id: id.to_string(),
         tool: "exec".to_string(),
@@ -609,21 +686,43 @@ fn exec_step(id: &str, script: &str, pod_id: &str, env: &serde_json::Value) -> B
             "pod_id": pod_id,
             "script": script,
             "env": env,
+            "timeout": timeout_secs,
         }),
         depends_on: Vec::new(),
         validate: None,
     }
 }
 
+/// Expand a repo reference into a git clone URL.
+///
+/// Accepts `owner/name` slug (GitHub assumed) or a full `https://` /
+/// `git@` URL. Slug form is expanded to `https://github.com/owner/name.git`.
+fn expand_repo_url(repo: &str) -> String {
+    if repo.starts_with("https://") || repo.starts_with("git@") || repo.starts_with("http://") {
+        repo.to_string()
+    } else {
+        format!("https://github.com/{repo}.git")
+    }
+}
+
 /// ComfyUI checkout + venv + requirements install script (phase 2).
-fn comfyui_install_script(git_ref: &str) -> String {
+///
+/// `repo` accepts either a `owner/name` slug or a full `https://` URL.
+/// A slug is expanded to `https://github.com/owner/name.git`.
+fn comfyui_install_script(repo: &str, git_ref: &str) -> String {
+    let url = expand_repo_url(repo);
+    // --system-site-packages: inherit the base image's pre-compiled
+    // torch (driver-matched on RunPod pytorch images). Without this,
+    // `pip install torch` pulls whatever latest wheel exists and
+    // usually requires a newer CUDA driver than the pod provides, so
+    // `torch.cuda.is_available()` silently returns False.
     format!(
         "set -e\n\
          cd /workspace\n\
-         test -d ComfyUI || git clone https://github.com/comfyanonymous/ComfyUI.git\n\
+         test -d ComfyUI || git clone {url}\n\
          cd ComfyUI\n\
          git fetch --all --tags && git checkout {git_ref}\n\
-         test -d .venv || python3 -m venv .venv\n\
+         test -d .venv || python3 -m venv --system-site-packages .venv\n\
          .venv/bin/pip install --upgrade pip\n\
          .venv/bin/pip install -r requirements.txt\n"
     )
@@ -637,15 +736,28 @@ fn comfyui_install_script(git_ref: &str) -> String {
 /// discovery). Exceeding either limit exits non-zero so Phase 9 fails
 /// loudly instead of hanging forever.
 fn comfyui_restart_script(port: u16, extra_args: &str) -> String {
+    // DSL-provided args are authoritative. Only inject default
+    // `--listen 0.0.0.0 --port $PORT` when the manifest gave nothing.
+    let launch_args = if extra_args.trim().is_empty() {
+        "--listen 0.0.0.0 --port $PORT".to_string()
+    } else {
+        extra_args.to_string()
+    };
+    // pgrep pattern matches the restart script's own spawned process:
+    //   `.venv/bin/python main.py --listen ... --port ...`
+    // argv (cwd-relative). The bracket trick `[.]venv` matches the literal
+    // `.venv` path segment while NOT matching this script's own argv
+    // (which contains `[.]venv/bin/python` unescaped in the pattern text).
     format!(
         "set -e\n\
          PORT={port}\n\
-         pkill -f ComfyUI/main.py || true\n\
+         pgrep -f '[.]venv/bin/python main\\.py' | xargs -r kill || true\n\
          i=0; while lsof -i:$PORT >/dev/null 2>&1; do\n\
            i=$((i+1)); [ $i -ge 30 ] && echo 'port $PORT still held after 30s' >&2 && exit 1; sleep 1;\n\
          done\n\
+         mkdir -p /workspace/.vdsl\n\
          cd /workspace/ComfyUI\n\
-         nohup .venv/bin/python main.py --listen 0.0.0.0 --port $PORT {extra_args} \\\n\
+         nohup .venv/bin/python main.py {launch_args} \\\n\
            > /workspace/.vdsl/comfyui.log 2>&1 &\n\
          i=0; until curl -sf http://localhost:$PORT/ >/dev/null; do\n\
            i=$((i+1)); [ $i -ge 180 ] && echo 'comfyui not ready after 180s' >&2 && exit 1; sleep 1;\n\
@@ -655,8 +767,13 @@ fn comfyui_restart_script(port: u16, extra_args: &str) -> String {
 
 /// Build a phase-7 model step.
 ///
-/// - `b2://...` — staged via `sync_route` (same edge vocabulary as
-///   phase 5, but registered separately per model).
+/// - `b2://<bucket>/<path>` — fetched on the pod via `rclone copyto`.
+///   B2 credentials are injected per-step via placeholder env
+///   (`__secret:VDSL_B2_KEY_ID` / `__secret:VDSL_B2_KEY`), resolved by
+///   `batch_service` at dispatch time from the secrets map that
+///   `resolve_secrets` populated from the MCP process env. Creds do
+///   NOT land in any persistent file on the pod — they live only in
+///   the transient rclone process env for the duration of the copy.
 /// - `file://...` — copied on the pod via `exec cp`.
 fn build_model_step(
     idx: usize,
@@ -670,18 +787,46 @@ fn build_model_step(
 
     if let Some(rest) = model.src.strip_prefix("b2://") {
         assert_shell_safe(rest, "models[].src (b2 path)")?;
-        Ok(BatchStep {
-            id: format!("7_model_{idx}"),
-            tool: "sync_route".to_string(),
-            args: serde_json::json!({
-                "src": "cloud",
-                "dest": format!("pod-{pod_id}"),
-                "src_path": rest,
-                "dest_path": dst_path,
-            }),
-            depends_on: Vec::new(),
-            validate: None,
-        })
+        // Split `<bucket>/<path>` — `rclone copyto` needs the fully
+        // qualified `remote:bucket/path` form.
+        let (bucket, object) = rest.split_once('/').ok_or_else(|| {
+            ProfileError::InvalidManifest(format!(
+                "b2:// src must be b2://<bucket>/<path>, got: {}",
+                model.src
+            ))
+        })?;
+        if object.is_empty() {
+            return Err(ProfileError::InvalidManifest(format!(
+                "b2:// src missing object path: {}",
+                model.src
+            )));
+        }
+
+        // Env-based rclone config keeps credentials out of argv
+        // (visible via `ps`). They still live in the rclone process
+        // env for the duration of the copy, readable via
+        // /proc/<pid>/environ by same-uid processes — acceptable for
+        // an ephemeral pod whose only tenant is this apply run.
+        let script = format!(
+            "set -e\n\
+             command -v rclone >/dev/null 2>&1 || curl -sL https://rclone.org/install.sh | bash\n\
+             mkdir -p /workspace/ComfyUI/models/{subdir}\n\
+             export RCLONE_CONFIG_B2_TYPE=b2\n\
+             export RCLONE_CONFIG_B2_ACCOUNT=\"$VDSL_B2_KEY_ID\"\n\
+             export RCLONE_CONFIG_B2_KEY=\"$VDSL_B2_KEY\"\n\
+             rclone copyto --progress b2:{bucket}/{object} {dst}\n",
+            subdir = model.subdir,
+            bucket = bucket,
+            object = object,
+            dst = dst_path,
+        );
+        let step_env = merge_b2_env(env);
+        Ok(exec_step(
+            &format!("7_model_{idx}"),
+            &script,
+            pod_id,
+            &step_env,
+        ))
     } else if let Some(rest) = model.src.strip_prefix("file://") {
         assert_shell_safe(rest, "models[].src (file path)")?;
         let script = format!(
@@ -700,6 +845,24 @@ fn build_model_step(
     }
 }
 
+/// Clone `base_env` (the profile-global env object) and overlay
+/// B2 credential placeholders for a single b2:// model step. The
+/// placeholders are resolved to real values by `batch_service` at
+/// dispatch time from the secrets map populated by `resolve_secrets`.
+fn merge_b2_env(base_env: &serde_json::Value) -> serde_json::Value {
+    let mut map = match base_env {
+        serde_json::Value::Object(m) => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+    for name in B2_PULL_SECRET_NAMES {
+        map.insert(
+            (*name).to_string(),
+            serde_json::Value::String(format!("__secret:{name}")),
+        );
+    }
+    serde_json::Value::Object(map)
+}
+
 /// Validate a single sync route against the SDK's topology.
 fn validate_route(
     route: &SyncRoute,
@@ -709,9 +872,9 @@ fn validate_route(
         tracing::warn!(src = %route.src, error = %e, "sync route src invalid");
         ProfileError::InvalidManifest(format!("invalid route src '{}': {e}", route.src))
     })?;
-    let dest = LocationId::new(route.dest.clone()).map_err(|e| {
-        tracing::warn!(dest = %route.dest, error = %e, "sync route dest invalid");
-        ProfileError::InvalidManifest(format!("invalid route dest '{}': {e}", route.dest))
+    let dest = LocationId::new(route.dst.clone()).map_err(|e| {
+        tracing::warn!(dest = %route.dst, error = %e, "sync route dst invalid");
+        ProfileError::InvalidManifest(format!("invalid route dst '{}': {e}", route.dst))
     })?;
 
     if valid_edges.iter().any(|(s, d)| *s == src && *d == dest) {

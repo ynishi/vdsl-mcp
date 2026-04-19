@@ -151,11 +151,22 @@ async fn dispatch_step_with_server(
                 .exec(Parameters(req))
                 .await
                 .map_err(|e| e.to_string())?;
-            extract_result(result)
+            let text = extract_result(result)?;
+            // vdsl_exec wraps shell output and appends `exit code: N`
+            // when the command exits non-zero. The tool call itself
+            // succeeds (is_error=false) regardless of N, so without
+            // this check Phase-N shell failures silently pass through
+            // as status=ok. Treat any non-zero trailer as a step
+            // failure so downstream phases get skipped.
+            if let Some(code) = parse_exec_exit_code(&text) {
+                if code != 0 {
+                    return Err(format!("shell exit code {code}\n{text}"));
+                }
+            }
+            Ok(text)
         }
         "task_run" => {
-            let req: VdslTaskRunRequest = serde_json::from_value(step.args.clone())
-                .map_err(|e| format!("bad args for task_run: {e}"))?;
+            let req = build_task_run_request(&step.args)?;
             let result = server
                 .task_run(Parameters(req))
                 .await
@@ -257,6 +268,43 @@ fn build_exec_request(args: &serde_json::Value) -> Result<VdslExecRequest, Strin
     }
 }
 
+/// Build a [`VdslTaskRunRequest`] from a step's args, accepting the
+/// profile shape `{pod_id, script, env}` or the direct shape
+/// `{pod_id, command, ssh_key}`. Mirrors [`build_exec_request`].
+fn build_task_run_request(args: &serde_json::Value) -> Result<VdslTaskRunRequest, String> {
+    let map = args
+        .as_object()
+        .ok_or_else(|| "task_run args must be a JSON object".to_string())?;
+
+    if map.contains_key("script") {
+        let script = map
+            .get("script")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "task_run.script must be a string".to_string())?;
+        let env_prefix = build_env_prefix(map.get("env"))?;
+        let command = if env_prefix.is_empty() {
+            script.to_string()
+        } else {
+            format!("{env_prefix}{script}")
+        };
+        let pod_id = map
+            .get("pod_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let ssh_key = map
+            .get("ssh_key")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        Ok(VdslTaskRunRequest {
+            command,
+            pod_id,
+            ssh_key,
+        })
+    } else {
+        serde_json::from_value(args.clone()).map_err(|e| format!("bad args for task_run: {e}"))
+    }
+}
+
 /// Build the `export K='V'; ...` prefix from a profile env object.
 ///
 /// Values are single-quote escaped (`'` inside becomes `'"'"'`) so shell
@@ -314,6 +362,21 @@ fn shell_escape_single_quote(s: &str) -> String {
 ///
 /// Maps `is_error: Some(true)` to `Err`. Non-text content (images, resources)
 /// is discarded — batch steps contract on text output.
+/// Parse the trailing `exit code: N` marker emitted by `vdsl_exec`
+/// when a shell command exits non-zero. Returns `None` if no marker
+/// is present (which the tool treats as success, code=0).
+fn parse_exec_exit_code(text: &str) -> Option<i32> {
+    for line in text.lines().rev().take(5) {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("exit code:") {
+            if let Ok(n) = rest.trim().parse::<i32>() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
 fn extract_result(result: CallToolResult) -> Result<String, String> {
     let is_err = result.is_error.unwrap_or(false);
     let text = result
@@ -489,22 +552,40 @@ where
 ///
 /// Returns the first match's value, trimmed.
 fn extract_field(output: &str, field: &str) -> Option<String> {
-    let patterns = if field == "task_id" {
-        vec!["task_id:".to_string(), "Job ID:".to_string()]
-    } else {
-        vec![format!("{}:", field)]
+    // task_run / task_status output uses "Job ID: <hex>" as the
+    // authoritative marker. Match it first for both `task_id` and
+    // `job_id` so a later hint line like `job_id: "a44..."` (with
+    // stray quote/paren trailer) is never picked over the canonical
+    // marker.
+    let patterns = match field {
+        "task_id" => vec!["Job ID:".to_string(), "task_id:".to_string()],
+        "job_id" => vec!["Job ID:".to_string(), "job_id:".to_string()],
+        _ => vec![format!("{}:", field)],
     };
     for pat in &patterns {
         if let Some(idx) = output.find(pat.as_str()) {
             let after = &output[idx + pat.len()..];
             let line_end = after.find('\n').unwrap_or(after.len());
-            let val = after[..line_end].trim();
+            let val = strip_quote_paren(after[..line_end].trim());
             if !val.is_empty() {
                 return Some(val.to_string());
             }
         }
     }
     None
+}
+
+/// Strip one layer of surrounding quotes and any trailing `)` / `,`
+/// left over from human-readable hint lines like `(job_id: "abc")`.
+fn strip_quote_paren(s: &str) -> String {
+    let mut out = s.trim();
+    while let Some(stripped) = out.strip_suffix(')').or_else(|| out.strip_suffix(',')) {
+        out = stripped.trim();
+    }
+    if out.starts_with('"') && out.ends_with('"') && out.len() >= 2 {
+        out = &out[1..out.len() - 1];
+    }
+    out.to_string()
 }
 
 // =============================================================================

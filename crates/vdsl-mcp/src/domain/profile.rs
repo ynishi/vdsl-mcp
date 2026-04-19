@@ -83,9 +83,16 @@ pub struct ComfyUiConfig {
     #[serde(rename = "ref")]
     pub ref_: String,
 
-    /// Extra argv tacked onto `python main.py ...` at launch.
+    /// Git repo slug (`owner/name`) or full URL. Defaults to
+    /// `comfyanonymous/ComfyUI` server-side.
     #[serde(default)]
-    pub args: Option<String>,
+    pub repo: Option<String>,
+
+    /// Extra argv tacked onto `python main.py ...` at launch. DSL
+    /// emits an array; we keep it as `Vec<String>` and shell-join on
+    /// expansion.
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
 
     /// TCP port the server binds to. Defaults to 8188 server-side.
     #[serde(default)]
@@ -118,6 +125,11 @@ pub struct CustomNode {
     /// Optional ref (branch / tag / SHA). `None` means default branch.
     #[serde(default, rename = "ref")]
     pub ref_: Option<String>,
+
+    /// Run `pip install -r requirements.txt` after clone if true.
+    /// Tolerated for DSL compatibility; expansion not wired yet.
+    #[serde(default)]
+    pub pip: Option<bool>,
 }
 
 /// `sync.pull` / `sync.push` config.
@@ -138,7 +150,10 @@ pub struct SyncConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncRoute {
     pub src: String,
-    pub dest: String,
+    /// Destination. Field name is `dst` on the wire (DSL + docs
+    /// canonical); `dest` accepted as alias for older JSON.
+    #[serde(rename = "dst", alias = "dest")]
+    pub dst: String,
 }
 
 /// One model staging entry.
