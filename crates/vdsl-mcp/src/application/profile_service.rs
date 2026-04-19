@@ -745,14 +745,23 @@ fn comfyui_restart_script(port: u16, extra_args: &str) -> String {
     };
     // pgrep pattern matches the restart script's own spawned process:
     //   `.venv/bin/python main.py --listen ... --port ...`
-    // argv (cwd-relative). The bracket trick `[.]venv` matches the literal
-    // `.venv` path segment while NOT matching this script's own argv
-    // (which contains `[.]venv/bin/python` unescaped in the pattern text).
+    // argv (cwd-relative). The bracket trick `[.]venv` matches the
+    // literal `.venv` path segment, but the script text ALSO contains
+    // `.venv/bin/python main.py` on the nohup launch line — so
+    // `pgrep -f` self-matches the wrapper shell whose cmdline is
+    // `bash -c <script_text>`. We therefore exclude `$$` (this shell)
+    // and `$PPID` (the ssh-level parent) from the kill list.
+    //
+    // Port-free wait uses `ss` (iproute2, ships on the RunPod base
+    // image) instead of `lsof` (not installed — silently short-
+    // circuited the whole loop before this fix).
     format!(
         "set -e\n\
          PORT={port}\n\
-         pgrep -f '[.]venv/bin/python main\\.py' | xargs -r kill || true\n\
-         i=0; while lsof -i:$PORT >/dev/null 2>&1; do\n\
+         pgrep -f '[.]venv/bin/python main\\.py' \\\n\
+           | grep -vx \"$$\" | grep -vx \"$PPID\" \\\n\
+           | xargs -r kill || true\n\
+         i=0; while ss -ltnH \"sport = :$PORT\" | grep -q LISTEN; do\n\
            i=$((i+1)); [ $i -ge 30 ] && echo 'port $PORT still held after 30s' >&2 && exit 1; sleep 1;\n\
          done\n\
          mkdir -p /workspace/.vdsl\n\

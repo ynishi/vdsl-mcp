@@ -566,6 +566,37 @@ fn custom_node_pip_true_installs_requirements_with_torch_filter() {
 }
 
 #[test]
+fn restart_script_uses_ss_and_self_excludes_from_kill() {
+    let m = full_manifest();
+    let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), false).expect("ok");
+    let script = find_script(&plan, "9_comfyui_restart").expect("step present");
+
+    // Port-free wait must use `ss` (iproute2) — `lsof` is not
+    // installed on the RunPod base image and silently short-circuits
+    // the whole loop.
+    assert!(
+        script.contains("ss -ltnH"),
+        "expected ss-based port wait; got: {script}"
+    );
+    assert!(
+        !script.contains("lsof"),
+        "lsof must not appear; got: {script}"
+    );
+
+    // The pkill step must exclude $$ / $PPID so the wrapper shell
+    // (whose cmdline contains the script text, incl. the literal
+    // `.venv/bin/python main.py` launch line) is never targeted.
+    assert!(
+        script.contains("grep -vx \"$$\""),
+        "expected $$ self-exclude; got: {script}"
+    );
+    assert!(
+        script.contains("grep -vx \"$PPID\""),
+        "expected $PPID self-exclude; got: {script}"
+    );
+}
+
+#[test]
 fn expand_phases_rejects_unsafe_comfyui_args() {
     let mut m = full_manifest();
     m.comfyui.args = Some(vec!["; rm -rf /".to_string()]);
