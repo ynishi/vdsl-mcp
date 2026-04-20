@@ -12,8 +12,8 @@
 //! | 2 | ComfyUI install    | leaf                  | `exec`                        |
 //! | 3 | `python.deps`      | leaf                  | `exec`                        |
 //! | 4 | `custom_nodes`     | group (parallel 4)    | `exec`                        |
-//! | 5 | sync routes        | group (parallel 4)    | `sync_route` / `sync_route_register` |
-//! | 6 | `sync.pull` wait   | group (parallel 4)    | `sync_poll`                   |
+//! | 5 | sync routes        | group (parallel 4)    | `exec` (rclone for pull, marker append for push) |
+//! | 6 | (unused)           | —                     | —                             |
 //! | 7 | models             | group (parallel 1)    | `exec` (rclone for b2://, cp for file://) |
 //! | 8 | `hooks.post_install` | leaf                | `exec`                        |
 //! | 9 | ComfyUI restart    | leaf pair             | `task_run` + `task_status`    |
@@ -62,7 +62,6 @@ use crate::domain::profile::{EnvValue, Model, ProfileManifest, SyncRoute, PROFIL
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use vdsl_sync::LocationId;
 
 // =============================================================================
 // Error type
@@ -292,10 +291,13 @@ const B2_PULL_SECRET_NAMES: &[&str] = &["VDSL_B2_KEY_ID", "VDSL_B2_KEY"];
 
 /// Expand a manifest into a concrete [`BatchPlan`] targeting `pod_id`.
 ///
-/// `valid_edges` is the current SDK topology — each
-/// `sync.pull` / `sync.push` route is checked against it. Unknown
-/// edge -> [`ProfileError::InvalidManifest`] (design §2 PrimaryRoute
-/// ONLY).
+/// Sync routes (`sync.pull` / `sync.push`) are self-describing — each
+/// route declares `b2://<bucket>/<path>` on the cloud side and an
+/// absolute pod-local path on the pod side (docs §2.3). Pull routes
+/// run as blocking `rclone` exec steps in Phase 5; push routes are
+/// recorded to `/workspace/.vdsl/push_routes.jsonl` on the pod for
+/// later consumption by generation flows (apply itself does not
+/// trigger uploads). No pre-registered SDK topology is required.
 ///
 /// `dry_run` is forwarded onto the resulting [`BatchPlan`] unchanged.
 ///
@@ -311,7 +313,6 @@ const B2_PULL_SECRET_NAMES: &[&str] = &["VDSL_B2_KEY_ID", "VDSL_B2_KEY"];
 pub fn expand_phases(
     manifest: &ProfileManifest,
     pod_id: &str,
-    valid_edges: &[(LocationId, LocationId)],
     dry_run: bool,
 ) -> Result<BatchPlan, ProfileError> {
     let mut steps: Vec<StepEntry> = Vec::new();
@@ -429,35 +430,19 @@ pub fn expand_phases(
     }
 
     // ---- Phase 5: sync routes (parallel group) ----
-    // Pull -> sync_route (spawns a transfer task); push -> sync_route_register (verify only).
-    // Each (src, dest) pair must appear in `valid_edges` (design §2).
+    // Pull: blocking rclone exec (b2://<bucket>/<path>/ -> /<pod-path>/).
+    // Push: marker-only exec that appends to /workspace/.vdsl/push_routes.jsonl
+    // for later consumption by generation flows. Apply never triggers
+    // uploads.
     let mut route_steps: Vec<BatchStep> = Vec::new();
     if let Some(sync) = &manifest.sync {
         for (idx, route) in sync.pull.iter().enumerate() {
-            validate_route(route, valid_edges)?;
-            route_steps.push(BatchStep {
-                id: format!("5_sync_pull_{idx}"),
-                tool: "sync_route".to_string(),
-                args: serde_json::json!({
-                    "src": route.src,
-                    "dest": route.dst,
-                }),
-                depends_on: Vec::new(),
-                validate: None,
-            });
+            validate_pull_route(route)?;
+            route_steps.push(build_sync_pull_step(idx, route, pod_id, &env_json)?);
         }
         for (idx, route) in sync.push.iter().enumerate() {
-            validate_route(route, valid_edges)?;
-            route_steps.push(BatchStep {
-                id: format!("5_sync_push_{idx}"),
-                tool: "sync_route_register".to_string(),
-                args: serde_json::json!({
-                    "src": route.src,
-                    "dest": route.dst,
-                }),
-                depends_on: Vec::new(),
-                validate: None,
-            });
+            validate_push_route(route)?;
+            route_steps.push(build_sync_push_step(idx, route, pod_id, &env_json)?);
         }
     }
     if !route_steps.is_empty() {
@@ -468,30 +453,9 @@ pub fn expand_phases(
         }));
     }
 
-    // ---- Phase 6: sync.pull wait (parallel group) ----
-    // Each pull route spawned in phase 5 exposes a task_id — resolved
-    // via placeholder `__result:5_sync_pull_{idx}.task_id`.
-    if let Some(sync) = &manifest.sync {
-        if !sync.pull.is_empty() {
-            let mut poll_steps: Vec<BatchStep> = Vec::with_capacity(sync.pull.len());
-            for (idx, _route) in sync.pull.iter().enumerate() {
-                poll_steps.push(BatchStep {
-                    id: format!("6_sync_poll_{idx}"),
-                    tool: "sync_poll".to_string(),
-                    args: serde_json::json!({
-                        "task_id": format!("__result:5_sync_pull_{idx}.task_id"),
-                    }),
-                    depends_on: vec![format!("5_sync_pull_{idx}")],
-                    validate: None,
-                });
-            }
-            steps.push(StepEntry::Group(GroupBlock {
-                id: Some("6_sync_pull_wait".to_string()),
-                parallel: 4,
-                steps: poll_steps,
-            }));
-        }
-    }
+    // Phase 6 is unused after the URL-scheme route redesign:
+    // pulls are blocking rclone execs in Phase 5, so there is no
+    // task_id to poll. Intentionally emit no steps at this index.
 
     // ---- Phase 7: models (serial group) ----
     // Serialized intentionally: each model is already large (GBs) and
@@ -872,38 +836,143 @@ fn merge_b2_env(base_env: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
-/// Validate a single sync route against the SDK's topology.
-fn validate_route(
-    route: &SyncRoute,
-    valid_edges: &[(LocationId, LocationId)],
-) -> Result<(), ProfileError> {
-    let src = LocationId::new(route.src.clone()).map_err(|e| {
-        tracing::warn!(src = %route.src, error = %e, "sync route src invalid");
-        ProfileError::InvalidManifest(format!("invalid route src '{}': {e}", route.src))
+/// Validate a `sync.pull` route — must be `b2://<bucket>/<path>` on
+/// the src (cloud) side and an absolute pod-local path on the dst.
+fn validate_pull_route(route: &SyncRoute) -> Result<(), ProfileError> {
+    let b2_rest = route.src.strip_prefix("b2://").ok_or_else(|| {
+        ProfileError::InvalidManifest(format!(
+            "sync.pull src must be 'b2://<bucket>/<path>', got: {}",
+            route.src
+        ))
     })?;
-    let dest = LocationId::new(route.dst.clone()).map_err(|e| {
-        tracing::warn!(dest = %route.dst, error = %e, "sync route dst invalid");
-        ProfileError::InvalidManifest(format!("invalid route dst '{}': {e}", route.dst))
+    let (bucket, object) = b2_rest.split_once('/').ok_or_else(|| {
+        ProfileError::InvalidManifest(format!(
+            "sync.pull src must be 'b2://<bucket>/<path>', missing bucket or path: {}",
+            route.src
+        ))
     })?;
-
-    if valid_edges.iter().any(|(s, d)| *s == src && *d == dest) {
-        Ok(())
-    } else {
-        let available = valid_edges
-            .iter()
-            .map(|(s, d)| format!("{s}->{d}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        tracing::warn!(
-            src = %src,
-            dest = %dest,
-            available = %available,
-            "sync route not in SDK topology"
-        );
-        Err(ProfileError::InvalidManifest(format!(
-            "unknown route {src}->{dest}; valid edges: [{available}]"
-        )))
+    assert_shell_safe(bucket, "sync.pull src (b2 bucket)")?;
+    assert_shell_safe(object, "sync.pull src (b2 path)")?;
+    if !route.dst.starts_with('/') {
+        return Err(ProfileError::InvalidManifest(format!(
+            "sync.pull dst must be an absolute pod path starting with '/', got: {}",
+            route.dst
+        )));
     }
+    assert_no_path_traversal(&route.dst, "sync.pull dst")?;
+    assert_shell_safe(&route.dst, "sync.pull dst")?;
+    Ok(())
+}
+
+/// Validate a `sync.push` route — must be an absolute pod-local path
+/// on the src side and `b2://<bucket>/<path>` on the dst (cloud) side.
+/// The `{pod_id}` placeholder is allowed in the b2 path and substituted
+/// at step-build time.
+fn validate_push_route(route: &SyncRoute) -> Result<(), ProfileError> {
+    if !route.src.starts_with('/') {
+        return Err(ProfileError::InvalidManifest(format!(
+            "sync.push src must be an absolute pod path starting with '/', got: {}",
+            route.src
+        )));
+    }
+    assert_no_path_traversal(&route.src, "sync.push src")?;
+    assert_shell_safe(&route.src, "sync.push src")?;
+    let b2_rest = route.dst.strip_prefix("b2://").ok_or_else(|| {
+        ProfileError::InvalidManifest(format!(
+            "sync.push dst must be 'b2://<bucket>/<path>', got: {}",
+            route.dst
+        ))
+    })?;
+    let (bucket, object) = b2_rest.split_once('/').ok_or_else(|| {
+        ProfileError::InvalidManifest(format!(
+            "sync.push dst must be 'b2://<bucket>/<path>', missing bucket or path: {}",
+            route.dst
+        ))
+    })?;
+    assert_shell_safe(bucket, "sync.push dst (b2 bucket)")?;
+    // Allow `{pod_id}` placeholder — stripped before shell-safety check.
+    let object_for_check = object.replace("{pod_id}", "");
+    assert_shell_safe(&object_for_check, "sync.push dst (b2 path)")?;
+    Ok(())
+}
+
+fn assert_no_path_traversal(path: &str, field: &str) -> Result<(), ProfileError> {
+    if path.split('/').any(|seg| seg == "..") {
+        return Err(ProfileError::InvalidManifest(format!(
+            "field '{field}' contains '..' path traversal: {path}"
+        )));
+    }
+    Ok(())
+}
+
+/// Build a Phase-5 pull step: blocking `rclone copyto` from the
+/// `b2://<bucket>/<path>` source to the absolute pod destination.
+fn build_sync_pull_step(
+    idx: usize,
+    route: &SyncRoute,
+    pod_id: &str,
+    env: &serde_json::Value,
+) -> Result<BatchStep, ProfileError> {
+    let b2_rest = route.src.strip_prefix("b2://").expect("validated");
+    let (bucket, object) = b2_rest.split_once('/').expect("validated");
+    // rclone copyto with a trailing-slash src copies directory
+    // contents. Strip trailing slash from both so the shell command
+    // reads naturally; mkdir -p on dst already handles the directory.
+    let bucket = bucket.trim_end_matches('/');
+    let object = object.trim_end_matches('/');
+    let dst = route.dst.trim_end_matches('/');
+    let script = format!(
+        "set -e\n\
+         command -v rclone >/dev/null 2>&1 || curl -sL https://rclone.org/install.sh | bash\n\
+         mkdir -p {dst}\n\
+         export RCLONE_CONFIG_B2_TYPE=b2\n\
+         export RCLONE_CONFIG_B2_ACCOUNT=\"$VDSL_B2_KEY_ID\"\n\
+         export RCLONE_CONFIG_B2_KEY=\"$VDSL_B2_KEY\"\n\
+         rclone copyto --progress b2:{bucket}/{object} {dst}\n"
+    );
+    let step_env = merge_b2_env(env);
+    Ok(exec_step(
+        &format!("5_sync_pull_{idx}"),
+        &script,
+        pod_id,
+        &step_env,
+    ))
+}
+
+/// Build a Phase-5 push step: append one JSON line to
+/// `/workspace/.vdsl/push_routes.jsonl` on the pod. Apply itself never
+/// triggers the upload; later generation flows consume this file.
+/// `{pod_id}` placeholders in the dst are substituted at build time.
+fn build_sync_push_step(
+    idx: usize,
+    route: &SyncRoute,
+    pod_id: &str,
+    env: &serde_json::Value,
+) -> Result<BatchStep, ProfileError> {
+    let dst_resolved = route.dst.replace("{pod_id}", pod_id);
+    // Re-check shell safety of the resolved dst — pod_id is assumed
+    // safe (comes from RunPod), but belt-and-suspenders.
+    let b2_rest = dst_resolved
+        .strip_prefix("b2://")
+        .expect("validated by validate_push_route");
+    let (bucket, object) = b2_rest.split_once('/').expect("validated");
+    assert_shell_safe(bucket, "sync.push dst (resolved b2 bucket)")?;
+    assert_shell_safe(object, "sync.push dst (resolved b2 path)")?;
+    let src = &route.src;
+    // Serialize the {src, dst} pair as a single JSON line. jq is not
+    // assumed present; use printf with minimal escaping.
+    let json_line = format!(r#"{{"src":"{src}","dst":"{dst_resolved}"}}"#);
+    let script = format!(
+        "set -e\n\
+         mkdir -p /workspace/.vdsl\n\
+         printf '%s\\n' '{json_line}' >> /workspace/.vdsl/push_routes.jsonl\n"
+    );
+    Ok(exec_step(
+        &format!("5_sync_push_{idx}"),
+        &script,
+        pod_id,
+        env,
+    ))
 }
 
 // =============================================================================

@@ -5226,9 +5226,7 @@ impl VdslMcpServer {
             .map_err(|e| McpError::invalid_params(format!("profile parse: {e}"), None))?;
         let secrets = resolve_secrets(&manifest)
             .map_err(|e| McpError::invalid_params(format!("profile secrets: {e}"), None))?;
-        let sdk = self.resolve_or_init_sdk().await?;
-        let edges = sdk.all_edges();
-        let plan = expand_phases(&manifest, &req.pod_id, &edges, req.dry_run)
+        let plan = expand_phases(&manifest, &req.pod_id, req.dry_run)
             .map_err(|e| McpError::invalid_params(format!("profile expand: {e}"), None))?;
 
         let svc = BatchService::new(self.clone());

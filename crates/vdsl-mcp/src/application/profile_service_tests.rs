@@ -38,12 +38,12 @@ fn full_manifest() -> ProfileManifest {
         }],
         sync: Some(crate::domain::profile::SyncConfig {
             pull: vec![SyncRoute {
-                src: "cloud".to_string(),
-                dst: "pod-abc".to_string(),
+                src: "b2://bucket/models/".to_string(),
+                dst: "/workspace/ComfyUI/models/".to_string(),
             }],
             push: vec![SyncRoute {
-                src: "pod-abc".to_string(),
-                dst: "cloud".to_string(),
+                src: "/workspace/ComfyUI/output/".to_string(),
+                dst: "b2://bucket/output/{pod_id}/".to_string(),
             }],
         }),
         models: vec![
@@ -65,19 +65,6 @@ fn full_manifest() -> ProfileManifest {
             post_install: Some("echo done".to_string()),
         }),
     }
-}
-
-fn edges_for_pod(pod: &str) -> Vec<(LocationId, LocationId)> {
-    let local = LocationId::local();
-    let cloud = LocationId::new("cloud").unwrap();
-    let pod = LocationId::new(format!("pod-{pod}")).unwrap();
-    vec![
-        (local.clone(), cloud.clone()),
-        (cloud.clone(), local.clone()),
-        (cloud.clone(), pod.clone()),
-        (pod.clone(), cloud.clone()),
-        (local, pod),
-    ]
 }
 
 // ----- parse_manifest -----
@@ -255,7 +242,7 @@ fn leaf_ids(plan: &BatchPlan) -> Vec<String> {
 #[test]
 fn expand_phases_minimal_manifest_emits_2_9_10() {
     let m = parse_manifest(&minimal_manifest_json()).expect("parse ok");
-    let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), false).expect("ok");
+    let plan = expand_phases(&m, "abc", false).expect("ok");
     let ids = leaf_ids(&plan);
 
     assert!(ids.iter().any(|i| i == "2_comfyui_install"));
@@ -275,7 +262,7 @@ fn expand_phases_minimal_manifest_emits_2_9_10() {
 #[test]
 fn expand_phases_full_manifest_emits_all_phases_and_correct_tools() {
     let m = full_manifest();
-    let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), false).expect("ok");
+    let plan = expand_phases(&m, "abc", false).expect("ok");
 
     // Walk the plan and collect (id, tool) pairs for every leaf.
     let mut pairs: Vec<(String, String)> = Vec::new();
@@ -296,12 +283,9 @@ fn expand_phases_full_manifest_emits_all_phases_and_correct_tools() {
     assert_eq!(find("2_comfyui_install"), Some("exec".to_string()));
     assert_eq!(find("3_python_deps"), Some("exec".to_string()));
     assert_eq!(find("4_custom_node_0"), Some("exec".to_string()));
-    assert_eq!(find("5_sync_pull_0"), Some("sync_route".to_string()));
-    assert_eq!(
-        find("5_sync_push_0"),
-        Some("sync_route_register".to_string())
-    );
-    assert_eq!(find("6_sync_poll_0"), Some("sync_poll".to_string()));
+    assert_eq!(find("5_sync_pull_0"), Some("exec".to_string())); // rclone copyto
+    assert_eq!(find("5_sync_push_0"), Some("exec".to_string())); // marker append
+    assert_eq!(find("6_sync_poll_0"), None); // Phase 6 unused
     assert_eq!(find("7_model_0"), Some("exec".to_string())); // b2:// → rclone exec
     assert_eq!(find("7_model_1"), Some("exec".to_string())); // file://
     assert_eq!(find("8_post_install"), Some("exec".to_string()));
@@ -310,23 +294,92 @@ fn expand_phases_full_manifest_emits_all_phases_and_correct_tools() {
 }
 
 #[test]
-fn expand_phases_rejects_unknown_edge() {
+fn expand_phases_rejects_pull_with_non_b2_src() {
     let mut m = full_manifest();
-    // Replace valid pull with one referencing a pod that is not in the topology.
-    m.sync.as_mut().unwrap().pull[0].dst ="pod-other".to_string();
-
-    let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
+    m.sync.as_mut().unwrap().pull[0].src = "s3://bucket/x".to_string();
+    let err = expand_phases(&m, "abc", false).unwrap_err();
     assert!(matches!(err, ProfileError::InvalidManifest(_)));
 }
 
 #[test]
-fn expand_phases_rejects_invalid_location_string() {
+fn expand_phases_rejects_pull_with_relative_dst() {
     let mut m = full_manifest();
-    // Uppercase rejected by LocationId::new.
-    m.sync.as_mut().unwrap().pull[0].src = "CLOUD".to_string();
-
-    let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
+    m.sync.as_mut().unwrap().pull[0].dst = "relative/path".to_string();
+    let err = expand_phases(&m, "abc", false).unwrap_err();
     assert!(matches!(err, ProfileError::InvalidManifest(_)));
+}
+
+#[test]
+fn expand_phases_rejects_push_with_non_b2_dst() {
+    let mut m = full_manifest();
+    m.sync.as_mut().unwrap().push[0].dst = "s3://bucket/x".to_string();
+    let err = expand_phases(&m, "abc", false).unwrap_err();
+    assert!(matches!(err, ProfileError::InvalidManifest(_)));
+}
+
+#[test]
+fn expand_phases_rejects_push_with_relative_src() {
+    let mut m = full_manifest();
+    m.sync.as_mut().unwrap().push[0].src = "workspace/output".to_string();
+    let err = expand_phases(&m, "abc", false).unwrap_err();
+    assert!(matches!(err, ProfileError::InvalidManifest(_)));
+}
+
+#[test]
+fn expand_phases_rejects_path_traversal_in_pull_dst() {
+    let mut m = full_manifest();
+    m.sync.as_mut().unwrap().pull[0].dst = "/workspace/../etc".to_string();
+    let err = expand_phases(&m, "abc", false).unwrap_err();
+    assert!(matches!(err, ProfileError::InvalidManifest(_)));
+}
+
+#[test]
+fn phase5_pull_emits_rclone_copyto() {
+    let m = full_manifest();
+    let plan = expand_phases(&m, "abc", false).expect("ok");
+    let script = find_script(&plan, "5_sync_pull_0").expect("pull step present");
+    assert!(
+        script.contains("rclone"),
+        "expected rclone invocation; got: {script}"
+    );
+    assert!(
+        script.contains("b2:bucket/models"),
+        "expected b2 remote 'b2:bucket/models' in pull script; got: {script}"
+    );
+    assert!(
+        script.contains("/workspace/ComfyUI/models"),
+        "expected pod dest in pull script; got: {script}"
+    );
+}
+
+#[test]
+fn phase5_push_emits_marker_append() {
+    let m = full_manifest();
+    let plan = expand_phases(&m, "abc", false).expect("ok");
+    let script = find_script(&plan, "5_sync_push_0").expect("push step present");
+    assert!(
+        script.contains("/workspace/.vdsl/push_routes.jsonl"),
+        "expected marker file append; got: {script}"
+    );
+    assert!(
+        !script.contains("rclone"),
+        "push at apply time must NOT run rclone; got: {script}"
+    );
+}
+
+#[test]
+fn phase5_push_substitutes_pod_id_placeholder() {
+    let m = full_manifest();
+    let plan = expand_phases(&m, "abc", false).expect("ok");
+    let script = find_script(&plan, "5_sync_push_0").expect("push step present");
+    assert!(
+        script.contains("b2://bucket/output/abc/"),
+        "expected {{pod_id}} → 'abc' substitution in push dst; got: {script}"
+    );
+    assert!(
+        !script.contains("{pod_id}"),
+        "placeholder must be substituted; got: {script}"
+    );
 }
 
 #[test]
@@ -334,14 +387,14 @@ fn expand_phases_rejects_unsupported_model_scheme() {
     let mut m = full_manifest();
     m.models[0].src = "http://example.com/x.safetensors".to_string();
 
-    let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
+    let err = expand_phases(&m, "abc", false).unwrap_err();
     assert!(matches!(err, ProfileError::InvalidManifest(_)));
 }
 
 #[test]
 fn expand_phases_forwards_dry_run_flag() {
     let m = parse_manifest(&minimal_manifest_json()).expect("parse ok");
-    let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), true).expect("ok");
+    let plan = expand_phases(&m, "abc", true).expect("ok");
     assert!(plan.dry_run);
     assert_eq!(plan.mode, PlanMode::Seq);
 }
@@ -381,7 +434,7 @@ fn expand_phases_emits_secret_placeholders() {
         EnvValue::Plain("debug".to_string()),
     );
 
-    let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), false).expect("ok");
+    let plan = expand_phases(&m, "abc", false).expect("ok");
 
     // The plan serializes cleanly and contains the placeholder
     // string — never the secret env var's real value.
@@ -430,7 +483,7 @@ fn expand_phases_no_secrets_param_needed() {
         }),
     );
 
-    let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), false)
+    let plan = expand_phases(&m, "abc", false)
         .expect("expand_phases must not require the secret env var to be set");
 
     // Placeholder reaches the env object for every exec step.
@@ -490,7 +543,7 @@ fn shell_safe_rejects_injection() {
 fn expand_phases_rejects_unsafe_apt_package() {
     let mut m = full_manifest();
     m.system.as_mut().unwrap().apt = vec!["curl; rm -rf /".to_string()];
-    let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
+    let err = expand_phases(&m, "abc", false).unwrap_err();
     assert!(matches!(err, ProfileError::InvalidManifest(_)));
 }
 
@@ -498,7 +551,7 @@ fn expand_phases_rejects_unsafe_apt_package() {
 fn expand_phases_rejects_unsafe_custom_node_name() {
     let mut m = full_manifest();
     m.custom_nodes[0].name = "foo && whoami".to_string();
-    let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
+    let err = expand_phases(&m, "abc", false).unwrap_err();
     assert!(matches!(err, ProfileError::InvalidManifest(_)));
 }
 
@@ -526,7 +579,7 @@ fn find_script<'a>(plan: &'a BatchPlan, step_id: &str) -> Option<&'a str> {
 fn custom_node_pip_false_omits_pip_install() {
     let mut m = full_manifest();
     m.custom_nodes[0].pip = None;
-    let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), false).expect("ok");
+    let plan = expand_phases(&m, "abc", false).expect("ok");
     let script = find_script(&plan, "4_custom_node_0").expect("step present");
     assert!(
         !script.contains("pip install"),
@@ -538,7 +591,7 @@ fn custom_node_pip_false_omits_pip_install() {
 fn custom_node_pip_true_installs_requirements_with_torch_filter() {
     let mut m = full_manifest();
     m.custom_nodes[0].pip = Some(true);
-    let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), false).expect("ok");
+    let plan = expand_phases(&m, "abc", false).expect("ok");
     let script = find_script(&plan, "4_custom_node_0").expect("step present");
 
     // Must invoke pip install via the ComfyUI venv on a filtered stream.
@@ -568,7 +621,7 @@ fn custom_node_pip_true_installs_requirements_with_torch_filter() {
 #[test]
 fn restart_script_uses_ss_and_self_excludes_from_kill() {
     let m = full_manifest();
-    let plan = expand_phases(&m, "abc", &edges_for_pod("abc"), false).expect("ok");
+    let plan = expand_phases(&m, "abc", false).expect("ok");
     let script = find_script(&plan, "9_comfyui_restart").expect("step present");
 
     // Port-free wait must use `ss` (iproute2) — `lsof` is not
@@ -600,7 +653,7 @@ fn restart_script_uses_ss_and_self_excludes_from_kill() {
 fn expand_phases_rejects_unsafe_comfyui_args() {
     let mut m = full_manifest();
     m.comfyui.args = Some(vec!["; rm -rf /".to_string()]);
-    let err = expand_phases(&m, "abc", &edges_for_pod("abc"), false).unwrap_err();
+    let err = expand_phases(&m, "abc", false).unwrap_err();
     assert!(matches!(err, ProfileError::InvalidManifest(_)));
 }
 

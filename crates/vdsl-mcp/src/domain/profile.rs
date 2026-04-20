@@ -142,11 +142,14 @@ pub struct SyncConfig {
     pub push: Vec<SyncRoute>,
 }
 
-/// One `(src, dest)` edge reference.
+/// One sync route edge. Schemes depend on the direction:
 ///
-/// `src` / `dest` are `LocationId` string forms: `"local"`, `"cloud"`,
-/// or `"pod-{id}"`. Validated against `sdk.all_edges()` at phase
-/// expansion time (design §2 PrimaryRoute ONLY).
+/// - `sync.pull`: `src = "b2://<bucket>/<path>"`, `dst = "/<pod-path>"`
+/// - `sync.push`: `src = "/<pod-path>"`, `dst = "b2://<bucket>/<path>"`
+///
+/// The `{pod_id}` placeholder is allowed inside a b2 path and is
+/// substituted with the target pod id at phase expansion time (docs
+/// §2.3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncRoute {
     pub src: String,
