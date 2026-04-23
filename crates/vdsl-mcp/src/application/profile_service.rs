@@ -57,6 +57,24 @@
 //! [`StepStatus`], and [`PlanMode`] are the contract with
 //! `batch_service` (Subtask 2). Field renames / removals here
 //! require matching updates there.
+//!
+//! # No DSL-bypass: apply is the only allowed pod-op surface
+//!
+//! Every pod-side file operation that is part of apply / setup /
+//! staging must be expressible in the Profile DSL and emitted as a
+//! [`BatchStep`] by `expand_phases`. Callers (tools, higher-level
+//! orchestration, scripts) must NOT reach past this module to
+//! issue hand-rolled `mv` / `cp` / `ln` / `rclone` / `wget` /
+//! `curl` against the pod via `vdsl_exec` or `vdsl_task_run`.
+//!
+//! When a concrete operation is not expressible here, the fix is
+//! to extend the DSL (Lua `profile.lua` + this module in
+//! lockstep) — not to work around it. See
+//! `docs/profile-and-orchestration.md` §2.5 and the project
+//! `vdsl/.claude/CLAUDE.md` "Profile Evaluation Bypass" section
+//! for the rationale, concrete patterns (staging.push,
+//! non-preset subdirs, new source schemes), and the 2026-04-21
+//! accident record.
 
 use crate::domain::profile::{EnvValue, Model, ProfileManifest, SyncRoute, PROFILE_SCHEMA};
 use serde::{Deserialize, Serialize};
@@ -82,6 +100,13 @@ pub enum ProfileError {
 
     #[error("phase expansion failed: {0}")]
     ExpansionFailed(String),
+
+    /// User profile declared a secret in `manifest.env`. Profiles are
+    /// non-secret runtime config only; credentials are MCP-owned and
+    /// auto-injected during apply. See `docs/profile-and-orchestration.md`
+    /// §2.4 and `vdsl/.claude/CLAUDE.md` "Profile Secret Policy".
+    #[error("secret in user env[{key}]: {reason}")]
+    SecretInUserEnv { key: String, reason: String },
 }
 
 // =============================================================================
@@ -214,7 +239,58 @@ pub fn parse_manifest(input: &str) -> Result<ProfileManifest, ProfileError> {
         });
     }
 
+    validate_user_env(&manifest)?;
+
     Ok(manifest)
+}
+
+/// Substrings (case-insensitive) that mark an env key as secret-shaped.
+/// Must stay in sync with `lua/vdsl/runtime/profile.lua:SECRET_KEY_SUBSTRINGS`.
+const SECRET_KEY_SUBSTRINGS: &[&str] = &[
+    "KEY", "SECRET", "TOKEN", "PASSWORD", "PWD", "AUTH", "CRED", "APIKEY",
+];
+
+/// Reject any user-supplied secret in `manifest.env`. Two shapes are
+/// forbidden and both must be caught here so the MCP layer fails loud
+/// even if a caller bypasses the Lua DSL:
+///
+/// 1. `EnvValue::Secret` — i.e. the user wrote `{"__secret": "NAME"}`
+///    in `env`. The `__secret` sentinel is an MCP-internal emission
+///    format (see `env_value` / `build_model_step`); user manifests
+///    must not contain it.
+/// 2. A key name containing any of [`SECRET_KEY_SUBSTRINGS`] (case-
+///    insensitive). Profile.env is non-secret runtime config only.
+///    Credentials are MCP-owned and auto-injected during apply.
+///
+/// Mirrors `lua/vdsl/runtime/profile.lua:normalize_env` — defence in
+/// depth so the mcp-direct-call path cannot sneak secrets through.
+fn validate_user_env(manifest: &ProfileManifest) -> Result<(), ProfileError> {
+    for (key, value) in &manifest.env {
+        if matches!(value, EnvValue::Secret(_)) {
+            return Err(ProfileError::SecretInUserEnv {
+                key: key.clone(),
+                reason:
+                    "user profiles must not embed `{\"__secret\": ...}` sentinels; \
+                     MCP emits them internally during apply"
+                        .to_string(),
+            });
+        }
+        let upper = key.to_ascii_uppercase();
+        if let Some(hit) = SECRET_KEY_SUBSTRINGS
+            .iter()
+            .find(|s| upper.contains(*s))
+        {
+            return Err(ProfileError::SecretInUserEnv {
+                key: key.clone(),
+                reason: format!(
+                    "key contains secret-shaped substring {hit:?}; \
+                     Profile.env is for non-secret runtime config only, \
+                     credentials are MCP-owned and auto-injected during apply"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Resolve every `{"__secret": "NAME"}` entry in `manifest.env` via
@@ -249,17 +325,35 @@ pub fn resolve_secrets(
         }
     }
 
-    // Auto-inject B2 creds when any model uses b2://. Profiles must NOT
-    // declare these in `env` (that would leak creds into every phase's
-    // shell). Instead we pull them from the MCP process env on demand
-    // and scope them per-model-step via placeholder env (see
-    // `build_model_step`). Keeps the pod dumb: creds only exist during
-    // the rclone call, not in ~/.bashrc or any persistent location.
-    if manifest
+    // Auto-inject B2 creds when any apply step needs them. Profiles must
+    // NOT declare these in `env` (that would leak creds into every
+    // phase's shell). Instead we pull them from the MCP process env on
+    // demand and scope them per-step via placeholder env (see
+    // `build_model_step`, `build_sync_pull_step`, `build_staging_push_step`).
+    // Keeps the pod dumb: creds only exist during the rclone call, not
+    // in ~/.bashrc or any persistent location.
+    //
+    // Trigger conditions (any one is enough):
+    //   - any model with b2:// src           (Phase 7 model pull)
+    //   - any sync.pull route with b2:// src (Phase 5 sync pull)
+    //   - any staging.push route with b2:// dst (Phase 5 staging push)
+    // sync.push is marker-only and does NOT hit rclone, so it does not
+    // trigger B2 auto-inject.
+    let needs_b2 = manifest
         .models
         .iter()
         .any(|m| m.src.starts_with("b2://"))
-    {
+        || manifest
+            .sync
+            .as_ref()
+            .map(|s| s.pull.iter().any(|r| r.src.starts_with("b2://")))
+            .unwrap_or(false)
+        || manifest
+            .staging
+            .as_ref()
+            .map(|s| s.push.iter().any(|r| r.dst.starts_with("b2://")))
+            .unwrap_or(false);
+    if needs_b2 {
         for name in B2_PULL_SECRET_NAMES {
             if resolved.contains_key(*name) {
                 continue;
@@ -429,11 +523,14 @@ pub fn expand_phases(
         }));
     }
 
-    // ---- Phase 5: sync routes (parallel group) ----
-    // Pull: blocking rclone exec (b2://<bucket>/<path>/ -> /<pod-path>/).
-    // Push: marker-only exec that appends to /workspace/.vdsl/push_routes.jsonl
-    // for later consumption by generation flows. Apply never triggers
-    // uploads.
+    // ---- Phase 5: sync routes + staging (parallel group) ----
+    // Pull         : blocking rclone exec (b2://<bucket>/<path>/ -> /<pod-path>/).
+    // sync.push    : marker-only exec that appends to
+    //                /workspace/.vdsl/push_routes.jsonl for later
+    //                generation-flow consumption. Not executed at apply.
+    // staging.push : eager blocking rclone exec (/<pod-path>/ -> b2://).
+    //                One-shot pre-apply staging — fires during apply, not
+    //                during generation.
     let mut route_steps: Vec<BatchStep> = Vec::new();
     if let Some(sync) = &manifest.sync {
         for (idx, route) in sync.pull.iter().enumerate() {
@@ -443,6 +540,12 @@ pub fn expand_phases(
         for (idx, route) in sync.push.iter().enumerate() {
             validate_push_route(route)?;
             route_steps.push(build_sync_push_step(idx, route, pod_id, &env_json)?);
+        }
+    }
+    if let Some(staging) = &manifest.staging {
+        for (idx, route) in staging.push.iter().enumerate() {
+            validate_staging_push_route(route)?;
+            route_steps.push(build_staging_push_step(idx, route, pod_id, &env_json)?);
         }
     }
     if !route_steps.is_empty() {
@@ -707,33 +810,67 @@ fn comfyui_restart_script(port: u16, extra_args: &str) -> String {
     } else {
         extra_args.to_string()
     };
-    // pgrep pattern matches the restart script's own spawned process:
-    //   `.venv/bin/python main.py --listen ... --port ...`
-    // argv (cwd-relative). The bracket trick `[.]venv` matches the
-    // literal `.venv` path segment, but the script text ALSO contains
-    // `.venv/bin/python main.py` on the nohup launch line — so
-    // `pgrep -f` self-matches the wrapper shell whose cmdline is
-    // `bash -c <script_text>`. We therefore exclude `$$` (this shell)
-    // and `$PPID` (the ssh-level parent) from the kill list.
+    // Kill whatever process is actually listening on $PORT, regardless
+    // of whether it was launched via `.venv/bin/python` or the pod
+    // image's system python (e.g. runpod-slim's pre-baked ComfyUI auto-
+    // started at boot). The previous pgrep-on-argv approach missed the
+    // latter entirely and silently left the wrong ComfyUI bound to the
+    // port; apply would still report Phase 9 ok, but generation pointed
+    // at a models-less instance. See the 2026-04-21 accident in the
+    // project CLAUDE.md.
     //
-    // Port-free wait uses `ss` (iproute2, ships on the RunPod base
-    // image) instead of `lsof` (not installed — silently short-
-    // circuited the whole loop before this fix).
+    // ss -ltnpH gives "... users:(("python",pid=185,fd=5),...)"; we
+    // extract the pid tokens. -p requires CAP_NET_ADMIN / root, which
+    // is granted in the RunPod execution context. $$ (this shell) and
+    // $PPID (the ssh-level parent) are excluded so the script cannot
+    // accidentally kill its own ancestors.
     format!(
         "set -e\n\
          PORT={port}\n\
-         pgrep -f '[.]venv/bin/python main\\.py' \\\n\
-           | grep -vx \"$$\" | grep -vx \"$PPID\" \\\n\
-           | xargs -r kill || true\n\
-         i=0; while ss -ltnH \"sport = :$PORT\" | grep -q LISTEN; do\n\
-           i=$((i+1)); [ $i -ge 30 ] && echo 'port $PORT still held after 30s' >&2 && exit 1; sleep 1;\n\
+         # Ensure `ss` (iproute2) is available — some RunPod base images\n\
+         # ship without it, and a missing `ss` silently no-ops the kill\n\
+         # loop (bash `ss: command not found` -> stderr only, the `grep\n\
+         # -q LISTEN` falls through immediately). See 2026-04-21\n\
+         # runpod-slim incident in project CLAUDE.md. Idempotent — apt\n\
+         # is a no-op if the package is already installed.\n\
+         if ! command -v ss >/dev/null 2>&1; then\n\
+           DEBIAN_FRONTEND=noninteractive apt-get update -q >/dev/null 2>&1 || true\n\
+           DEBIAN_FRONTEND=noninteractive apt-get install -y -q iproute2 >/dev/null 2>&1 || true\n\
+         fi\n\
+         listener_pids() {{\n\
+           ss -ltnpH \"sport = :$PORT\" 2>/dev/null \\\n\
+             | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u\n\
+         }}\n\
+         pids=$(listener_pids)\n\
+         for pid in $pids; do\n\
+           [ \"$pid\" = \"$$\" ] && continue\n\
+           [ \"$pid\" = \"$PPID\" ] && continue\n\
+           kill \"$pid\" 2>/dev/null || true\n\
+         done\n\
+         i=0\n\
+         while ss -ltnH \"sport = :$PORT\" | grep -q LISTEN; do\n\
+           i=$((i+1))\n\
+           if [ $i -eq 10 ]; then\n\
+             # 10 s grace; escalate laggards to SIGKILL (pod supervisor\n\
+             # may respawn between SIGTERM and the next loop tick).\n\
+             for pid in $(listener_pids); do\n\
+               [ \"$pid\" = \"$$\" ] && continue\n\
+               [ \"$pid\" = \"$PPID\" ] && continue\n\
+               kill -KILL \"$pid\" 2>/dev/null || true\n\
+             done\n\
+           fi\n\
+           [ $i -ge 30 ] && echo 'port $PORT still held after 30s' >&2 && exit 1\n\
+           sleep 1\n\
          done\n\
          mkdir -p /workspace/.vdsl\n\
          cd /workspace/ComfyUI\n\
          nohup .venv/bin/python main.py {launch_args} \\\n\
            > /workspace/.vdsl/comfyui.log 2>&1 &\n\
-         i=0; until curl -sf http://localhost:$PORT/ >/dev/null; do\n\
-           i=$((i+1)); [ $i -ge 180 ] && echo 'comfyui not ready after 180s' >&2 && exit 1; sleep 1;\n\
+         i=0\n\
+         until curl -sf http://localhost:$PORT/ >/dev/null; do\n\
+           i=$((i+1))\n\
+           [ $i -ge 180 ] && echo 'comfyui not ready after 180s' >&2 && exit 1\n\
+           sleep 1\n\
          done\n"
     )
 }
@@ -972,6 +1109,75 @@ fn build_sync_push_step(
         &script,
         pod_id,
         env,
+    ))
+}
+
+/// Validate a `staging.push` route — absolute pod-local path on
+/// the src side, `b2://<bucket>/<path>` on the dst. Same shape as
+/// `sync.push` but fires eagerly during apply, so the label in
+/// error messages differs. `{pod_id}` is allowed in the b2 path.
+fn validate_staging_push_route(route: &SyncRoute) -> Result<(), ProfileError> {
+    if !route.src.starts_with('/') {
+        return Err(ProfileError::InvalidManifest(format!(
+            "staging.push src must be an absolute pod path starting with '/', got: {}",
+            route.src
+        )));
+    }
+    assert_no_path_traversal(&route.src, "staging.push src")?;
+    assert_shell_safe(&route.src, "staging.push src")?;
+    let b2_rest = route.dst.strip_prefix("b2://").ok_or_else(|| {
+        ProfileError::InvalidManifest(format!(
+            "staging.push dst must be 'b2://<bucket>/<path>', got: {}",
+            route.dst
+        ))
+    })?;
+    let (bucket, object) = b2_rest.split_once('/').ok_or_else(|| {
+        ProfileError::InvalidManifest(format!(
+            "staging.push dst must be 'b2://<bucket>/<path>', missing bucket or path: {}",
+            route.dst
+        ))
+    })?;
+    assert_shell_safe(bucket, "staging.push dst (b2 bucket)")?;
+    let object_for_check = object.replace("{pod_id}", "");
+    assert_shell_safe(&object_for_check, "staging.push dst (b2 path)")?;
+    Ok(())
+}
+
+/// Build a Phase-5 staging push step: eager `rclone copyto` from a
+/// pod-absolute path to B2. Mirror of [`build_sync_pull_step`] with
+/// the direction reversed. Secrets are emitted as `__secret:NAME`
+/// placeholders in the step env; `batch_service` resolves them at
+/// dispatch.
+fn build_staging_push_step(
+    idx: usize,
+    route: &SyncRoute,
+    pod_id: &str,
+    env: &serde_json::Value,
+) -> Result<BatchStep, ProfileError> {
+    let dst_resolved = route.dst.replace("{pod_id}", pod_id);
+    let b2_rest = dst_resolved
+        .strip_prefix("b2://")
+        .expect("validated by validate_staging_push_route");
+    let (bucket, object) = b2_rest.split_once('/').expect("validated");
+    assert_shell_safe(bucket, "staging.push dst (resolved b2 bucket)")?;
+    assert_shell_safe(object, "staging.push dst (resolved b2 path)")?;
+    let src = route.src.trim_end_matches('/');
+    let bucket = bucket.trim_end_matches('/');
+    let object = object.trim_end_matches('/');
+    let script = format!(
+        "set -e\n\
+         command -v rclone >/dev/null 2>&1 || curl -sL https://rclone.org/install.sh | bash\n\
+         export RCLONE_CONFIG_B2_TYPE=b2\n\
+         export RCLONE_CONFIG_B2_ACCOUNT=\"$VDSL_B2_KEY_ID\"\n\
+         export RCLONE_CONFIG_B2_KEY=\"$VDSL_B2_KEY\"\n\
+         rclone copyto --progress {src} b2:{bucket}/{object}\n"
+    );
+    let step_env = merge_b2_env(env);
+    Ok(exec_step(
+        &format!("5_staging_push_{idx}"),
+        &script,
+        pod_id,
+        &step_env,
     ))
 }
 

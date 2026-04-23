@@ -46,6 +46,12 @@ fn full_manifest() -> ProfileManifest {
                 dst: "b2://bucket/output/{pod_id}/".to_string(),
             }],
         }),
+        staging: Some(crate::domain::profile::StagingConfig {
+            push: vec![SyncRoute {
+                src: "/workspace/staging/a.safetensors".to_string(),
+                dst: "b2://bucket/staging/a.safetensors".to_string(),
+            }],
+        }),
         models: vec![
             Model {
                 src: "b2://bucket/sdxl.safetensors".to_string(),
@@ -102,25 +108,77 @@ fn parse_manifest_rejects_missing_required_fields() {
 }
 
 #[test]
-fn parse_manifest_deserializes_env_value_variants() {
+fn parse_manifest_accepts_plain_env_values() {
     let json = serde_json::json!({
         "schema": "vdsl.profile/1",
         "name": "env-test",
         "comfyui": { "ref": "x" },
         "env": {
-            "PLAIN_KEY": "plain_value",
-            "SECRET_KEY": { "__secret": "MY_SECRET" }
+            "DEBUG": "1",
+            "COMFYUI_PORT": "8188"
         }
     })
     .to_string();
     let m = parse_manifest(&json).expect("parse ok");
-    match m.env.get("PLAIN_KEY") {
-        Some(EnvValue::Plain(s)) => assert_eq!(s, "plain_value"),
+    match m.env.get("DEBUG") {
+        Some(EnvValue::Plain(s)) => assert_eq!(s, "1"),
         other => panic!("expected Plain, got {other:?}"),
     }
-    match m.env.get("SECRET_KEY") {
-        Some(EnvValue::Secret(SecretRef { name })) => assert_eq!(name, "MY_SECRET"),
-        other => panic!("expected Secret, got {other:?}"),
+    match m.env.get("COMFYUI_PORT") {
+        Some(EnvValue::Plain(s)) => assert_eq!(s, "8188"),
+        other => panic!("expected Plain, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_manifest_rejects_user_supplied_secret_sentinel() {
+    // `{"__secret": "NAME"}` is an MCP-internal emission shape. A user
+    // profile that contains it is trying to smuggle a credential ref —
+    // must be rejected by parse_manifest (defence-in-depth alongside
+    // the Lua DSL's normalize_env).
+    let json = serde_json::json!({
+        "schema": "vdsl.profile/1",
+        "name": "bad",
+        "comfyui": { "ref": "x" },
+        "env": {
+            "NEUTRAL_NAME": { "__secret": "VDSL_B2_KEY" }
+        }
+    })
+    .to_string();
+    let err = parse_manifest(&json).unwrap_err();
+    match err {
+        ProfileError::SecretInUserEnv { key, reason } => {
+            assert_eq!(key, "NEUTRAL_NAME");
+            assert!(reason.contains("__secret"), "reason should name the sentinel: {reason}");
+        }
+        other => panic!("expected SecretInUserEnv, got {other:?}"),
+    }
+    // Sanity-check `SecretRef` is still reachable for MCP-internal use
+    // (the domain type is not deprecated, only user-facing parsing is).
+    let _ = SecretRef {
+        name: "x".to_string(),
+    };
+}
+
+#[test]
+fn parse_manifest_rejects_secret_shaped_env_key() {
+    // Key matches SECRET_KEY_SUBSTRINGS (case-insensitive). Profile.env
+    // is non-secret runtime config only — credentials are MCP-owned.
+    for key in ["HF_TOKEN", "my_api_key", "DB_PASSWORD", "aws_secret"] {
+        let json = serde_json::json!({
+            "schema": "vdsl.profile/1",
+            "name": "bad",
+            "comfyui": { "ref": "x" },
+            "env": { key: "literal_value" }
+        })
+        .to_string();
+        let err = parse_manifest(&json).unwrap_err();
+        match err {
+            ProfileError::SecretInUserEnv { key: reported, .. } => {
+                assert_eq!(reported, key);
+            }
+            other => panic!("expected SecretInUserEnv for key {key:?}, got {other:?}"),
+        }
     }
 }
 
@@ -148,6 +206,7 @@ fn resolve_secrets_reads_env_var() {
         python: None,
         custom_nodes: vec![],
         sync: None,
+        staging: None,
         models: vec![],
         env: HashMap::new(),
         hooks: None,
@@ -186,6 +245,7 @@ fn resolve_secrets_collects_all_missing() {
         python: None,
         custom_nodes: vec![],
         sync: None,
+        staging: None,
         models: vec![],
         env: HashMap::new(),
         hooks: None,
@@ -285,6 +345,7 @@ fn expand_phases_full_manifest_emits_all_phases_and_correct_tools() {
     assert_eq!(find("4_custom_node_0"), Some("exec".to_string()));
     assert_eq!(find("5_sync_pull_0"), Some("exec".to_string())); // rclone copyto
     assert_eq!(find("5_sync_push_0"), Some("exec".to_string())); // marker append
+    assert_eq!(find("5_staging_push_0"), Some("exec".to_string())); // eager pod → B2
     assert_eq!(find("6_sync_poll_0"), None); // Phase 6 unused
     assert_eq!(find("7_model_0"), Some("exec".to_string())); // b2:// → rclone exec
     assert_eq!(find("7_model_1"), Some("exec".to_string())); // file://
@@ -331,6 +392,90 @@ fn expand_phases_rejects_path_traversal_in_pull_dst() {
     m.sync.as_mut().unwrap().pull[0].dst = "/workspace/../etc".to_string();
     let err = expand_phases(&m, "abc", false).unwrap_err();
     assert!(matches!(err, ProfileError::InvalidManifest(_)));
+}
+
+// ----- staging.push -----
+
+#[test]
+fn expand_phases_rejects_staging_push_with_non_b2_dst() {
+    let mut m = full_manifest();
+    m.staging.as_mut().unwrap().push[0].dst = "https://example.com/a".to_string();
+    let err = expand_phases(&m, "abc", false).unwrap_err();
+    assert!(matches!(err, ProfileError::InvalidManifest(_)));
+}
+
+#[test]
+fn expand_phases_rejects_staging_push_with_relative_src() {
+    let mut m = full_manifest();
+    m.staging.as_mut().unwrap().push[0].src = "staging/a".to_string();
+    let err = expand_phases(&m, "abc", false).unwrap_err();
+    assert!(matches!(err, ProfileError::InvalidManifest(_)));
+}
+
+#[test]
+fn expand_phases_rejects_staging_push_path_traversal() {
+    let mut m = full_manifest();
+    m.staging.as_mut().unwrap().push[0].src = "/workspace/../etc/a".to_string();
+    let err = expand_phases(&m, "abc", false).unwrap_err();
+    assert!(matches!(err, ProfileError::InvalidManifest(_)));
+}
+
+#[test]
+fn phase5_staging_push_emits_rclone_copyto_and_secret_sentinels() {
+    let m = full_manifest();
+    let plan = expand_phases(&m, "abc", false).expect("ok");
+    let script =
+        find_script(&plan, "5_staging_push_0").expect("staging push step present");
+    assert!(
+        script.contains("rclone copyto"),
+        "expected rclone copyto; got: {script}"
+    );
+    assert!(
+        script.contains("/workspace/staging/a.safetensors"),
+        "expected pod src in staging script; got: {script}"
+    );
+    assert!(
+        script.contains("b2:bucket/staging/a.safetensors"),
+        "expected b2 dst in staging script; got: {script}"
+    );
+
+    // __secret sentinels must be present in the step env.
+    for entry in &plan.steps {
+        if let StepEntry::Group(g) = entry {
+            for s in &g.steps {
+                if s.id == "5_staging_push_0" {
+                    let env = s.args.get("env").expect("env object").clone();
+                    let key_id = env
+                        .get("VDSL_B2_KEY_ID")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let key = env.get("VDSL_B2_KEY").and_then(|v| v.as_str()).unwrap_or("");
+                    assert_eq!(key_id, "__secret:VDSL_B2_KEY_ID");
+                    assert_eq!(key, "__secret:VDSL_B2_KEY");
+                    return;
+                }
+            }
+        }
+    }
+    panic!("5_staging_push_0 not found in plan");
+}
+
+#[test]
+fn phase5_staging_push_substitutes_pod_id_placeholder() {
+    let mut m = full_manifest();
+    m.staging.as_mut().unwrap().push[0].dst =
+        "b2://bucket/staging/{pod_id}/a.safetensors".to_string();
+    let plan = expand_phases(&m, "abc", false).expect("ok");
+    let script =
+        find_script(&plan, "5_staging_push_0").expect("staging push step present");
+    assert!(
+        script.contains("b2:bucket/staging/abc/a.safetensors"),
+        "expected {{pod_id}} → abc substitution; got: {script}"
+    );
+    assert!(
+        !script.contains("{pod_id}"),
+        "raw placeholder must be gone; got: {script}"
+    );
 }
 
 #[test]
@@ -619,33 +764,62 @@ fn custom_node_pip_true_installs_requirements_with_torch_filter() {
 }
 
 #[test]
-fn restart_script_uses_ss_and_self_excludes_from_kill() {
+fn restart_script_kills_port_listener_and_self_excludes() {
     let m = full_manifest();
     let plan = expand_phases(&m, "abc", false).expect("ok");
     let script = find_script(&plan, "9_comfyui_restart").expect("step present");
 
-    // Port-free wait must use `ss` (iproute2) — `lsof` is not
-    // installed on the RunPod base image and silently short-circuits
-    // the whole loop.
+    // Kill-set must be derived from the ACTUAL listener on $PORT
+    // (via `ss -ltnpH`), not from an argv pattern like `.venv/bin/
+    // python main.py` — pod images often start ComfyUI via system
+    // python which the argv pattern misses, and apply would silently
+    // leave the wrong ComfyUI bound to the port. See the 2026-04-21
+    // runpod-slim incident in the project CLAUDE.md.
     assert!(
-        script.contains("ss -ltnH"),
-        "expected ss-based port wait; got: {script}"
+        script.contains("ss -ltnpH"),
+        "expected ss -ltnpH for listener PID discovery; got: {script}"
+    );
+    assert!(
+        script.contains("pid="),
+        "expected pid= extraction from ss output; got: {script}"
     );
     assert!(
         !script.contains("lsof"),
         "lsof must not appear; got: {script}"
     );
-
-    // The pkill step must exclude $$ / $PPID so the wrapper shell
-    // (whose cmdline contains the script text, incl. the literal
-    // `.venv/bin/python main.py` launch line) is never targeted.
     assert!(
-        script.contains("grep -vx \"$$\""),
+        !script.contains("pgrep -f"),
+        "argv-pattern pgrep was the bug; must not reappear. got: {script}"
+    );
+
+    // The kill loop must exclude $$ / $PPID so the wrapper shell
+    // and its ssh-level parent are never targeted.
+    assert!(
+        script.contains("[ \"$pid\" = \"$$\" ] && continue"),
         "expected $$ self-exclude; got: {script}"
     );
     assert!(
-        script.contains("grep -vx \"$PPID\""),
+        script.contains("[ \"$pid\" = \"$PPID\" ] && continue"),
         "expected $PPID self-exclude; got: {script}"
+    );
+
+    // An escalation to SIGKILL must happen before the 30s timeout,
+    // to survive pod supervisors that respawn the listener.
+    assert!(
+        script.contains("kill -KILL"),
+        "expected SIGKILL escalation; got: {script}"
+    );
+
+    // iproute2 auto-install must be present so bases lacking `ss`
+    // don't silently no-op the kill loop. This was the 2026-04-21
+    // runpod-slim bug root cause.
+    assert!(
+        script.contains("apt-get install -y -q iproute2"),
+        "expected iproute2 auto-install fallback; got: {script}"
+    );
+    assert!(
+        script.contains("command -v ss"),
+        "expected gating on `command -v ss`; got: {script}"
     );
 }
 

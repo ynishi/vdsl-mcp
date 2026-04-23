@@ -62,6 +62,13 @@ pub struct ProfileManifest {
     #[serde(default)]
     pub sync: Option<SyncConfig>,
 
+    /// One-shot eager pod → B2 uploads executed during Phase 5 of
+    /// apply. Distinct from `sync.push` (which is marker-only and
+    /// consumed by later generation flows). See
+    /// docs/profile-and-orchestration.md §2.3 / §2.5.
+    #[serde(default)]
+    pub staging: Option<StagingConfig>,
+
     /// Checkpoints / LoRAs / VAEs etc. to stage into
     /// `/workspace/ComfyUI/models/<subdir>/<dst>`.
     #[serde(default)]
@@ -138,6 +145,17 @@ pub struct SyncConfig {
     #[serde(default)]
     pub pull: Vec<SyncRoute>,
 
+    #[serde(default)]
+    pub push: Vec<SyncRoute>,
+}
+
+/// Staging block. Currently holds eager pod → B2 uploads (`push`).
+/// Each route runs as a blocking `rclone copyto` in Phase 5, in the
+/// same parallel group as `sync.pull`. Separate from `sync.push` on
+/// purpose: `sync.push` is marker-only (consumed by later generation
+/// flows), `staging.push` fires during apply.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StagingConfig {
     #[serde(default)]
     pub push: Vec<SyncRoute>,
 }
