@@ -456,3 +456,40 @@ fn build_exec_request_rejects_non_string_env_value() {
     let err = build_exec_request(&args).unwrap_err();
     assert!(err.contains("env[K]"), "got: {err}");
 }
+
+// =============================================================================
+// count_leaf_steps — used by run_background to size the apply registry state
+// =============================================================================
+
+#[test]
+fn count_leaf_steps_empty_plan_is_zero() {
+    assert_eq!(count_leaf_steps(&[]), 0);
+}
+
+#[test]
+fn count_leaf_steps_flat_leaves_counts_each() {
+    let steps = vec![
+        StepEntry::Leaf(leaf("a", "exec", json!({"command": "true"}))),
+        StepEntry::Leaf(leaf("b", "exec_bg", json!({"command": "true"}))),
+    ];
+    assert_eq!(count_leaf_steps(&steps), 2);
+}
+
+#[test]
+fn count_leaf_steps_groups_flatten_to_children() {
+    let group = GroupBlock {
+        id: Some("g".to_string()),
+        parallel: 2,
+        steps: vec![
+            leaf("g1", "exec_bg", json!({"command": "true"})),
+            leaf("g2", "exec_bg", json!({"command": "true"})),
+            leaf("g3", "exec_bg", json!({"command": "true"})),
+        ],
+    };
+    let steps = vec![
+        StepEntry::Leaf(leaf("pre", "exec", json!({"command": "true"}))),
+        StepEntry::Group(group),
+        StepEntry::Leaf(leaf("post", "exec", json!({"command": "true"}))),
+    ];
+    assert_eq!(count_leaf_steps(&steps), 5);
+}

@@ -18,12 +18,12 @@ fn full_manifest() -> ProfileManifest {
     ProfileManifest {
         schema: PROFILE_SCHEMA.to_string(),
         name: "full".to_string(),
-        comfyui: ComfyUiConfig {
+        comfyui: Some(ComfyUiConfig {
             ref_: "master".to_string(),
             repo: None,
             args: Some(vec!["--lowvram".to_string()]),
             port: Some(8188),
-        },
+        }),
         system: Some(SystemConfig {
             apt: vec!["git".to_string(), "curl".to_string()],
         }),
@@ -80,7 +80,7 @@ fn parse_manifest_accepts_valid_json() {
     let m = parse_manifest(&minimal_manifest_json()).expect("parse ok");
     assert_eq!(m.schema, PROFILE_SCHEMA);
     assert_eq!(m.name, "minimal");
-    assert_eq!(m.comfyui.ref_, "v0.3.10");
+    assert_eq!(m.comfyui.as_ref().expect("comfyui present").ref_, "v0.3.10");
 }
 
 #[test]
@@ -196,12 +196,12 @@ fn resolve_secrets_reads_env_var() {
     let mut manifest = ProfileManifest {
         schema: PROFILE_SCHEMA.to_string(),
         name: "s".to_string(),
-        comfyui: ComfyUiConfig {
+        comfyui: Some(ComfyUiConfig {
             ref_: "x".to_string(),
             repo: None,
             args: None,
             port: None,
-        },
+        }),
         system: None,
         python: None,
         custom_nodes: vec![],
@@ -235,12 +235,12 @@ fn resolve_secrets_collects_all_missing() {
     let mut manifest = ProfileManifest {
         schema: PROFILE_SCHEMA.to_string(),
         name: "s".to_string(),
-        comfyui: ComfyUiConfig {
+        comfyui: Some(ComfyUiConfig {
             ref_: "x".to_string(),
             repo: None,
             args: None,
             port: None,
-        },
+        }),
         system: None,
         python: None,
         custom_nodes: vec![],
@@ -339,18 +339,25 @@ fn expand_phases_full_manifest_emits_all_phases_and_correct_tools() {
 
     let find = |id: &str| pairs.iter().find(|(i, _)| i == id).map(|(_, t)| t.clone());
 
-    assert_eq!(find("1_system_apt"), Some("exec".to_string()));
-    assert_eq!(find("2_comfyui_install"), Some("exec".to_string()));
-    assert_eq!(find("3_python_deps"), Some("exec".to_string()));
-    assert_eq!(find("4_custom_node_0"), Some("exec".to_string()));
-    assert_eq!(find("5_sync_pull_0"), Some("exec".to_string())); // rclone copyto
-    assert_eq!(find("5_sync_push_0"), Some("exec".to_string())); // marker append
-    assert_eq!(find("5_staging_push_0"), Some("exec".to_string())); // eager pod → B2
+    // Heavy phases (installs, git clones, pip, rclone, restart, user hooks)
+    // use `exec_bg` so SSH stays held only during launch + per-poll status
+    // queries; pod-side work runs detached via `task_run`. See the
+    // 2026-04-22 accident — the pre-fix `exec` path regularly deadlocked
+    // the SSH channel for ~1h on a pip install that had actually
+    // completed on the pod. Only the marker-append `sync.push` stays on
+    // plain `exec` (fast, single-line write).
+    assert_eq!(find("1_system_apt"), Some("exec_bg".to_string()));
+    assert_eq!(find("2_comfyui_install"), Some("exec_bg".to_string()));
+    assert_eq!(find("3_python_deps"), Some("exec_bg".to_string()));
+    assert_eq!(find("4_custom_node_0"), Some("exec_bg".to_string()));
+    assert_eq!(find("5_sync_pull_0"), Some("exec_bg".to_string())); // rclone copyto
+    assert_eq!(find("5_sync_push_0"), Some("exec".to_string())); // marker append — light
+    assert_eq!(find("5_staging_push_0"), Some("exec_bg".to_string())); // eager pod → B2
     assert_eq!(find("6_sync_poll_0"), None); // Phase 6 unused
-    assert_eq!(find("7_model_0"), Some("exec".to_string())); // b2:// → rclone exec
-    assert_eq!(find("7_model_1"), Some("exec".to_string())); // file://
-    assert_eq!(find("8_post_install"), Some("exec".to_string()));
-    assert_eq!(find("9_comfyui_restart"), Some("exec".to_string()));
+    assert_eq!(find("7_model_0"), Some("exec_bg".to_string())); // b2:// → rclone
+    assert_eq!(find("7_model_1"), Some("exec_bg".to_string())); // file:// cp
+    assert_eq!(find("8_post_install"), Some("exec_bg".to_string()));
+    assert_eq!(find("9_comfyui_restart"), Some("exec_bg".to_string()));
     assert_eq!(find("10_health"), Some("comfy_api".to_string()));
 }
 
@@ -826,9 +833,60 @@ fn restart_script_kills_port_listener_and_self_excludes() {
 #[test]
 fn expand_phases_rejects_unsafe_comfyui_args() {
     let mut m = full_manifest();
-    m.comfyui.args = Some(vec!["; rm -rf /".to_string()]);
+    m.comfyui.as_mut().expect("comfyui present").args =
+        Some(vec!["; rm -rf /".to_string()]);
     let err = expand_phases(&m, "abc", false).unwrap_err();
     assert!(matches!(err, ProfileError::InvalidManifest(_)));
+}
+
+#[test]
+fn expand_phases_without_comfyui_skips_phase_2_9_10() {
+    // Evacuation / staging-only profile: no comfyui block means no
+    // install, no restart, no health check. Only the phases whose
+    // source data is declared elsewhere in the manifest get emitted.
+    // Regression guard for the 2026-04-24 design flaw where an
+    // evacuation profile forced a Phase 2 git fetch that could not
+    // run on a disk-quota-exhausted volume, deadlocking the apply.
+    let m = ProfileManifest {
+        schema: PROFILE_SCHEMA.to_string(),
+        name: "evac".to_string(),
+        comfyui: None,
+        system: None,
+        python: None,
+        custom_nodes: vec![],
+        sync: None,
+        staging: Some(crate::domain::profile::StagingConfig {
+            push: vec![SyncRoute {
+                src: "/workspace/data/".to_string(),
+                dst: "b2://bucket/archive/data/".to_string(),
+            }],
+        }),
+        models: vec![],
+        env: HashMap::new(),
+        hooks: None,
+    };
+    let plan = expand_phases(&m, "abc", false).expect("ok");
+    let mut ids = Vec::new();
+    for entry in &plan.steps {
+        match entry {
+            StepEntry::Leaf(s) => ids.push(s.id.clone()),
+            StepEntry::Group(g) => {
+                for s in &g.steps {
+                    ids.push(s.id.clone());
+                }
+            }
+        }
+    }
+    assert!(
+        ids.iter().any(|i| i == "5_staging_push_0"),
+        "staging step must fire; got: {ids:?}"
+    );
+    for forbidden in ["2_comfyui_install", "9_comfyui_restart", "10_health"] {
+        assert!(
+            !ids.iter().any(|i| i == forbidden),
+            "{forbidden} must NOT fire when comfyui is None; got: {ids:?}"
+        );
+    }
 }
 
 // ----- compute_profile_hash -----

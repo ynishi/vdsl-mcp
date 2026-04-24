@@ -418,7 +418,13 @@ pub fn expand_phases(
         assert_shell_safe(key, "env[].key")?;
     }
     let env_json = env_value(&manifest.env);
-    let comfy_port = manifest.comfyui.port.unwrap_or(8188);
+    // Port only matters when a `comfyui` block is present (Phase 2 / 9 /
+    // 10). Otherwise we skip those phases entirely.
+    let comfy_port = manifest
+        .comfyui
+        .as_ref()
+        .and_then(|c| c.port)
+        .unwrap_or(8188);
 
     // ---- Phase 1: system.apt ----
     if let Some(system) = &manifest.system {
@@ -427,7 +433,7 @@ pub fn expand_phases(
                 assert_shell_safe(pkg, "system.apt")?;
             }
             let pkgs = system.apt.join(" ");
-            steps.push(StepEntry::Leaf(exec_step(
+            steps.push(StepEntry::Leaf(exec_bg_step(
                 "1_system_apt",
                 &format!(
                     "apt-get update && DEBIAN_FRONTEND=noninteractive \
@@ -439,20 +445,21 @@ pub fn expand_phases(
         }
     }
 
-    // ---- Phase 2: ComfyUI install ----
-    assert_shell_safe(&manifest.comfyui.ref_, "comfyui.ref")?;
-    let comfy_repo = manifest
-        .comfyui
-        .repo
-        .as_deref()
-        .unwrap_or("comfyanonymous/ComfyUI");
-    assert_shell_safe(comfy_repo, "comfyui.repo")?;
-    steps.push(StepEntry::Leaf(exec_step(
-        "2_comfyui_install",
-        &comfyui_install_script(comfy_repo, &manifest.comfyui.ref_),
-        pod_id,
-        &env_json,
-    )));
+    // ---- Phase 2: ComfyUI install (skipped when comfyui block absent) ----
+    if let Some(comfyui) = &manifest.comfyui {
+        assert_shell_safe(&comfyui.ref_, "comfyui.ref")?;
+        let comfy_repo = comfyui
+            .repo
+            .as_deref()
+            .unwrap_or("comfyanonymous/ComfyUI");
+        assert_shell_safe(comfy_repo, "comfyui.repo")?;
+        steps.push(StepEntry::Leaf(exec_bg_step(
+            "2_comfyui_install",
+            &comfyui_install_script(comfy_repo, &comfyui.ref_),
+            pod_id,
+            &env_json,
+        )));
+    }
 
     // ---- Phase 3: python.deps ----
     if let Some(python) = &manifest.python {
@@ -461,7 +468,7 @@ pub fn expand_phases(
                 assert_shell_safe(dep, "python.deps")?;
             }
             let deps = python.deps.join(" ");
-            steps.push(StepEntry::Leaf(exec_step(
+            steps.push(StepEntry::Leaf(exec_bg_step(
                 "3_python_deps",
                 &format!("cd /workspace/ComfyUI && .venv/bin/pip install {deps}"),
                 pod_id,
@@ -509,7 +516,7 @@ pub fn expand_phases(
                 name = node.name,
                 url = clone_url,
             );
-            node_steps.push(exec_step(
+            node_steps.push(exec_bg_step(
                 &format!("4_custom_node_{idx}"),
                 &script,
                 pod_id,
@@ -583,7 +590,7 @@ pub fn expand_phases(
     if let Some(hooks) = &manifest.hooks {
         if let Some(script) = &hooks.post_install {
             if !script.trim().is_empty() {
-                steps.push(StepEntry::Leaf(exec_step(
+                steps.push(StepEntry::Leaf(exec_bg_step(
                     "8_post_install",
                     script,
                     pod_id,
@@ -593,50 +600,52 @@ pub fn expand_phases(
         }
     }
 
-    // ---- Phase 9: ComfyUI restart ----
-    // Single blocking `exec` step. The restart script internally bounds
-    // itself at ~210s (30s port-free wait + 180s curl-ready wait), and
-    // launches the server via `nohup ... &` so the python process survives
-    // the SSH session exit. Using `exec` (not `task_run` + `task_status`)
-    // means Phase 10's health check fires only after the server actually
-    // answers HTTP — no race, no polling primitive needed.
-    //
-    // DSL emits args as an array of tokens; validate each token
-    // individually (no spaces) then shell-join with a single space for
-    // the launch command.
-    let args_vec = manifest
-        .comfyui
-        .args
-        .as_deref()
-        .unwrap_or(&[] as &[String]);
-    for tok in args_vec {
-        assert_shell_safe(tok, "comfyui.args[]")?;
-    }
-    let extra_args = args_vec.join(" ");
-    let restart_script = comfyui_restart_script(comfy_port, &extra_args);
-    steps.push(StepEntry::Leaf(exec_step(
-        "9_comfyui_restart",
-        &restart_script,
-        pod_id,
-        &env_json,
-    )));
+    // ---- Phase 9 / 10 are COMFYUI-only (skipped when block absent) ----
+    // A profile with no `comfyui` block is declaring "this apply has no
+    // ComfyUI runtime to restart or health-check" (e.g. a pure
+    // volume-evacuation profile that only emits `staging.push`). Emitting
+    // a restart step in that case would force a wasted git clone / pip
+    // install to produce a process we're not going to use.
+    if let Some(comfyui) = &manifest.comfyui {
+        // ---- Phase 9: ComfyUI restart ----
+        // Single `exec_bg` step. The restart script internally bounds
+        // itself at ~210s (30s port-free wait + 180s curl-ready wait),
+        // and launches the server via `nohup ... &` so the python
+        // process survives the SSH session exit.
+        //
+        // DSL emits args as an array of tokens; validate each token
+        // individually (no spaces) then shell-join with a single space
+        // for the launch command.
+        let args_vec = comfyui.args.as_deref().unwrap_or(&[] as &[String]);
+        for tok in args_vec {
+            assert_shell_safe(tok, "comfyui.args[]")?;
+        }
+        let extra_args = args_vec.join(" ");
+        let restart_script = comfyui_restart_script(comfy_port, &extra_args);
+        steps.push(StepEntry::Leaf(exec_bg_step(
+            "9_comfyui_restart",
+            &restart_script,
+            pod_id,
+            &env_json,
+        )));
 
-    // ---- Phase 10: health check ----
-    // Pass `pod_id` explicitly so comfy_api auto-constructs the RunPod
-    // proxy URL (`https://<pod_id>-8188.proxy.runpod.net`). Without it
-    // the tool falls through to the default "connect first" guard and
-    // fails with -32602.
-    steps.push(StepEntry::Leaf(BatchStep {
-        id: "10_health".to_string(),
-        tool: "comfy_api".to_string(),
-        args: serde_json::json!({
-            "pod_id": pod_id,
-            "method": "GET",
-            "path": "/object_info",
-        }),
-        depends_on: Vec::new(),
-        validate: None,
-    }));
+        // ---- Phase 10: health check ----
+        // Pass `pod_id` explicitly so comfy_api auto-constructs the
+        // RunPod proxy URL (`https://<pod_id>-8188.proxy.runpod.net`).
+        // Without it the tool falls through to the default "connect
+        // first" guard and fails with -32602.
+        steps.push(StepEntry::Leaf(BatchStep {
+            id: "10_health".to_string(),
+            tool: "comfy_api".to_string(),
+            args: serde_json::json!({
+                "pod_id": pod_id,
+                "method": "GET",
+                "path": "/object_info",
+            }),
+            depends_on: Vec::new(),
+            validate: None,
+        }));
+    }
 
     Ok(BatchPlan {
         mode: PlanMode::Seq,
@@ -749,6 +758,40 @@ fn exec_step_with_timeout(
     BatchStep {
         id: id.to_string(),
         tool: "exec".to_string(),
+        args: serde_json::json!({
+            "pod_id": pod_id,
+            "script": script,
+            "env": env,
+            "timeout": timeout_secs,
+        }),
+        depends_on: Vec::new(),
+        validate: None,
+    }
+}
+
+/// Build a background-exec step (tool = `"exec_bg"`). Same arg shape
+/// as [`exec_step`] — `batch_service`'s `exec_bg` dispatch launches
+/// via `task_run` and polls `task_status` until the job reaches
+/// `state == "done"`. Use for any phase that may run longer than
+/// the SSH idle-drop threshold (~5-10 min for some proxies);
+/// holding a single SSH channel for a 20-min pip install reliably
+/// hangs the RunPod proxy and blocks the caller for the full
+/// per-step timeout. See the 2026-04-22 accident log in the project
+/// `CLAUDE.md`.
+fn exec_bg_step(id: &str, script: &str, pod_id: &str, env: &serde_json::Value) -> BatchStep {
+    exec_bg_step_with_timeout(id, script, pod_id, env, DEFAULT_EXEC_TIMEOUT_SECS)
+}
+
+fn exec_bg_step_with_timeout(
+    id: &str,
+    script: &str,
+    pod_id: &str,
+    env: &serde_json::Value,
+    timeout_secs: u64,
+) -> BatchStep {
+    BatchStep {
+        id: id.to_string(),
+        tool: "exec_bg".to_string(),
         args: serde_json::json!({
             "pod_id": pod_id,
             "script": script,
@@ -931,7 +974,7 @@ fn build_model_step(
             dst = dst_path,
         );
         let step_env = merge_b2_env(env);
-        Ok(exec_step(
+        Ok(exec_bg_step(
             &format!("7_model_{idx}"),
             &script,
             pod_id,
@@ -945,7 +988,7 @@ fn build_model_step(
             src = rest,
             dst = dst_path,
         );
-        Ok(exec_step(&format!("7_model_{idx}"), &script, pod_id, env))
+        Ok(exec_bg_step(&format!("7_model_{idx}"), &script, pod_id, env))
     } else {
         tracing::warn!(src = %model.src, "unsupported model src scheme");
         Err(ProfileError::InvalidManifest(format!(
@@ -1068,7 +1111,7 @@ fn build_sync_pull_step(
          rclone copyto --progress b2:{bucket}/{object} {dst}\n"
     );
     let step_env = merge_b2_env(env);
-    Ok(exec_step(
+    Ok(exec_bg_step(
         &format!("5_sync_pull_{idx}"),
         &script,
         pod_id,
@@ -1173,7 +1216,7 @@ fn build_staging_push_step(
          rclone copyto --progress {src} b2:{bucket}/{object}\n"
     );
     let step_env = merge_b2_env(env);
-    Ok(exec_step(
+    Ok(exec_bg_step(
         &format!("5_staging_push_{idx}"),
         &script,
         pod_id,

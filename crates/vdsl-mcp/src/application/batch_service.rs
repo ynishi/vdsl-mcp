@@ -25,6 +25,9 @@ use futures::FutureExt;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+use crate::application::apply_registry::{
+    self, ApplyRegistry, ApplyRunState, ApplyStatus,
+};
 use crate::application::profile_service::{
     BatchPlan, BatchResult, BatchStep, BatchStepResult, GroupBlock, PlanMode, StepEntry,
     StepStatus, ValidateBlock,
@@ -129,6 +132,102 @@ impl BatchService {
             dry_run: false,
         })
     }
+
+    /// Spawn [`Self::execute`] onto the tokio runtime and return a
+    /// `task_id` the caller can poll via
+    /// [`ApplyRegistry::snapshot`].
+    ///
+    /// The returned task_id is also recorded as the registry key. The
+    /// caller (typically `vdsl_profile_apply`) uses it to drive
+    /// `vdsl_profile_apply_status`. Progress granularity in v1 is
+    /// binary — the spawned future writes the final `BatchResult`
+    /// into the state on completion. Per-step streaming progress is
+    /// a future enhancement; pollers can still distinguish
+    /// "Running" vs terminal "Ok"/"Failed" with timestamps, which is
+    /// enough to resolve the "is MCP alive?" uncertainty that a
+    /// synchronous blocking call leaves pending for 20+ minutes on a
+    /// cold pod apply.
+    pub fn run_background(
+        &self,
+        plan: BatchPlan,
+        secrets: HashMap<String, String>,
+        registry: ApplyRegistry,
+        pod_id: String,
+    ) -> String {
+        let task_id = format!("apply_{}", uuid::Uuid::new_v4());
+
+        let total_steps = count_leaf_steps(&plan.steps);
+        let state = ApplyRunState::new(task_id.clone(), pod_id, total_steps);
+        let handle = registry.insert(state);
+
+        let server = self.server.clone();
+        tokio::spawn(async move {
+            let service = BatchService::new(server);
+            match AssertUnwindSafe(service.execute(plan, secrets))
+                .catch_unwind()
+                .await
+            {
+                Ok(Ok(result)) => {
+                    // Replace the live results with the authoritative
+                    // completion vector so late failures (or skips)
+                    // are visible to pollers.
+                    {
+                        let mut s = handle.lock().await;
+                        s.completed_steps = result.results.len();
+                        s.results = result.results.clone();
+                    }
+                    let any_failed = result
+                        .results
+                        .iter()
+                        .any(|r| r.status == StepStatus::Failed);
+                    let status = if any_failed {
+                        ApplyStatus::Failed
+                    } else {
+                        ApplyStatus::Ok
+                    };
+                    apply_registry::finalize(&handle, status, result.plan_id, None).await;
+                }
+                Ok(Err(e)) => {
+                    apply_registry::finalize(
+                        &handle,
+                        ApplyStatus::Failed,
+                        String::new(),
+                        Some(e.to_string()),
+                    )
+                    .await;
+                }
+                Err(panic) => {
+                    let msg = if let Some(s) = panic.downcast_ref::<&'static str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = panic.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "runner panicked".to_string()
+                    };
+                    apply_registry::finalize(
+                        &handle,
+                        ApplyStatus::Failed,
+                        String::new(),
+                        Some(format!("panic: {msg}")),
+                    )
+                    .await;
+                }
+            }
+        });
+
+        task_id
+    }
+}
+
+/// Count flat leaf steps across entries (groups expand to children).
+fn count_leaf_steps(steps: &[StepEntry]) -> usize {
+    steps
+        .iter()
+        .map(|e| match e {
+            StepEntry::Leaf(_) => 1,
+            StepEntry::Group(g) => g.steps.len(),
+        })
+        .sum()
 }
 
 // =============================================================================
@@ -213,7 +312,97 @@ async fn dispatch_step_with_server(
                 .map_err(|e| e.to_string())?;
             extract_result(result)
         }
+        "exec_bg" => dispatch_exec_bg(server, &step.args).await,
         other => Err(format!("unknown tool: {other}")),
+    }
+}
+
+/// Dispatch a background-exec step: launch via `task_run`, poll
+/// `task_status` until `state == "done"`, then return the captured log.
+///
+/// Rationale: `runpod-cli exec` uses a single SSH channel held open for
+/// the entire command duration. Long-running installs (pip install
+/// mediapipe etc.) regularly hang past the default SSH idle grace
+/// window; the client blocks on a dead channel for the full
+/// per-step timeout (3600s default) even though the pod-side work
+/// finished. `task_run` detaches the shell from SSH — we only hold
+/// ssh for the launch and per-poll status query. See the 2026-04-22
+/// "45 min stuck" accident note in the project `CLAUDE.md`.
+///
+/// Args shape is identical to `exec` (profile `{pod_id, script, env,
+/// timeout?}` or raw `{pod_id, command, ssh_key?}`). `timeout` caps
+/// the total wait for the background task to reach `done` state and
+/// defaults to 3600s.
+async fn dispatch_exec_bg(
+    server: &VdslMcpServer,
+    args: &serde_json::Value,
+) -> Result<String, String> {
+    // 1. Launch — reuse the same arg-shape logic as the eager `task_run`
+    //    dispatch so profile-style {pod_id, script, env} is accepted.
+    let run_req = build_task_run_request(args)?;
+    let pod_id_hint = run_req.pod_id.clone();
+    let ssh_key_hint = run_req.ssh_key.clone();
+    let timeout_secs = args
+        .as_object()
+        .and_then(|m| m.get("timeout"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3600);
+
+    let run_result = server
+        .task_run(Parameters(run_req))
+        .await
+        .map_err(|e| e.to_string())?;
+    let run_text = extract_result(run_result)?;
+    let job_id = extract_field(&run_text, "job_id").ok_or_else(|| {
+        format!("exec_bg: task_run returned no Job ID:\n{run_text}")
+    })?;
+
+    // 2. Poll — exponential backoff capped at 15 s.
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut interval_secs: u64 = 3;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+
+        let status_req = VdslTaskStatusRequest {
+            job_id: job_id.clone(),
+            pod_id: pod_id_hint.clone(),
+            ssh_key: ssh_key_hint.clone(),
+        };
+        let status_result = server
+            .task_status(Parameters(status_req))
+            .await
+            .map_err(|e| e.to_string())?;
+        let status_text = extract_result(status_result)?;
+
+        // mcp::task_status emits `serde_json::to_string_pretty(..)`;
+        // re-parse to inspect the `state` / `exit_code` / `log` fields.
+        let status_json: serde_json::Value = serde_json::from_str(&status_text)
+            .map_err(|e| format!("exec_bg: parse task_status JSON: {e}\n{status_text}"))?;
+        let state = status_json["state"].as_str().unwrap_or("unknown");
+
+        if state == "done" {
+            let exit_code = status_json["exit_code"]
+                .as_i64()
+                .or_else(|| {
+                    status_json["exit_code"]
+                        .as_str()
+                        .and_then(|s| s.parse().ok())
+                })
+                .unwrap_or(-1) as i32;
+            let log_text = status_json["log"].as_str().unwrap_or("").to_string();
+            if exit_code != 0 {
+                return Err(format!("shell exit code {exit_code}\n{log_text}"));
+            }
+            return Ok(log_text);
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "exec_bg timed out after {timeout_secs}s (job_id={job_id}, last state={state})"
+            ));
+        }
+        interval_secs = (interval_secs * 2).min(15);
     }
 }
 

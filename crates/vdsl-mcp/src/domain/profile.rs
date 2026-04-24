@@ -44,7 +44,13 @@ pub struct ProfileManifest {
     pub name: String,
 
     /// ComfyUI installation config (ref, args, port).
-    pub comfyui: ComfyUiConfig,
+    ///
+    /// Optional: profiles that only use `staging.push` / `sync` /
+    /// `system.apt` without needing a ComfyUI runtime omit this block.
+    /// When `None`, Phase 2 (install), Phase 9 (restart), and Phase 10
+    /// (health check) are all skipped by `expand_phases`.
+    #[serde(default)]
+    pub comfyui: Option<ComfyUiConfig>,
 
     /// System-level apt packages to install.
     #[serde(default)]
