@@ -1,3 +1,6 @@
+pub mod apply_registry;
+pub mod batch_service;
 pub mod error;
 pub mod pod_service;
+pub mod profile_service;
 pub mod storage_service;

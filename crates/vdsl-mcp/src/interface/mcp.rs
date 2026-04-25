@@ -57,7 +57,7 @@ pub async fn run() -> anyhow::Result<()> {
 // =============================================================================
 
 #[derive(Clone)]
-struct VdslMcpServer {
+pub(crate) struct VdslMcpServer {
     tool_router: ToolRouter<Self>,
     /// Last successfully connected ComfyUI URL (session state).
     /// Set by `vdsl_connect` and `vdsl_pod_setup` on success.
@@ -88,6 +88,12 @@ struct VdslMcpServer {
     syncd_cfg: SyncdConfig,
     /// syncd HTTP client — probe / delegate に使用。
     syncd_client: Arc<SyncdClient>,
+    /// Registry for background `vdsl_profile_apply` tasks. Keyed by the
+    /// `task_id` returned from the `profile_apply` MCP call when
+    /// `dry_run=false`; polled via `vdsl_profile_apply_status`. See
+    /// `application::apply_registry` module docstring for the full
+    /// rationale.
+    apply_registry: crate::application::apply_registry::ApplyRegistry,
 }
 
 impl VdslMcpServer {
@@ -112,6 +118,7 @@ impl VdslMcpServer {
             sync_task_mgr: Arc::new(SyncTaskManager::new()),
             syncd_cfg,
             syncd_client,
+            apply_registry: crate::application::apply_registry::ApplyRegistry::new(),
         }
     }
 
@@ -1284,6 +1291,28 @@ pub struct VdslPodCreateRequest {
 
     /// Container disk size in GB (default: 30 with volume, 100 without).
     pub disk_gb: Option<u32>,
+
+    /// Workspace (MooseFS `/workspace` mount) size in GB for ephemeral
+    /// pods. Ignored when `volume_id` is set (network volume sets its
+    /// own size). Default when omitted on an ephemeral pod is RunPod's
+    /// built-in 20 GB, which is not enough for multi-checkpoint stacks
+    /// (each SDXL checkpoint is ~6-7 GB). Recommended: 100 for
+    /// Profile apply bundles, 200+ for full multi-LoRA setups. Can be
+    /// enlarged later via the RunPod API but cannot be shrunk.
+    pub volume_gb: Option<u32>,
+
+    /// Raw docker image to run on the pod (e.g.
+    /// `"runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"`).
+    /// Mutually exclusive with `template_id`. If both are omitted the
+    /// built-in ComfyUI template is used, which bundles an old
+    /// ComfyUI that cannot boot against most existing network
+    /// volumes — set this to a pytorch base and install ComfyUI via
+    /// `vdsl_profile_apply` instead.
+    pub image_name: Option<String>,
+
+    /// RunPod template ID (override the default ComfyUI template).
+    /// Mutually exclusive with `image_name`.
+    pub template_id: Option<String>,
 }
 
 /// Default timeout for generate poll (seconds).
@@ -1771,6 +1800,44 @@ pub struct VdslImageSearchRequest {
     pub ssh_key: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslProfileApplyRequest {
+    /// Profile manifest JSON string (schema tag "vdsl.profile/1").
+    /// Emitted by the vdsl Lua Profile DSL.
+    pub manifest: String,
+
+    /// Target RunPod pod ID (e.g. "pod_abc123def").
+    pub pod_id: String,
+
+    /// Emit the expanded BatchPlan without dispatching steps. Default: false.
+    /// `dry_run=true` runs synchronously and returns the compiled
+    /// plan body immediately. `dry_run=false` spawns the real
+    /// dispatch into a background task and returns
+    /// `{ task_id, plan_id }` — the caller then polls
+    /// `vdsl_profile_apply_status(task_id)`.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslProfileApplyStatusRequest {
+    /// Task ID returned by a prior `vdsl_profile_apply` call with
+    /// `dry_run=false`.
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslBatchToolsRequest {
+    /// Pre-built BatchPlan JSON (fields: mode ∈ {"seq","dag"}, steps[], dry_run).
+    /// Each step references an MCP tool name without the `vdsl_` prefix.
+    pub plan: serde_json::Value,
+
+    /// Optional map for `__secret:NAME` placeholder substitution.
+    /// Normally empty — vdsl_profile_apply populates this automatically.
+    #[serde(default)]
+    pub secrets: std::collections::HashMap<String, String>,
+}
+
 // =============================================================================
 // Tool implementations
 // =============================================================================
@@ -1859,15 +1926,40 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslPodCreateRequest>,
     ) -> Result<CallToolResult, McpError> {
+        if req.image_name.is_some() && req.template_id.is_some() {
+            return Err(McpError::invalid_params(
+                "image_name and template_id are mutually exclusive",
+                None,
+            ));
+        }
+
         let mut spec = serde_json::Map::new();
         spec.insert(
             "name".into(),
             serde_json::Value::String(req.name.unwrap_or_else(|| COMFY_DEFAULTS_NAME.to_string())),
         );
-        spec.insert(
-            "templateId".into(),
-            serde_json::Value::String(COMFY_DEFAULTS_TEMPLATE.to_string()),
-        );
+        // Image / template selection order:
+        //   1. explicit image_name  → raw docker image (pytorch base etc.)
+        //   2. explicit template_id → RunPod-managed template
+        //   3. fallback              → COMFY_DEFAULTS_TEMPLATE (runpod/comfyui)
+        // The COMFY_DEFAULTS fallback has a known failure mode: an
+        // existing network volume with an older ComfyUI install
+        // prevents the bundled entrypoint from booting (proxy returns
+        // 404, pod has no public IP). See `vdsl/.claude/CLAUDE.md`
+        // 2026-04-24 accident record. Use `image_name` with a pytorch
+        // base + `vdsl_profile_apply` to install ComfyUI fresh.
+        if let Some(image) = req.image_name.as_ref() {
+            spec.insert(
+                "imageName".into(),
+                serde_json::Value::String(image.clone()),
+            );
+        } else {
+            let template = req
+                .template_id
+                .clone()
+                .unwrap_or_else(|| COMFY_DEFAULTS_TEMPLATE.to_string());
+            spec.insert("templateId".into(), serde_json::Value::String(template));
+        }
         let is_ephemeral = req.volume_id.is_none();
         let default_disk = if is_ephemeral {
             COMFY_DEFAULTS_EPHEMERAL_DISK
@@ -1881,6 +1973,16 @@ impl VdslMcpServer {
         spec.insert("ports".into(), serde_json::json!(["8188/http", "22/tcp"]));
         if let Some(vol) = req.volume_id {
             spec.insert("networkVolumeId".into(), serde_json::Value::String(vol));
+        } else if let Some(vgb) = req.volume_gb {
+            // Ephemeral pod: set pod-attached workspace size. Ignored
+            // by RunPod when a network volume is attached (network
+            // volume provides its own size). A stack of multiple SDXL
+            // checkpoints (~7 GB each) easily overflows the default
+            // 20 GB, so the caller typically passes 100+.
+            spec.insert(
+                "volumeInGb".into(),
+                serde_json::Value::Number(vgb.into()),
+            );
         }
 
         if let Some(gpu) = req.gpu {
@@ -3117,7 +3219,7 @@ impl VdslMcpServer {
             open_world_hint = true
         )
     )]
-    async fn comfy_api(
+    pub(crate) async fn comfy_api(
         &self,
         Parameters(req): Parameters<VdslComfyApiRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -3159,7 +3261,7 @@ impl VdslMcpServer {
             open_world_hint = true
         )
     )]
-    async fn exec(
+    pub(crate) async fn exec(
         &self,
         Parameters(req): Parameters<VdslExecRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -3208,7 +3310,7 @@ impl VdslMcpServer {
             open_world_hint = true
         )
     )]
-    async fn task_run(
+    pub(crate) async fn task_run(
         &self,
         Parameters(req): Parameters<VdslTaskRunRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -3245,7 +3347,7 @@ impl VdslMcpServer {
             open_world_hint = true
         )
     )]
-    async fn task_status(
+    pub(crate) async fn task_status(
         &self,
         Parameters(req): Parameters<VdslTaskStatusRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -4408,7 +4510,7 @@ impl VdslMcpServer {
             open_world_hint = true
         )
     )]
-    async fn sync(&self) -> Result<CallToolResult, McpError> {
+    pub(crate) async fn sync(&self) -> Result<CallToolResult, McpError> {
         // auto-detect pod BEFORE syncd spawn so pod_id is available for env propagation
         self.ensure_pod_detected().await;
         // probe → syncd 委譲 / 未稼働なら spawn → fallback
@@ -4461,7 +4563,7 @@ impl VdslMcpServer {
             open_world_hint = true
         )
     )]
-    async fn sync_route(
+    pub(crate) async fn sync_route(
         &self,
         Parameters(req): Parameters<VdslSyncRouteRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -4819,7 +4921,7 @@ impl VdslMcpServer {
             open_world_hint = false
         )
     )]
-    async fn sync_poll(
+    pub(crate) async fn sync_poll(
         &self,
         Parameters(req): Parameters<VdslSyncPollRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -5433,6 +5535,139 @@ impl VdslMcpServer {
         }
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    // =========================================================================
+    // Profile / Batch orchestration
+    // =========================================================================
+
+    #[tool(
+        name = "vdsl_profile_apply",
+        description = "[profile] Apply a Profile manifest (schema \"vdsl.profile/1\") to a pod. \
+            Parses the manifest, resolves __secret:NAME env refs via std::env::var (fail-fast on missing), \
+            expands to a BatchPlan via the 10-phase layout, and dispatches through BatchService. \
+            dry_run=true: synchronous; returns the compiled plan immediately. \
+            dry_run=false: spawns the dispatch into a background task and returns \
+            { task_id, plan_id } in < 1 s — poll vdsl_profile_apply_status(task_id) for progress \
+            and terminal results. Prevents the MCP call itself from blocking 15-20 min on cold apply.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn profile_apply(
+        &self,
+        Parameters(req): Parameters<VdslProfileApplyRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::application::batch_service::BatchService;
+        use crate::application::profile_service::{expand_phases, parse_manifest, resolve_secrets};
+
+        let manifest = parse_manifest(&req.manifest)
+            .map_err(|e| McpError::invalid_params(format!("profile parse: {e}"), None))?;
+        let secrets = resolve_secrets(&manifest)
+            .map_err(|e| McpError::invalid_params(format!("profile secrets: {e}"), None))?;
+        let plan = expand_phases(&manifest, &req.pod_id, req.dry_run)
+            .map_err(|e| McpError::invalid_params(format!("profile expand: {e}"), None))?;
+
+        let svc = BatchService::new(self.clone());
+
+        if req.dry_run {
+            // Synchronous path: dry_run surfaces the plan for inspection
+            // — no background task needed.
+            let result = svc
+                .execute(plan, secrets)
+                .await
+                .map_err(|e| McpError::internal_error(format!("batch execute: {e}"), None))?;
+            let body = serde_json::to_string_pretty(&result)
+                .map_err(|e| McpError::internal_error(format!("serialize result: {e}"), None))?;
+            return Ok(CallToolResult::success(vec![Content::text(body)]));
+        }
+
+        // Background path: spawn + return task_id immediately. The caller
+        // polls `vdsl_profile_apply_status` to observe progress / terminal
+        // state. Rationale: a cold-pod apply spans ~15-20 min and the
+        // blocking path previously locked the MCP tool call for the full
+        // duration with no progress signal (2026-04-22 accident).
+        let task_id = svc.run_background(
+            plan,
+            secrets,
+            self.apply_registry.clone(),
+            req.pod_id.clone(),
+        );
+        let body = serde_json::json!({
+            "task_id": task_id,
+            "pod_id": req.pod_id,
+            "status": "running",
+            "poll_with": format!("vdsl_profile_apply_status(task_id: \"{task_id}\")"),
+        });
+        let text = serde_json::to_string_pretty(&body)
+            .map_err(|e| McpError::internal_error(format!("serialize response: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[tool(
+        name = "vdsl_profile_apply_status",
+        description = "[profile] Poll the status of a background vdsl_profile_apply task. \
+            Returns a snapshot: { status ∈ \"running\"|\"ok\"|\"failed\", completed_steps/total_steps, \
+            current_step, results[], started_at_ms, finished_at_ms, error? }. \
+            Returns after each poll (cheap — in-process state, no SSH). Safe to call repeatedly; \
+            terminal entries stay in the registry for the MCP process lifetime.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn profile_apply_status(
+        &self,
+        Parameters(req): Parameters<VdslProfileApplyStatusRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let snap = self.apply_registry.snapshot(&req.task_id).await;
+        match snap {
+            Some(state) => {
+                let body = serde_json::to_string_pretty(&state)
+                    .map_err(|e| McpError::internal_error(format!("serialize state: {e}"), None))?;
+                Ok(CallToolResult::success(vec![Content::text(body)]))
+            }
+            None => Err(McpError::invalid_params(
+                format!("unknown apply task_id: {}", req.task_id),
+                None,
+            )),
+        }
+    }
+
+    #[tool(
+        name = "vdsl_batch_tools",
+        description = "[batch] Execute a pre-built BatchPlan against this server. \
+            Accepts mode ∈ {\"seq\",\"dag\"}. __result:step_id.field and __secret:NAME placeholders \
+            are resolved at dispatch time. Normally invoked via vdsl_profile_apply; direct use \
+            is for hand-crafted plans. Returns BatchResult JSON.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn batch_tools(
+        &self,
+        Parameters(req): Parameters<VdslBatchToolsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::application::batch_service::BatchService;
+        use crate::application::profile_service::BatchPlan;
+
+        let plan: BatchPlan = serde_json::from_value(req.plan)
+            .map_err(|e| McpError::invalid_params(format!("plan parse: {e}"), None))?;
+
+        let svc = BatchService::new(self.clone());
+        let result = svc
+            .execute(plan, req.secrets)
+            .await
+            .map_err(|e| McpError::internal_error(format!("batch execute: {e}"), None))?;
+
+        let body = serde_json::to_string_pretty(&result)
+            .map_err(|e| McpError::internal_error(format!("serialize result: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 }
 
