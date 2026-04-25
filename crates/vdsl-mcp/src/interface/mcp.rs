@@ -3497,7 +3497,7 @@ impl VdslMcpServer {
 
         if let Some(mt) = req.model_type {
             if let Some(s) = mt.to_civitai_type() {
-                url.push_str(&format!("&type={s}"));
+                url.push_str(&format!("&types={s}"));
             }
         }
         if let Some(sort) = req.sort {
