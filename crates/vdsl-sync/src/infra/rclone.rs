@@ -640,10 +640,7 @@ impl StorageBackend for RcloneBackend {
                         "(apt-get update -qq && apt-get install -y -qq unzip)) && ",
                         "curl -sL https://rclone.org/install.sh | bash",
                     );
-                    let fallback = self
-                        .shell
-                        .exec_script(fallback_script, Some(180))
-                        .await;
+                    let fallback = self.shell.exec_script(fallback_script, Some(180)).await;
                     match &fallback {
                         Ok(o) if o.success => {
                             tracing::info!("rclone installed successfully via install.sh");

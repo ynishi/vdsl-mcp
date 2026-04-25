@@ -105,6 +105,23 @@ impl ModelType {
         }
     }
 
+    /// Converts a CivitAI `type` field string to the corresponding `ModelType`.
+    ///
+    /// Performs case-insensitive matching against known CivitAI type strings.
+    /// Returns `Unknown` for unrecognized or empty strings.
+    pub fn from_civitai_type(s: &str) -> Self {
+        let lower = s.to_lowercase();
+        match lower.as_str() {
+            "checkpoint" => Self::Checkpoint,
+            "lora" => Self::Lora,
+            "controlnet" => Self::Controlnet,
+            "vae" => Self::Vae,
+            "upscaler" => Self::Upscale,
+            "textualinversion" => Self::Embedding,
+            _ => Self::Unknown,
+        }
+    }
+
     /// Infers a model type from an archive path and optional file size.
     ///
     /// The inference chain is:
@@ -273,6 +290,21 @@ impl BaseModel {
             Self::Sd15
         } else {
             Self::Unknown
+        }
+    }
+
+    /// Returns the CivitAI `baseModels` query parameter string for this base model.
+    ///
+    /// Returns `None` for `Unknown` (omit the `&baseModels=` parameter).
+    pub fn to_civitai_str(&self) -> Option<&'static str> {
+        match self {
+            Self::Pony => Some("Pony"),
+            Self::Illustrious => Some("Illustrious"),
+            Self::Noobai => Some("NoobAI"),
+            Self::Sdxl => Some("SDXL 1.0"),
+            Self::Sd15 => Some("SD 1.5"),
+            Self::Flux => Some("Flux.1 D"),
+            Self::Unknown => None,
         }
     }
 }
@@ -854,6 +886,51 @@ mod tests {
         assert_eq!(ModelType::Unknown.to_civitai_type(), None);
     }
 
+    // =========================================================================
+    // T1 — Happy path: ModelType::from_civitai_type
+    // =========================================================================
+
+    #[test]
+    fn model_type_from_civitai_type_happy_path() {
+        assert_eq!(
+            ModelType::from_civitai_type("Checkpoint"),
+            ModelType::Checkpoint
+        );
+        assert_eq!(ModelType::from_civitai_type("LORA"), ModelType::Lora);
+        assert_eq!(
+            ModelType::from_civitai_type("Controlnet"),
+            ModelType::Controlnet
+        );
+        assert_eq!(ModelType::from_civitai_type("VAE"), ModelType::Vae);
+        assert_eq!(ModelType::from_civitai_type("Upscaler"), ModelType::Upscale);
+        assert_eq!(
+            ModelType::from_civitai_type("TextualInversion"),
+            ModelType::Embedding
+        );
+    }
+
+    // T2 — Edge: case-insensitive matching
+    #[test]
+    fn model_type_from_civitai_type_case_insensitive() {
+        assert_eq!(
+            ModelType::from_civitai_type("checkpoint"),
+            ModelType::Checkpoint
+        );
+        assert_eq!(ModelType::from_civitai_type("lora"), ModelType::Lora);
+        assert_eq!(
+            ModelType::from_civitai_type("CHECKPOINT"),
+            ModelType::Checkpoint
+        );
+    }
+
+    // T3 — Error path: unrecognized or empty returns Unknown
+    #[test]
+    fn model_type_from_civitai_type_unknown_fallback() {
+        assert_eq!(ModelType::from_civitai_type(""), ModelType::Unknown);
+        assert_eq!(ModelType::from_civitai_type("FooBar"), ModelType::Unknown);
+        assert_eq!(ModelType::from_civitai_type("clip"), ModelType::Unknown);
+    }
+
     // T3 — All() smoke: every concrete variant has a defined as_dir_key
 
     #[test]
@@ -1033,5 +1110,24 @@ mod tests {
         assert!(json.contains("\"lora\""));
         assert!(json.contains("\"sdxl\""));
         assert!(json.contains("\"remote\""));
+    }
+
+    // =========================================================================
+    // BaseModel::to_civitai_str
+    // =========================================================================
+
+    #[test]
+    fn base_model_to_civitai_str_known_variants() {
+        assert_eq!(BaseModel::Pony.to_civitai_str(), Some("Pony"));
+        assert_eq!(BaseModel::Illustrious.to_civitai_str(), Some("Illustrious"));
+        assert_eq!(BaseModel::Noobai.to_civitai_str(), Some("NoobAI"));
+        assert_eq!(BaseModel::Sdxl.to_civitai_str(), Some("SDXL 1.0"));
+        assert_eq!(BaseModel::Sd15.to_civitai_str(), Some("SD 1.5"));
+        assert_eq!(BaseModel::Flux.to_civitai_str(), Some("Flux.1 D"));
+    }
+
+    #[test]
+    fn base_model_to_civitai_str_unknown_is_none() {
+        assert_eq!(BaseModel::Unknown.to_civitai_str(), None);
     }
 }

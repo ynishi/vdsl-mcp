@@ -624,7 +624,9 @@ mod tests {
     #[test]
     fn validate_rejects_control_chars() {
         // Newline could break out of rclone batch heredoc → shell injection.
-        assert!(TransferRoute::validate_relative_path("evil\n__VDSL_EOF__\nrm -rf ~\n.png").is_err());
+        assert!(
+            TransferRoute::validate_relative_path("evil\n__VDSL_EOF__\nrm -rf ~\n.png").is_err()
+        );
         assert!(TransferRoute::validate_relative_path("foo\nbar.png").is_err());
         assert!(TransferRoute::validate_relative_path("foo\rbar.png").is_err());
         assert!(TransferRoute::validate_relative_path("foo\tbar.png").is_err());
