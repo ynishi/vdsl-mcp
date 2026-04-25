@@ -23,7 +23,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::application::pod_service::{resolve_api_key, PodService};
 use crate::application::storage_service::{self, StorageService, RCLONE_OP_TIMEOUT_SECS};
-use crate::domain::models::{format_model_catalog_with_limit, parse_model_catalog, ModelType};
+use crate::domain::models::{
+    catalog_to_search_results, format_model_catalog_with_limit, parse_model_catalog, ModelType,
+};
 use crate::domain::models::{BaseModel, ModelSearchResult, Scope};
 use crate::domain::pod::{format_pod_list, format_volume_list};
 use crate::infra::comfyui_client::{proxy_url, ComfyUiClient};
@@ -3341,8 +3343,9 @@ impl VdslMcpServer {
                     )),
                 }
             }
-            Scope::Pod | Scope::Archive => Err(McpError::invalid_params(
-                "scope=pod is not yet implemented in this subtask, will be added in next subtask",
+            Scope::Pod => self.search_pod(&req).await,
+            Scope::Archive => Err(McpError::invalid_params(
+                "scope=archive is not yet implemented",
                 None,
             )),
         }
@@ -3427,6 +3430,53 @@ impl VdslMcpServer {
             McpError::internal_error(format!("serialize ModelSearchResult failed: {e}"), None)
         })?;
         Ok(CallToolResult::success(vec![Content::text(json_str)]))
+    }
+
+    /// Search models available on the currently connected pod via ComfyUI `/object_info`.
+    ///
+    /// Uses the session's last connected ComfyUI URL (`resolve_comfyui_url(None, None)`).
+    /// Applies `req.query` as a case-insensitive filename substring filter (empty = all).
+    /// Post-filters by `req.model_type` and `req.base` if set, then truncates to `req.limit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `McpError::internal_error` if no ComfyUI URL is available in the session,
+    /// the ComfyUI client cannot be created, `/object_info` HTTP request fails,
+    /// or the result serialization fails.
+    async fn search_pod(&self, req: &VdslModelSearchRequest) -> Result<CallToolResult, McpError> {
+        let url = self.resolve_comfyui_url(None, None)?;
+        let client = Self::comfyui_client(url)?;
+        let object_info = client.object_info().await.map_err(Self::to_mcp_error)?;
+        let catalog = parse_model_catalog(&object_info);
+        let base_dir = comfyui_models_base();
+
+        let mut results = catalog_to_search_results(&catalog, &base_dir);
+
+        // Apply query as case-insensitive filename substring filter (empty = all).
+        let query_lower = req.query.trim().to_lowercase();
+        if !query_lower.is_empty() {
+            results.retain(|r| r.name.to_lowercase().contains(&query_lower));
+        }
+
+        // Post-filter by model_type.
+        if let Some(mt) = req.model_type {
+            results.retain(|r| r.model_type == mt);
+        }
+
+        // Post-filter by base model.
+        if let Some(b) = req.base {
+            results.retain(|r| r.base == b);
+        }
+
+        // Truncate to limit.
+        let limit = req.limit.unwrap_or(DEFAULT_LIST_LIMIT as u32) as usize;
+        results.truncate(limit);
+
+        let json = serde_json::to_string_pretty(&results).map_err(|e| {
+            tracing::warn!(error = %e, "Failed to serialize pod ModelSearchResult list");
+            McpError::internal_error(format!("serialize ModelSearchResult failed: {e}"), None)
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
     #[tool(

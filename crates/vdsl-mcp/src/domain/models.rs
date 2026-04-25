@@ -610,6 +610,57 @@ pub fn format_preflight_report(required: &RequiredModels, missing: &RequiredMode
     out
 }
 
+// =============================================================================
+// Pod scope helper
+// =============================================================================
+
+/// Convert a [`ModelCatalog`] to a flat list of [`ModelSearchResult`] for pod scope search.
+///
+/// Each catalog category maps to the corresponding [`ModelType`]:
+/// `checkpoints`→`Checkpoint`, `loras`→`Lora`, `vaes`→`Vae`,
+/// `controlnets`→`Controlnet`, `upscalers`→`Upscale`.
+///
+/// The `location` field is built as `{base_dir}/{dir_key}/{name}` using
+/// [`ModelType::as_dir_key`] for the asymmetric dir name mapping.
+///
+/// `obtain` is always `None` because pod models are already available on the pod.
+///
+/// # Arguments
+///
+/// * `catalog` — Model catalog produced by [`parse_model_catalog`].
+/// * `base_dir` — ComfyUI models root path (e.g. from `comfyui_models_base()`).
+///
+/// # Returns
+///
+/// A `Vec<ModelSearchResult>` with one entry per model name across all catalog categories.
+pub fn catalog_to_search_results(catalog: &ModelCatalog, base_dir: &str) -> Vec<ModelSearchResult> {
+    let categories: &[(&[String], ModelType)] = &[
+        (&catalog.checkpoints, ModelType::Checkpoint),
+        (&catalog.loras, ModelType::Lora),
+        (&catalog.vaes, ModelType::Vae),
+        (&catalog.controlnets, ModelType::Controlnet),
+        (&catalog.upscalers, ModelType::Upscale),
+    ];
+    let mut results = Vec::new();
+    for (names, mt) in categories {
+        for name in *names {
+            let base = BaseModel::from_filename(name);
+            let location = format!("{}/{}/{}", base_dir, mt.as_dir_key(), name);
+            results.push(ModelSearchResult {
+                name: name.clone(),
+                model_type: *mt,
+                base,
+                scope: Scope::Pod,
+                size_bytes: None,
+                location,
+                obtain: None,
+                metadata: serde_json::Value::Null,
+            });
+        }
+    }
+    results
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1129,5 +1180,144 @@ mod tests {
     #[test]
     fn base_model_to_civitai_str_unknown_is_none() {
         assert_eq!(BaseModel::Unknown.to_civitai_str(), None);
+    }
+
+    // =========================================================================
+    // catalog_to_search_results
+    // =========================================================================
+
+    fn sample_catalog() -> ModelCatalog {
+        ModelCatalog {
+            checkpoints: vec![
+                "realistic_v5.safetensors".to_string(),
+                "sdxl_base.safetensors".to_string(),
+            ],
+            loras: vec!["pony_lora_v2.safetensors".to_string()],
+            vaes: vec!["vae-ft-mse.safetensors".to_string()],
+            controlnets: vec!["control_v11p_sd15_canny.pth".to_string()],
+            upscalers: vec!["4x-UltraSharp.pth".to_string()],
+            node_types: vec![],
+        }
+    }
+
+    // T1 — Happy path: each category maps to correct ModelType
+
+    #[test]
+    fn catalog_to_search_results_checkpoint_type() {
+        let catalog = sample_catalog();
+        let results = catalog_to_search_results(&catalog, "/models");
+        let cp: Vec<_> = results
+            .iter()
+            .filter(|r| r.model_type == ModelType::Checkpoint)
+            .collect();
+        assert_eq!(cp.len(), 2, "expected 2 checkpoints");
+        assert!(cp.iter().any(|r| r.name == "realistic_v5.safetensors"));
+        assert!(cp.iter().any(|r| r.name == "sdxl_base.safetensors"));
+        // All have scope=Pod and obtain=None
+        assert!(cp.iter().all(|r| r.scope == Scope::Pod));
+        assert!(cp.iter().all(|r| r.obtain.is_none()));
+    }
+
+    #[test]
+    fn catalog_to_search_results_lora_type() {
+        let catalog = sample_catalog();
+        let results = catalog_to_search_results(&catalog, "/models");
+        let loras: Vec<_> = results
+            .iter()
+            .filter(|r| r.model_type == ModelType::Lora)
+            .collect();
+        assert_eq!(loras.len(), 1);
+        assert_eq!(loras[0].name, "pony_lora_v2.safetensors");
+        // base should be Pony (substring "pony")
+        assert_eq!(loras[0].base, BaseModel::Pony);
+    }
+
+    #[test]
+    fn catalog_to_search_results_vae_and_controlnet_types() {
+        let catalog = sample_catalog();
+        let results = catalog_to_search_results(&catalog, "/models");
+        let vaes: Vec<_> = results
+            .iter()
+            .filter(|r| r.model_type == ModelType::Vae)
+            .collect();
+        assert_eq!(vaes.len(), 1);
+        let cnets: Vec<_> = results
+            .iter()
+            .filter(|r| r.model_type == ModelType::Controlnet)
+            .collect();
+        assert_eq!(cnets.len(), 1);
+        let upscalers: Vec<_> = results
+            .iter()
+            .filter(|r| r.model_type == ModelType::Upscale)
+            .collect();
+        assert_eq!(upscalers.len(), 1);
+    }
+
+    #[test]
+    fn catalog_to_search_results_location_uses_dir_key() {
+        let catalog = sample_catalog();
+        let results = catalog_to_search_results(&catalog, "/root/models");
+        // checkpoint → "checkpoints" dir
+        let cp = results
+            .iter()
+            .find(|r| r.model_type == ModelType::Checkpoint)
+            .unwrap();
+        assert!(
+            cp.location.contains("/checkpoints/"),
+            "location: {}",
+            cp.location
+        );
+        // upscaler → "upscale_models" dir (asymmetric mapping)
+        let up = results
+            .iter()
+            .find(|r| r.model_type == ModelType::Upscale)
+            .unwrap();
+        assert!(
+            up.location.contains("/upscale_models/"),
+            "location: {}",
+            up.location
+        );
+        // vae → "vae" dir
+        let vae = results
+            .iter()
+            .find(|r| r.model_type == ModelType::Vae)
+            .unwrap();
+        assert!(vae.location.contains("/vae/"), "location: {}", vae.location);
+    }
+
+    // T2 — Edge: empty catalog produces empty results
+
+    #[test]
+    fn catalog_to_search_results_empty_catalog() {
+        let catalog = ModelCatalog {
+            checkpoints: vec![],
+            loras: vec![],
+            vaes: vec![],
+            controlnets: vec![],
+            upscalers: vec![],
+            node_types: vec![],
+        };
+        let results = catalog_to_search_results(&catalog, "/models");
+        assert!(results.is_empty());
+    }
+
+    // T3 — Error path: sdxl substring in checkpoint name → BaseModel::Sdxl
+
+    #[test]
+    fn catalog_to_search_results_base_inference_from_name() {
+        let catalog = ModelCatalog {
+            checkpoints: vec!["sdxl_turbo.safetensors".to_string()],
+            loras: vec![],
+            vaes: vec![],
+            controlnets: vec![],
+            upscalers: vec![],
+            node_types: vec![],
+        };
+        let results = catalog_to_search_results(&catalog, "/models");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].base, BaseModel::Sdxl);
+        assert_eq!(results[0].model_type, ModelType::Checkpoint);
+        assert_eq!(results[0].size_bytes, None);
+        assert_eq!(results[0].metadata, serde_json::Value::Null);
     }
 }
