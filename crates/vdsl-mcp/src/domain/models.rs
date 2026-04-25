@@ -2,7 +2,313 @@
 //!
 //! Mirrors Lua `RESOURCE_MAP` in `registry.lua` L13-19.
 
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::domain::error::DomainError;
+
+// =============================================================================
+// Size threshold constants for archive type inference
+// =============================================================================
+
+/// Minimum size (bytes) for a checkpoint model (2 GB).
+pub const ARCHIVE_SIZE_CP_MIN: u64 = 2 * 1024 * 1024 * 1024;
+/// Maximum size (bytes) for a checkpoint model (8 GB).
+pub const ARCHIVE_SIZE_CP_MAX: u64 = 8 * 1024 * 1024 * 1024;
+/// Minimum size (bytes) for a LoRA model (50 MB).
+pub const ARCHIVE_SIZE_LORA_MIN: u64 = 50 * 1024 * 1024;
+/// Maximum size (bytes) for a LoRA model (500 MB).
+pub const ARCHIVE_SIZE_LORA_MAX: u64 = 500 * 1024 * 1024;
+/// Minimum size (bytes) for a VAE model (300 MB).
+pub const ARCHIVE_SIZE_VAE_MIN: u64 = 300 * 1024 * 1024;
+/// Maximum size (bytes) for a VAE model (800 MB).
+pub const ARCHIVE_SIZE_VAE_MAX: u64 = 800 * 1024 * 1024;
+
+// =============================================================================
+// Unified model type enum (Single Source of Truth, replaces MODEL_DIRS const)
+// =============================================================================
+
+/// Model type covering all 8 ComfyUI model categories.
+///
+/// This is the Single Source of Truth for model category → directory name mapping.
+/// Replaces the old `MODEL_DIRS` const table in `mcp.rs`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelType {
+    /// Stable Diffusion checkpoint (main model file).
+    Checkpoint,
+    /// LoRA fine-tuning adapter.
+    Lora,
+    /// Variational AutoEncoder.
+    Vae,
+    /// Textual Inversion embedding.
+    Embedding,
+    /// ControlNet conditioning model.
+    Controlnet,
+    /// Image upscaler (e.g. RealESRGAN).
+    Upscale,
+    /// CLIP text encoder.
+    Clip,
+    /// UNet diffusion backbone.
+    Unet,
+    /// Unknown or unrecognized model type.
+    #[default]
+    Unknown,
+}
+
+impl ModelType {
+    /// Returns the ComfyUI model directory name for this type.
+    ///
+    /// Encodes the asymmetric mapping: `Upscale` key → `"upscale_models"` dir.
+    /// Used by `vdsl_download`, `vdsl_storage_pull/push/archive`, and archive dir inference.
+    pub const fn as_dir_key(&self) -> &'static str {
+        match self {
+            Self::Checkpoint => "checkpoints",
+            Self::Lora => "loras",
+            Self::Vae => "vae",
+            Self::Embedding => "embeddings",
+            Self::Controlnet => "controlnet",
+            Self::Upscale => "upscale_models",
+            Self::Clip => "clip",
+            Self::Unet => "unet",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Returns all concrete (non-Unknown) variants for iteration.
+    pub const fn all() -> &'static [ModelType; 8] {
+        &[
+            Self::Checkpoint,
+            Self::Lora,
+            Self::Vae,
+            Self::Embedding,
+            Self::Controlnet,
+            Self::Upscale,
+            Self::Clip,
+            Self::Unet,
+        ]
+    }
+
+    /// Returns the CivitAI `type` query parameter value for this model type.
+    ///
+    /// Returns `None` for `Clip`, `Unet`, and `Unknown` because CivitAI does not
+    /// have a direct equivalent; the `&type=` parameter is omitted in that case.
+    pub fn to_civitai_type(self) -> Option<&'static str> {
+        match self {
+            Self::Checkpoint => Some("Checkpoint"),
+            Self::Lora => Some("LORA"),
+            Self::Controlnet => Some("Controlnet"),
+            Self::Vae => Some("VAE"),
+            Self::Upscale => Some("Upscaler"),
+            Self::Embedding => Some("TextualInversion"),
+            Self::Clip | Self::Unet | Self::Unknown => None,
+        }
+    }
+
+    /// Infers a model type from an archive path and optional file size.
+    ///
+    /// The inference chain is:
+    /// 1. Directory name segment (e.g. `/checkpoints/` in the path).
+    /// 2. File size range thresholds (CP/LoRA/VAE bands).
+    /// 3. `Unknown` fallback.
+    ///
+    /// This is intentionally infallible; callers do not need to handle errors.
+    pub fn from_archive_path_and_size(path: &str, size: Option<u64>) -> Self {
+        // Step 1: dir name segment match
+        let path_lower = path.to_lowercase();
+        let dir_candidates = [
+            ("checkpoints", Self::Checkpoint),
+            ("loras", Self::Lora),
+            ("controlnet", Self::Controlnet),
+            ("vae", Self::Vae),
+            ("upscale_models", Self::Upscale),
+            ("upscale", Self::Upscale),
+            ("embeddings", Self::Embedding),
+            ("clip", Self::Clip),
+            ("unet", Self::Unet),
+        ];
+        for (segment, variant) in &dir_candidates {
+            if path_lower.contains(&format!("/{segment}/"))
+                || path_lower.starts_with(&format!("{segment}/"))
+                || path_lower.ends_with(&format!("/{segment}"))
+                || path_lower == *segment
+            {
+                return *variant;
+            }
+        }
+
+        // Step 2: size range fallback
+        if let Some(sz) = size {
+            if (ARCHIVE_SIZE_CP_MIN..=ARCHIVE_SIZE_CP_MAX).contains(&sz) {
+                return Self::Checkpoint;
+            }
+            if (ARCHIVE_SIZE_LORA_MIN..=ARCHIVE_SIZE_LORA_MAX).contains(&sz) {
+                return Self::Lora;
+            }
+            if (ARCHIVE_SIZE_VAE_MIN..=ARCHIVE_SIZE_VAE_MAX).contains(&sz) {
+                return Self::Vae;
+            }
+        }
+
+        // Step 3: unknown
+        Self::Unknown
+    }
+
+    /// Returns the ComfyUI loader node name for this type, if applicable.
+    ///
+    /// Used to absorb `RESOURCE_MAP` entries into the enum.
+    /// Returns `None` for types without a direct ComfyUI loader (Clip, Unet, Unknown).
+    pub const fn comfyui_loader(&self) -> Option<&'static str> {
+        match self {
+            Self::Checkpoint => Some("CheckpointLoaderSimple"),
+            Self::Lora => Some("LoraLoader"),
+            Self::Vae => Some("VAELoader"),
+            Self::Controlnet => Some("ControlNetLoader"),
+            Self::Upscale => Some("UpscaleModelLoader"),
+            Self::Embedding | Self::Clip | Self::Unet | Self::Unknown => None,
+        }
+    }
+
+    /// Maps a ComfyUI node loader class name to the corresponding `ModelType`.
+    ///
+    /// Returns `None` if the loader name is not recognized.
+    pub fn from_comfyui_loader(name: &str) -> Option<Self> {
+        Self::all()
+            .iter()
+            .find(|t| t.comfyui_loader() == Some(name))
+            .copied()
+    }
+}
+
+impl TryFrom<&str> for ModelType {
+    type Error = DomainError;
+
+    /// Converts a dir-key string (e.g. `"checkpoints"`, `"loras"`) to `ModelType`.
+    ///
+    /// The key space is the left-hand side of the old `MODEL_DIRS` table.
+    /// `"upscale"` (the key) maps to `Upscale`; `"upscale_models"` (the dir) is not a valid key.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DomainError::ModelTypeParse` for unrecognized keys.
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "checkpoints" => Ok(Self::Checkpoint),
+            "loras" => Ok(Self::Lora),
+            "controlnet" => Ok(Self::Controlnet),
+            "vae" => Ok(Self::Vae),
+            "upscale" => Ok(Self::Upscale),
+            "embeddings" => Ok(Self::Embedding),
+            "clip" => Ok(Self::Clip),
+            "unet" => Ok(Self::Unet),
+            other => Err(DomainError::ModelTypeParse(other.to_string())),
+        }
+    }
+}
+
+// =============================================================================
+// Scope enum
+// =============================================================================
+
+/// Search scope for `vdsl_model_search`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    /// Search CivitAI (or other remote marketplace).
+    #[default]
+    Remote,
+    /// Search B2 cold-storage archive bucket.
+    Archive,
+    /// Search models currently available on the RunPod pod (ComfyUI).
+    Pod,
+}
+
+// =============================================================================
+// BaseModel enum
+// =============================================================================
+
+/// Base model / architecture of a generative model.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BaseModel {
+    /// Pony Diffusion base.
+    Pony,
+    /// Illustrious base.
+    Illustrious,
+    /// NoobAI base.
+    Noobai,
+    /// Stable Diffusion XL.
+    Sdxl,
+    /// Stable Diffusion 1.5.
+    Sd15,
+    /// Flux base model.
+    Flux,
+    /// Unknown or unrecognized base model.
+    #[default]
+    Unknown,
+}
+
+impl BaseModel {
+    /// Infers the base model from a filename using case-insensitive substring matching.
+    ///
+    /// Matching priority (first match wins):
+    /// `illustrious` → `pony` → `noobai` → `flux` → `sdxl` → `sd15`.
+    /// Falls back to `Unknown` if no substring matches.
+    ///
+    /// This is intentionally infallible.
+    pub fn from_filename(name: &str) -> Self {
+        let lower = name.to_lowercase();
+        // Order matters: longer/more-specific first to avoid shadowing
+        if lower.contains("illustrious") {
+            Self::Illustrious
+        } else if lower.contains("pony") {
+            Self::Pony
+        } else if lower.contains("noobai") {
+            Self::Noobai
+        } else if lower.contains("flux") {
+            Self::Flux
+        } else if lower.contains("sdxl") {
+            Self::Sdxl
+        } else if lower.contains("sd15") || lower.contains("sd_1.5") || lower.contains("sd-1.5") {
+            Self::Sd15
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+// =============================================================================
+// ModelSearchResult struct
+// =============================================================================
+
+/// Unified search result returned by `vdsl_model_search` across all scopes.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ModelSearchResult {
+    /// Human-readable model name (filename or model title).
+    pub name: String,
+
+    /// Model type (checkpoint, lora, vae, etc.).
+    pub model_type: ModelType,
+
+    /// Base model / architecture.
+    pub base: BaseModel,
+
+    /// Search scope that produced this result (remote / archive / pod).
+    pub scope: Scope,
+
+    /// File size in bytes, if known.
+    pub size_bytes: Option<u64>,
+
+    /// Location string (URL, bucket path, or pod filesystem path).
+    pub location: String,
+
+    /// Suggested obtain command (e.g. `vdsl_download source=cv:ID target=checkpoints`).
+    /// `None` when the model is already available (scope=pod).
+    pub obtain: Option<String>,
+
+    /// Free-form metadata payload (CivitAI version object, rclone entry, etc.).
+    pub metadata: serde_json::Value,
+}
 
 /// Resource mapping: ComfyUI node type → input field → category key.
 const RESOURCE_MAP: &[(&str, &str, &str)] = &[
@@ -442,5 +748,290 @@ mod tests {
         assert!(text.contains("# ControlNets (0)"));
         assert!(text.contains("(none)"));
         assert!(text.contains("sd_v1-5.safetensors"));
+    }
+
+    // =========================================================================
+    // T1 — Happy path: BaseModel::from_filename
+    // =========================================================================
+
+    #[test]
+    fn base_model_from_filename_happy_path() {
+        assert_eq!(
+            BaseModel::from_filename("pony_v6.safetensors"),
+            BaseModel::Pony
+        );
+        assert_eq!(
+            BaseModel::from_filename("illustrious_xl.safetensors"),
+            BaseModel::Illustrious
+        );
+        assert_eq!(
+            BaseModel::from_filename("noobAI_v1.safetensors"),
+            BaseModel::Noobai
+        );
+        assert_eq!(
+            BaseModel::from_filename("flux_schnell.safetensors"),
+            BaseModel::Flux
+        );
+        assert_eq!(
+            BaseModel::from_filename("sdxl_base_1.0.safetensors"),
+            BaseModel::Sdxl
+        );
+        assert_eq!(
+            BaseModel::from_filename("sd15_realisticVision.safetensors"),
+            BaseModel::Sd15
+        );
+    }
+
+    // T2 — Edge: case-insensitive, exact unknown, alternative sd15 variants
+
+    #[test]
+    fn base_model_from_filename_case_insensitive() {
+        assert_eq!(
+            BaseModel::from_filename("PONY_V6.SAFETENSORS"),
+            BaseModel::Pony
+        );
+        assert_eq!(
+            BaseModel::from_filename("FLUX_DEV.SAFETENSORS"),
+            BaseModel::Flux
+        );
+    }
+
+    #[test]
+    fn base_model_from_filename_unknown_for_unrecognized() {
+        assert_eq!(
+            BaseModel::from_filename("v1-5-pruned.ckpt"),
+            BaseModel::Unknown
+        );
+        assert_eq!(BaseModel::from_filename(""), BaseModel::Unknown);
+    }
+
+    #[test]
+    fn base_model_from_filename_sd15_variants() {
+        assert_eq!(
+            BaseModel::from_filename("sd_1.5_model.safetensors"),
+            BaseModel::Sd15
+        );
+        assert_eq!(
+            BaseModel::from_filename("sd-1.5-model.safetensors"),
+            BaseModel::Sd15
+        );
+    }
+
+    // T3 — Error path: Unknown is the fallback, never panics on empty or garbage
+
+    #[test]
+    fn base_model_from_filename_no_panic_garbage() {
+        // Must not panic on unusual input (ASCII-only garbage string)
+        let result = std::panic::catch_unwind(|| BaseModel::from_filename("@@## garbage **!!"));
+        // Safety: catch_unwind is test-only, assert is safe after is_ok check
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), BaseModel::Unknown);
+    }
+
+    // =========================================================================
+    // T1 — Happy path: ModelType::to_civitai_type
+    // =========================================================================
+
+    #[test]
+    fn model_type_to_civitai_type_happy_path() {
+        assert_eq!(ModelType::Checkpoint.to_civitai_type(), Some("Checkpoint"));
+        assert_eq!(ModelType::Lora.to_civitai_type(), Some("LORA"));
+        assert_eq!(ModelType::Vae.to_civitai_type(), Some("VAE"));
+        assert_eq!(
+            ModelType::Embedding.to_civitai_type(),
+            Some("TextualInversion")
+        );
+        assert_eq!(ModelType::Controlnet.to_civitai_type(), Some("Controlnet"));
+        assert_eq!(ModelType::Upscale.to_civitai_type(), Some("Upscaler"));
+    }
+
+    // T2 — Edge: Clip / Unet / Unknown return None
+
+    #[test]
+    fn model_type_to_civitai_type_none_for_unsupported() {
+        assert_eq!(ModelType::Clip.to_civitai_type(), None);
+        assert_eq!(ModelType::Unet.to_civitai_type(), None);
+        assert_eq!(ModelType::Unknown.to_civitai_type(), None);
+    }
+
+    // T3 — All() smoke: every concrete variant has a defined as_dir_key
+
+    #[test]
+    fn model_type_all_as_dir_key_exhaustive() {
+        for t in ModelType::all() {
+            let key = t.as_dir_key();
+            assert!(
+                !key.is_empty(),
+                "as_dir_key should never be empty for concrete variant"
+            );
+        }
+        assert_eq!(ModelType::all().len(), 8);
+    }
+
+    // =========================================================================
+    // T1 — Happy path: TryFrom<&str> for ModelType
+    // =========================================================================
+
+    #[test]
+    fn model_type_try_from_valid_keys() {
+        assert_eq!(
+            ModelType::try_from("checkpoints").unwrap(),
+            ModelType::Checkpoint
+        );
+        assert_eq!(ModelType::try_from("loras").unwrap(), ModelType::Lora);
+        assert_eq!(
+            ModelType::try_from("controlnet").unwrap(),
+            ModelType::Controlnet
+        );
+        assert_eq!(ModelType::try_from("vae").unwrap(), ModelType::Vae);
+        assert_eq!(ModelType::try_from("upscale").unwrap(), ModelType::Upscale);
+        assert_eq!(
+            ModelType::try_from("embeddings").unwrap(),
+            ModelType::Embedding
+        );
+        assert_eq!(ModelType::try_from("clip").unwrap(), ModelType::Clip);
+        assert_eq!(ModelType::try_from("unet").unwrap(), ModelType::Unet);
+    }
+
+    // T2 — Edge: dir name (not key) is not a valid key
+
+    #[test]
+    fn model_type_try_from_dir_name_is_not_key() {
+        // "upscale_models" is the dir name; "upscale" is the key
+        assert!(ModelType::try_from("upscale_models").is_err());
+        // "checkpoints" is both key and dir name — should succeed
+        assert!(ModelType::try_from("checkpoints").is_ok());
+    }
+
+    // T3 — Error path: unknown key returns Err with the unknown string
+
+    #[test]
+    fn model_type_try_from_unknown_key_returns_err() {
+        let err = ModelType::try_from("foobar").unwrap_err();
+        // Error message should reference the unknown key
+        assert!(err.to_string().contains("foobar"));
+    }
+
+    #[test]
+    fn model_type_try_from_empty_key_returns_err() {
+        assert!(ModelType::try_from("").is_err());
+    }
+
+    // =========================================================================
+    // T1 — Happy path: ModelType::from_archive_path_and_size — dir detection
+    // =========================================================================
+
+    #[test]
+    fn model_type_from_archive_path_dir_segment() {
+        assert_eq!(
+            ModelType::from_archive_path_and_size("/models/checkpoints/foo.safetensors", None),
+            ModelType::Checkpoint
+        );
+        assert_eq!(
+            ModelType::from_archive_path_and_size("/models/loras/bar.safetensors", None),
+            ModelType::Lora
+        );
+        assert_eq!(
+            ModelType::from_archive_path_and_size("/models/upscale_models/esrgan.pth", None),
+            ModelType::Upscale
+        );
+    }
+
+    // T2 — Edge: size fallback when no dir match
+
+    #[test]
+    fn model_type_from_archive_path_size_fallback() {
+        // Size in CP range (4 GB)
+        assert_eq!(
+            ModelType::from_archive_path_and_size(
+                "somefile.safetensors",
+                Some(4 * 1024 * 1024 * 1024)
+            ),
+            ModelType::Checkpoint
+        );
+        // Size in LoRA range (100 MB)
+        assert_eq!(
+            ModelType::from_archive_path_and_size("somefile.safetensors", Some(100 * 1024 * 1024)),
+            ModelType::Lora
+        );
+        // Size in VAE range (600 MB — above LoRA_MAX=500MB, within VAE range 300-800MB)
+        assert_eq!(
+            ModelType::from_archive_path_and_size("somefile.safetensors", Some(600 * 1024 * 1024)),
+            ModelType::Vae
+        );
+    }
+
+    // T3 — Error path: falls back to Unknown when dir and size give no match
+
+    #[test]
+    fn model_type_from_archive_path_unknown_fallback() {
+        // No dir match, size 0
+        assert_eq!(
+            ModelType::from_archive_path_and_size("unknown_file.bin", Some(0)),
+            ModelType::Unknown
+        );
+        // No dir match, no size
+        assert_eq!(
+            ModelType::from_archive_path_and_size("mystery.bin", None),
+            ModelType::Unknown
+        );
+    }
+
+    // =========================================================================
+    // T1 — Happy path: from_comfyui_loader
+    // =========================================================================
+
+    #[test]
+    fn model_type_from_comfyui_loader_happy_path() {
+        assert_eq!(
+            ModelType::from_comfyui_loader("CheckpointLoaderSimple"),
+            Some(ModelType::Checkpoint)
+        );
+        assert_eq!(
+            ModelType::from_comfyui_loader("LoraLoader"),
+            Some(ModelType::Lora)
+        );
+        assert_eq!(
+            ModelType::from_comfyui_loader("VAELoader"),
+            Some(ModelType::Vae)
+        );
+        assert_eq!(
+            ModelType::from_comfyui_loader("ControlNetLoader"),
+            Some(ModelType::Controlnet)
+        );
+        assert_eq!(
+            ModelType::from_comfyui_loader("UpscaleModelLoader"),
+            Some(ModelType::Upscale)
+        );
+    }
+
+    // T2 — Edge: unknown loader returns None
+
+    #[test]
+    fn model_type_from_comfyui_loader_unknown() {
+        assert_eq!(ModelType::from_comfyui_loader("KSampler"), None);
+        assert_eq!(ModelType::from_comfyui_loader(""), None);
+    }
+
+    // =========================================================================
+    // ModelSearchResult serialization roundtrip
+    // =========================================================================
+
+    #[test]
+    fn model_search_result_serializes() {
+        let r = ModelSearchResult {
+            name: "test_model.safetensors".to_string(),
+            model_type: ModelType::Lora,
+            base: BaseModel::Sdxl,
+            scope: Scope::Remote,
+            size_bytes: Some(100 * 1024 * 1024),
+            location: "https://example.com/model".to_string(),
+            obtain: Some("vdsl_download source=cv:123 target=loras".to_string()),
+            metadata: serde_json::json!({"id": 123}),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"lora\""));
+        assert!(json.contains("\"sdxl\""));
+        assert!(json.contains("\"remote\""));
     }
 }
