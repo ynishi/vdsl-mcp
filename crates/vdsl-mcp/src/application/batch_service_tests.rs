@@ -407,7 +407,10 @@ fn build_exec_request_profile_shape_env_prefix_is_deterministic() {
     });
     let req = build_exec_request(&args).expect("must build");
     // Keys are sorted so prefix ordering is deterministic.
-    assert_eq!(req.command, "export ALPHA='first'; export ZED='last'; echo $FOO");
+    assert_eq!(
+        req.command,
+        "export ALPHA='first'; export ZED='last'; echo $FOO"
+    );
 }
 
 #[test]

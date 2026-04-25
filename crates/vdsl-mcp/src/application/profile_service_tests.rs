@@ -149,7 +149,10 @@ fn parse_manifest_rejects_user_supplied_secret_sentinel() {
     match err {
         ProfileError::SecretInUserEnv { key, reason } => {
             assert_eq!(key, "NEUTRAL_NAME");
-            assert!(reason.contains("__secret"), "reason should name the sentinel: {reason}");
+            assert!(
+                reason.contains("__secret"),
+                "reason should name the sentinel: {reason}"
+            );
         }
         other => panic!("expected SecretInUserEnv, got {other:?}"),
     }
@@ -431,8 +434,7 @@ fn expand_phases_rejects_staging_push_path_traversal() {
 fn phase5_staging_push_emits_rclone_copyto_and_secret_sentinels() {
     let m = full_manifest();
     let plan = expand_phases(&m, "abc", false).expect("ok");
-    let script =
-        find_script(&plan, "5_staging_push_0").expect("staging push step present");
+    let script = find_script(&plan, "5_staging_push_0").expect("staging push step present");
     assert!(
         script.contains("rclone copyto"),
         "expected rclone copyto; got: {script}"
@@ -456,7 +458,10 @@ fn phase5_staging_push_emits_rclone_copyto_and_secret_sentinels() {
                         .get("VDSL_B2_KEY_ID")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    let key = env.get("VDSL_B2_KEY").and_then(|v| v.as_str()).unwrap_or("");
+                    let key = env
+                        .get("VDSL_B2_KEY")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     assert_eq!(key_id, "__secret:VDSL_B2_KEY_ID");
                     assert_eq!(key, "__secret:VDSL_B2_KEY");
                     return;
@@ -473,8 +478,7 @@ fn phase5_staging_push_substitutes_pod_id_placeholder() {
     m.staging.as_mut().unwrap().push[0].dst =
         "b2://bucket/staging/{pod_id}/a.safetensors".to_string();
     let plan = expand_phases(&m, "abc", false).expect("ok");
-    let script =
-        find_script(&plan, "5_staging_push_0").expect("staging push step present");
+    let script = find_script(&plan, "5_staging_push_0").expect("staging push step present");
     assert!(
         script.contains("b2:bucket/staging/abc/a.safetensors"),
         "expected {{pod_id}} → abc substitution; got: {script}"
@@ -757,7 +761,14 @@ fn custom_node_pip_true_installs_requirements_with_torch_filter() {
         "expected requirements.txt reference; got: {script}"
     );
     // Must guard every torch-family package the pod's driver is pinned to.
-    for pkg in ["torch", "torchvision", "torchaudio", "xformers", "bitsandbytes", "triton"] {
+    for pkg in [
+        "torch",
+        "torchvision",
+        "torchaudio",
+        "xformers",
+        "bitsandbytes",
+        "triton",
+    ] {
         assert!(
             script.contains(pkg),
             "torch-filter regex missing {pkg}; got: {script}"
@@ -833,8 +844,7 @@ fn restart_script_kills_port_listener_and_self_excludes() {
 #[test]
 fn expand_phases_rejects_unsafe_comfyui_args() {
     let mut m = full_manifest();
-    m.comfyui.as_mut().expect("comfyui present").args =
-        Some(vec!["; rm -rf /".to_string()]);
+    m.comfyui.as_mut().expect("comfyui present").args = Some(vec!["; rm -rf /".to_string()]);
     let err = expand_phases(&m, "abc", false).unwrap_err();
     assert!(matches!(err, ProfileError::InvalidManifest(_)));
 }

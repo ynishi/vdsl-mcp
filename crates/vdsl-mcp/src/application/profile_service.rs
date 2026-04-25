@@ -269,17 +269,13 @@ fn validate_user_env(manifest: &ProfileManifest) -> Result<(), ProfileError> {
         if matches!(value, EnvValue::Secret(_)) {
             return Err(ProfileError::SecretInUserEnv {
                 key: key.clone(),
-                reason:
-                    "user profiles must not embed `{\"__secret\": ...}` sentinels; \
+                reason: "user profiles must not embed `{\"__secret\": ...}` sentinels; \
                      MCP emits them internally during apply"
-                        .to_string(),
+                    .to_string(),
             });
         }
         let upper = key.to_ascii_uppercase();
-        if let Some(hit) = SECRET_KEY_SUBSTRINGS
-            .iter()
-            .find(|s| upper.contains(*s))
-        {
+        if let Some(hit) = SECRET_KEY_SUBSTRINGS.iter().find(|s| upper.contains(*s)) {
             return Err(ProfileError::SecretInUserEnv {
                 key: key.clone(),
                 reason: format!(
@@ -339,10 +335,7 @@ pub fn resolve_secrets(
     //   - any staging.push route with b2:// dst (Phase 5 staging push)
     // sync.push is marker-only and does NOT hit rclone, so it does not
     // trigger B2 auto-inject.
-    let needs_b2 = manifest
-        .models
-        .iter()
-        .any(|m| m.src.starts_with("b2://"))
+    let needs_b2 = manifest.models.iter().any(|m| m.src.starts_with("b2://"))
         || manifest
             .sync
             .as_ref()
@@ -448,10 +441,7 @@ pub fn expand_phases(
     // ---- Phase 2: ComfyUI install (skipped when comfyui block absent) ----
     if let Some(comfyui) = &manifest.comfyui {
         assert_shell_safe(&comfyui.ref_, "comfyui.ref")?;
-        let comfy_repo = comfyui
-            .repo
-            .as_deref()
-            .unwrap_or("comfyanonymous/ComfyUI");
+        let comfy_repo = comfyui.repo.as_deref().unwrap_or("comfyanonymous/ComfyUI");
         assert_shell_safe(comfy_repo, "comfyui.repo")?;
         steps.push(StepEntry::Leaf(exec_bg_step(
             "2_comfyui_install",
@@ -709,7 +699,6 @@ fn assert_shell_safe(value: &str, field: &str) -> Result<(), ProfileError> {
         )))
     }
 }
-
 
 // =============================================================================
 // Private helpers
@@ -988,7 +977,12 @@ fn build_model_step(
             src = rest,
             dst = dst_path,
         );
-        Ok(exec_bg_step(&format!("7_model_{idx}"), &script, pod_id, env))
+        Ok(exec_bg_step(
+            &format!("7_model_{idx}"),
+            &script,
+            pod_id,
+            env,
+        ))
     } else {
         tracing::warn!(src = %model.src, "unsupported model src scheme");
         Err(ProfileError::InvalidManifest(format!(

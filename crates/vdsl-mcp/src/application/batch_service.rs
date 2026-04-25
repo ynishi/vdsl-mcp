@@ -25,9 +25,7 @@ use futures::FutureExt;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::application::apply_registry::{
-    self, ApplyRegistry, ApplyRunState, ApplyStatus,
-};
+use crate::application::apply_registry::{self, ApplyRegistry, ApplyRunState, ApplyStatus};
 use crate::application::profile_service::{
     BatchPlan, BatchResult, BatchStep, BatchStepResult, GroupBlock, PlanMode, StepEntry,
     StepStatus, ValidateBlock,
@@ -353,13 +351,11 @@ async fn dispatch_exec_bg(
         .await
         .map_err(|e| e.to_string())?;
     let run_text = extract_result(run_result)?;
-    let job_id = extract_field(&run_text, "job_id").ok_or_else(|| {
-        format!("exec_bg: task_run returned no Job ID:\n{run_text}")
-    })?;
+    let job_id = extract_field(&run_text, "job_id")
+        .ok_or_else(|| format!("exec_bg: task_run returned no Job ID:\n{run_text}"))?;
 
     // 2. Poll — exponential backoff capped at 15 s.
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let mut interval_secs: u64 = 3;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
@@ -437,10 +433,7 @@ fn build_exec_request(args: &serde_json::Value) -> Result<VdslExecRequest, Strin
         } else {
             format!("{env_prefix}{script}")
         };
-        let pod_id = map
-            .get("pod_id")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let pod_id = map.get("pod_id").and_then(|v| v.as_str()).map(String::from);
         let timeout = map.get("timeout").and_then(|v| v.as_u64());
         let ssh_key = map
             .get("ssh_key")
@@ -476,10 +469,7 @@ fn build_task_run_request(args: &serde_json::Value) -> Result<VdslTaskRunRequest
         } else {
             format!("{env_prefix}{script}")
         };
-        let pod_id = map
-            .get("pod_id")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let pod_id = map.get("pod_id").and_then(|v| v.as_str()).map(String::from);
         let ssh_key = map
             .get("ssh_key")
             .and_then(|v| v.as_str())

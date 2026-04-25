@@ -228,7 +228,12 @@ mod tests {
 
         // Write through the handle.
         mark_step_started(&handle, "1_apt".into()).await;
-        mark_step_complete(&handle, sample_result("1_apt", StepStatus::Ok), Some("2_install".into())).await;
+        mark_step_complete(
+            &handle,
+            sample_result("1_apt", StepStatus::Ok),
+            Some("2_install".into()),
+        )
+        .await;
 
         let snap = reg.snapshot("apply_1").await.expect("present");
         assert_eq!(snap.completed_steps, 1);
@@ -269,7 +274,13 @@ mod tests {
         let handle = reg.insert(state);
 
         mark_step_complete(&handle, sample_result("1_apt", StepStatus::Failed), None).await;
-        finalize(&handle, ApplyStatus::Failed, "bt_zzz".into(), Some("boom".into())).await;
+        finalize(
+            &handle,
+            ApplyStatus::Failed,
+            "bt_zzz".into(),
+            Some("boom".into()),
+        )
+        .await;
 
         let snap = reg.snapshot("apply_3").await.unwrap();
         assert_eq!(snap.status, ApplyStatus::Failed);
