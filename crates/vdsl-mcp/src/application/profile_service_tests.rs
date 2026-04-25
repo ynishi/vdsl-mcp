@@ -842,6 +842,90 @@ fn restart_script_kills_port_listener_and_self_excludes() {
 }
 
 #[test]
+fn comfyui_install_filters_torch_and_runs_cuda_smoke() {
+    let m = full_manifest();
+    let plan = expand_phases(&m, "abc", false).expect("ok");
+    let script = find_script(&plan, "2_comfyui_install").expect("step present");
+
+    // Phase 2 must apply the same torch-family filter as Phase 4 to the
+    // ComfyUI requirements.txt before pip-installing — upstream pins
+    // (e.g. torch>=2.7) otherwise shadow the system cu124 wheel inside
+    // the venv and break CUDA at Phase 9 silently. 2026-04-25 incident.
+    for pkg in [
+        "torch",
+        "torchvision",
+        "torchaudio",
+        "xformers",
+        "bitsandbytes",
+        "triton",
+    ] {
+        assert!(
+            script.contains(pkg),
+            "torch-family filter missing {pkg}; got: {script}"
+        );
+    }
+    assert!(
+        script.contains("grep -viE") && script.contains("requirements.txt"),
+        "expected requirements.txt filtered through grep -viE; got: {script}"
+    );
+    assert!(
+        script.contains(".venv/bin/pip install -r /dev/stdin"),
+        "expected piped pip install -r /dev/stdin; got: {script}"
+    );
+    // CUDA smoke check must surface driver mismatch at Phase 2 (loud)
+    // rather than at Phase 9 restart (silent).
+    assert!(
+        script.contains("torch.cuda.is_available()"),
+        "expected torch.cuda.is_available() smoke check; got: {script}"
+    );
+}
+
+#[test]
+fn comfyui_install_script_env_override_replaces_body() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("vdsl-mcp-script-override-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("install.sh");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(f, "#!/bin/bash\necho repo=${{REPO_URL}} ref=${{GIT_REF}}\n").unwrap();
+
+    // Set env, expand phases, then unset to keep test isolation.
+    // SAFETY: env mutation in tests is single-threaded inside Rust's
+    // default test harness only when `--test-threads=1`. This test
+    // therefore tolerates parallel execution by using a unique tempfile
+    // and restoring the env at the end.
+    let prev = std::env::var("VDSL_SCRIPT_COMFYUI_INSTALL").ok();
+    // SAFETY: see above — single-threaded mutation.
+    unsafe {
+        std::env::set_var("VDSL_SCRIPT_COMFYUI_INSTALL", &path);
+    }
+
+    let m = full_manifest();
+    let plan = expand_phases(&m, "abc", false).expect("ok");
+    let script = find_script(&plan, "2_comfyui_install").expect("step present");
+
+    // SAFETY: see above.
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("VDSL_SCRIPT_COMFYUI_INSTALL", v),
+            None => std::env::remove_var("VDSL_SCRIPT_COMFYUI_INSTALL"),
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir(&dir);
+
+    assert!(
+        script.contains("repo=https://github.com/") && script.contains("echo repo="),
+        "override body should be used verbatim with placeholders; got: {script}"
+    );
+    // Built-in pip-install line must NOT appear (override fully replaces).
+    assert!(
+        !script.contains(".venv/bin/pip install"),
+        "override should replace built-in script; got: {script}"
+    );
+}
+
+#[test]
 fn expand_phases_rejects_unsafe_comfyui_args() {
     let mut m = full_manifest();
     m.comfyui.as_mut().expect("comfyui present").args = Some(vec!["; rm -rf /".to_string()]);

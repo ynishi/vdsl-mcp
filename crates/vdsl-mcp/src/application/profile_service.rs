@@ -476,35 +476,12 @@ pub fn expand_phases(
             if let Some(r) = &node.ref_ {
                 assert_shell_safe(r, "custom_nodes[].ref")?;
             }
-            let checkout = match &node.ref_ {
-                Some(r) => format!(" && cd {name} && git checkout {r}", name = node.name),
-                None => String::new(),
-            };
             let clone_url = expand_repo_url(&node.repo);
-            // pip=true → install requirements.txt into ComfyUI's .venv,
-            // but filter out torch-family lines. Custom-node reqs
-            // routinely pin a torch version that upgrades the wheel
-            // past the pod's CUDA driver (seen with Impact Pack pulling
-            // torch 2.11.0 onto a driver that only supports <=2.5).
-            // The driver-matched torch was installed by Phase 2 via
-            // --system-site-packages, so we honor that pin here.
-            let pip_install = if node.pip.unwrap_or(false) {
-                format!(
-                    " && if [ -f /workspace/ComfyUI/custom_nodes/{name}/requirements.txt ]; then \
-                       grep -viE '^[[:space:]]*(torch|torchvision|torchaudio|xformers|bitsandbytes|triton)([[:space:]=<>~!;]|$)' \
-                         /workspace/ComfyUI/custom_nodes/{name}/requirements.txt \
-                         | /workspace/ComfyUI/.venv/bin/pip install -r /dev/stdin; \
-                     fi",
-                    name = node.name,
-                )
-            } else {
-                String::new()
-            };
-            let script = format!(
-                "cd /workspace/ComfyUI/custom_nodes && \
-                 (test -d {name} || git clone {url} {name}){checkout}{pip_install}",
-                name = node.name,
-                url = clone_url,
+            let script = custom_node_install_script(
+                &node.name,
+                &clone_url,
+                node.ref_.as_deref(),
+                node.pip.unwrap_or(false),
             );
             node_steps.push(exec_bg_step(
                 &format!("4_custom_node_{idx}"),
@@ -804,17 +781,104 @@ fn expand_repo_url(repo: &str) -> String {
     }
 }
 
+/// Regex (extended POSIX) used by Phase 2 / Phase 4 to strip torch-family
+/// lines from any `requirements.txt` before pip-installing it.
+///
+/// ComfyUI's own `requirements.txt` and many custom-node `requirements.txt`
+/// files pin a torch wheel that overrides the pod base image's
+/// driver-matched torch (`--system-site-packages` does not help once a
+/// satisfying wheel is also installed inside the venv). The result is a
+/// CUDA mismatch (e.g. cu128 wheel against a cu124 driver) that surfaces
+/// only as `torch.cuda.is_available() == False` and silent ComfyUI startup
+/// failure at Phase 9.
+///
+/// Keeping a single source of truth for this filter prevents Phase 2 and
+/// Phase 4 drifting apart.
+const TORCH_FAMILY_FILTER_REGEX: &str = r"^[[:space:]]*(torch|torchvision|torchaudio|xformers|bitsandbytes|triton)([[:space:]=<>~!;]|$)";
+
+/// Resolve a script-override env var to rendered script content.
+///
+/// When `env_var` is set, its value is treated as a filesystem path. The
+/// file is read and `${TOKEN}` placeholders are substituted from
+/// `placeholders`. On read failure, returns `None` and emits a `tracing::warn`
+/// so the caller falls back to the built-in default. On success, returns
+/// `Some(rendered)`.
+///
+/// Placeholders use shell-style `${TOKEN}` so that override files remain
+/// editable as bash with their host editor's syntax highlighting intact.
+/// Unknown `${TOKEN}` left in the body is logged as a `tracing::warn` but
+/// otherwise left in place — bash itself will resolve genuine env-var
+/// references at execution time on the pod.
+fn load_script_override(env_var: &str, placeholders: &[(&str, &str)]) -> Option<String> {
+    let path = std::env::var(env_var).ok()?;
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    // Expand a leading `~/` so user-level paths work without manual env eval.
+    let expanded: std::path::PathBuf = if let Some(rest) = path.strip_prefix("~/") {
+        match std::env::var("HOME") {
+            Ok(home) => std::path::PathBuf::from(home).join(rest),
+            Err(_) => std::path::PathBuf::from(path),
+        }
+    } else {
+        std::path::PathBuf::from(path)
+    };
+    match std::fs::read_to_string(&expanded) {
+        Ok(body) => {
+            let mut rendered = body;
+            for (token, value) in placeholders {
+                rendered = rendered.replace(&format!("${{{token}}}"), value);
+            }
+            tracing::info!(
+                env = env_var,
+                path = %expanded.display(),
+                "script override applied"
+            );
+            Some(rendered)
+        }
+        Err(e) => {
+            tracing::warn!(
+                env = env_var,
+                path = %expanded.display(),
+                error = %e,
+                "script override read failed; falling back to built-in default"
+            );
+            None
+        }
+    }
+}
+
 /// ComfyUI checkout + venv + requirements install script (phase 2).
 ///
 /// `repo` accepts either a `owner/name` slug or a full `https://` URL.
 /// A slug is expanded to `https://github.com/owner/name.git`.
+///
+/// Override via `VDSL_SCRIPT_COMFYUI_INSTALL=<file path>` — the file is
+/// read as bash with `${REPO_URL}` and `${GIT_REF}` substituted by the
+/// loader. See [`load_script_override`].
 fn comfyui_install_script(repo: &str, git_ref: &str) -> String {
     let url = expand_repo_url(repo);
+    if let Some(rendered) = load_script_override(
+        "VDSL_SCRIPT_COMFYUI_INSTALL",
+        &[("REPO_URL", &url), ("GIT_REF", git_ref)],
+    ) {
+        return rendered;
+    }
     // --system-site-packages: inherit the base image's pre-compiled
     // torch (driver-matched on RunPod pytorch images). Without this,
     // `pip install torch` pulls whatever latest wheel exists and
     // usually requires a newer CUDA driver than the pod provides, so
     // `torch.cuda.is_available()` silently returns False.
+    //
+    // ComfyUI's own requirements.txt also gets the same torch-family
+    // filter as Phase 4 custom_nodes — see TORCH_FAMILY_FILTER_REGEX.
+    // Without it, an upstream pin (e.g. torch>=2.7) silently shadows
+    // the system wheel inside the venv.
+    //
+    // Final smoke: assert torch.cuda.is_available(). A driver mismatch
+    // here used to surface only at Phase 9 restart as a silent exit 1;
+    // failing Phase 2 loudly is materially easier to diagnose.
     format!(
         "set -e\n\
          cd /workspace\n\
@@ -823,7 +887,62 @@ fn comfyui_install_script(repo: &str, git_ref: &str) -> String {
          git fetch --all --tags && git checkout {git_ref}\n\
          test -d .venv || python3 -m venv --system-site-packages .venv\n\
          .venv/bin/pip install --upgrade pip\n\
-         .venv/bin/pip install -r requirements.txt\n"
+         grep -viE '{regex}' requirements.txt \
+           | .venv/bin/pip install -r /dev/stdin\n\
+         .venv/bin/python -c 'import torch, sys; \
+           ok = torch.cuda.is_available(); \
+           print(f\"torch={{torch.__version__}} cuda={{torch.version.cuda}} avail={{ok}}\"); \
+           sys.exit(0 if ok else 1)'\n",
+        regex = TORCH_FAMILY_FILTER_REGEX,
+    )
+}
+
+/// Custom-node clone + optional checkout + optional pip install script
+/// (phase 4). Custom-node `requirements.txt` files routinely pin a torch
+/// wheel that upgrades past the driver — see [`TORCH_FAMILY_FILTER_REGEX`]
+/// — so torch-family lines are stripped before pip install.
+///
+/// Override via `VDSL_SCRIPT_CUSTOM_NODE_INSTALL=<file path>` — the file
+/// is read as bash with `${NODE_NAME}`, `${REPO_URL}`, `${GIT_REF}`,
+/// `${PIP_FLAG}` (`"1"`/`"0"`) substituted. See [`load_script_override`].
+fn custom_node_install_script(
+    name: &str,
+    clone_url: &str,
+    git_ref: Option<&str>,
+    pip: bool,
+) -> String {
+    let pip_flag = if pip { "1" } else { "0" };
+    let git_ref_value = git_ref.unwrap_or("");
+    if let Some(rendered) = load_script_override(
+        "VDSL_SCRIPT_CUSTOM_NODE_INSTALL",
+        &[
+            ("NODE_NAME", name),
+            ("REPO_URL", clone_url),
+            ("GIT_REF", git_ref_value),
+            ("PIP_FLAG", pip_flag),
+        ],
+    ) {
+        return rendered;
+    }
+    let checkout = match git_ref {
+        Some(r) => format!(" && cd {name} && git checkout {r}"),
+        None => String::new(),
+    };
+    let pip_install = if pip {
+        format!(
+            " && if [ -f /workspace/ComfyUI/custom_nodes/{name}/requirements.txt ]; then \
+               grep -viE '{regex}' \
+                 /workspace/ComfyUI/custom_nodes/{name}/requirements.txt \
+                 | /workspace/ComfyUI/.venv/bin/pip install -r /dev/stdin; \
+             fi",
+            regex = TORCH_FAMILY_FILTER_REGEX,
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "cd /workspace/ComfyUI/custom_nodes && \
+         (test -d {name} || git clone {clone_url} {name}){checkout}{pip_install}"
     )
 }
 
@@ -834,6 +953,10 @@ fn comfyui_install_script(repo: &str, git_ref: &str) -> String {
 /// hung on close), HTTP readiness caps at 180s (cold-start + model
 /// discovery). Exceeding either limit exits non-zero so Phase 9 fails
 /// loudly instead of hanging forever.
+///
+/// Override via `VDSL_SCRIPT_COMFYUI_RESTART=<file path>` — the file is
+/// read as bash with `${PORT}` and `${EXTRA_ARGS}` substituted by the
+/// loader. See [`load_script_override`].
 fn comfyui_restart_script(port: u16, extra_args: &str) -> String {
     // DSL-provided args are authoritative. Only inject default
     // `--listen 0.0.0.0 --port $PORT` when the manifest gave nothing.
@@ -842,6 +965,13 @@ fn comfyui_restart_script(port: u16, extra_args: &str) -> String {
     } else {
         extra_args.to_string()
     };
+    let port_str = port.to_string();
+    if let Some(rendered) = load_script_override(
+        "VDSL_SCRIPT_COMFYUI_RESTART",
+        &[("PORT", &port_str), ("EXTRA_ARGS", &launch_args)],
+    ) {
+        return rendered;
+    }
     // Kill whatever process is actually listening on $PORT, regardless
     // of whether it was launched via `.venv/bin/python` or the pod
     // image's system python (e.g. runpod-slim's pre-baked ComfyUI auto-
