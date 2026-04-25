@@ -30,7 +30,7 @@ RunPod GPU provisioning, ComfyUI orchestration, and model management — all acc
 | `vdsl_interrupt` | Cancel running or pending ComfyUI jobs |
 | **Models & Catalogs** | |
 | `vdsl_models` | List available checkpoints, LoRAs, VAEs, etc. |
-| `vdsl_model_search` | Search CivitAI for models |
+| `vdsl_model_search` | Search models by scope (`remote`=CivitAI, `archive`=B2 bucket, `pod`=connected pod), type, and base; returns structured JSON with obtain hint |
 | `vdsl_node_search` | Search installed ComfyUI custom nodes |
 | `vdsl_catalogs` | Browse VDSL catalog entries (camera, lighting, figure, quality, etc.) |
 | **RunPod Infrastructure** | |

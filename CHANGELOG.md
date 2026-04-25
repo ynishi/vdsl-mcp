@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+
+- **`vdsl_model_search` — scope parameter** — `scope=remote|archive|pod` selects search target: CivitAI (default), B2 archive bucket, or connected pod
+- **`vdsl_model_search` — type filter** — `model_type` now accepts 8 values: `checkpoint / lora / controlnet / vae / upscale / embedding / clip / unet`
+- **`vdsl_model_search` — base filter** — `base` parameter accepts `sd15 / sdxl / pony / illustrious / noobai / flux / unknown`
+- **`vdsl_model_search` — structured result** — returns `ModelSearchResult[]` JSON with `name`, `model_type`, `base`, `scope`, `size_bytes`, `location`, `obtain`, `metadata` fields
+- **`vdsl_model_search` — obtain hint** — `obtain` field surfaces ready-to-use tool invocation for each result (`vdsl_download` for remote, `vdsl_storage_pull` for archive)
+- **`domain::models::Scope`** — `Remote | Archive | Pod` enum for model search scope
+- **`domain::models::BaseModel`** — 7-value enum with `from_filename()` substring inference
+- **`domain::models::ModelSearchResult`** — structured search result type returned by all scope paths
+- **`parse_rclone_lsf()`** — standalone parser for `rclone lsf --format tsp` output (semicolon-separated modtime/size/path)
+
+### Changed
+
+- **`domain::models::ModelType`** — moved from `interface::mcp` to `domain::models`, extended from 6 to 8 values (added `Clip` and `Unet`); `to_civitai_type()` now returns `Option<&'static str>` (None for Clip/Unet)
+- **`ModelType::as_dir_key()`** — replaces `MODEL_DIRS` const as single source of truth for ComfyUI directory key mapping
+
+### Performance
+
+- **`search_archive` sidecar lookup** — O(N²) scan replaced with O(N) `HashSet` pre-index
+
 ## [0.4.0] - 2026-04-12
 
 ### Highlights
