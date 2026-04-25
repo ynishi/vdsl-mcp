@@ -869,7 +869,16 @@ fn inject_civitai_token(url: &str) -> String {
 ///
 /// Each model × version pair becomes one entry. Fields missing in the response
 /// degrade gracefully to `None` / `Unknown` without panicking.
-fn civitai_json_to_results(json: &serde_json::Value) -> Vec<ModelSearchResult> {
+///
+/// `view` controls how much CivitAI metadata is embedded in `ModelSearchResult.metadata`:
+/// - `Compact`: a small object with `downloadCount`, `thumbsUpCount`, `nsfwLevel`,
+///   `supportsGeneration`, and (if non-empty) `trainedWords`. ~200 chars/entry.
+/// - `Full`: the version JSON verbatim (images / files / hashes / scan status).
+///   Multi-KB per entry; suitable for deep-dive of a few results, not bulk listing.
+fn civitai_json_to_results(
+    json: &serde_json::Value,
+    view: ModelSearchView,
+) -> Vec<ModelSearchResult> {
     let empty = vec![];
     let items = json["items"].as_array().unwrap_or(&empty);
     let mut results: Vec<ModelSearchResult> = Vec::new();
@@ -903,6 +912,11 @@ fn civitai_json_to_results(json: &serde_json::Value) -> Vec<ModelSearchResult> {
             let location =
                 format!("https://civitai.com/models/{model_id}?modelVersionId={version_id}");
 
+            let metadata = match view {
+                ModelSearchView::Full => ver.clone(),
+                ModelSearchView::Compact => civitai_compact_metadata(ver),
+            };
+
             results.push(ModelSearchResult {
                 name: name.clone(),
                 model_type,
@@ -911,12 +925,38 @@ fn civitai_json_to_results(json: &serde_json::Value) -> Vec<ModelSearchResult> {
                 size_bytes,
                 location,
                 obtain,
-                metadata: ver.clone(),
+                metadata,
             });
         }
     }
 
     results
+}
+
+/// Build a compact metadata object from a CivitAI version JSON.
+///
+/// Includes only fields useful for one-line ranking: download count, thumbs up,
+/// NSFW level, generation support, and trigger words (if any).
+fn civitai_compact_metadata(ver: &serde_json::Value) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    if let Some(v) = ver["stats"]["downloadCount"].as_u64() {
+        obj.insert("downloadCount".to_string(), serde_json::json!(v));
+    }
+    if let Some(v) = ver["stats"]["thumbsUpCount"].as_u64() {
+        obj.insert("thumbsUpCount".to_string(), serde_json::json!(v));
+    }
+    if let Some(v) = ver["nsfwLevel"].as_u64() {
+        obj.insert("nsfwLevel".to_string(), serde_json::json!(v));
+    }
+    if let Some(v) = ver["supportsGeneration"].as_bool() {
+        obj.insert("supportsGeneration".to_string(), serde_json::json!(v));
+    }
+    if let Some(words) = ver["trainedWords"].as_array() {
+        if !words.is_empty() {
+            obj.insert("trainedWords".to_string(), serde_json::json!(words));
+        }
+    }
+    serde_json::Value::Object(obj)
 }
 
 /// Format CivitAI /api/v1/models response into human-readable text.
@@ -3433,10 +3473,16 @@ impl VdslMcpServer {
 
     #[tool(
         name = "vdsl_model_search",
-        description = "[gen] Search for AI models (checkpoints, LoRAs, VAEs, etc.) on model marketplaces. \
-            Returns model names, version IDs, download counts, and base model info. \
-            Use the returned version ID with vdsl_download (source: \"cv:VERSION_ID\") to install. \
-            Currently supports: CivitAI (cv). HuggingFace (hf) support is planned.",
+        description = "[gen] Search for AI models across remote (CivitAI), archive (B2 cold storage), \
+            or pod (running ComfyUI) — controlled by `scope` (default: remote). \
+            Filter by `model_type` (checkpoint/lora/vae/embedding/controlnet/upscale/clip/unet) \
+            and `base` (pony/illustrious/noobai/sdxl/sd15/flux). \
+            Returns ModelSearchResult JSON: name, model_type, base, scope, size_bytes, location, \
+            and an `obtain` hint (vdsl_download / vdsl_storage_pull command string) for fetching to pod. \
+            `view`: compact (default, ~200 chars/entry, downloadCount + thumbsUp + nsfwLevel + trainedWords) \
+            or full (with images / file hashes / verbatim CivitAI metadata, multi-KB/entry — use only for \
+            deep-dive of a few results). Remote source: cv (CivitAI). \
+            Archive scope requires `pod_id` (rclone runs on the pod). HuggingFace (hf) support is planned.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -3550,7 +3596,7 @@ impl VdslMcpServer {
             McpError::internal_error(format!("Failed to parse CivitAI response: {e}"), None)
         })?;
 
-        let results = civitai_json_to_results(&json);
+        let results = civitai_json_to_results(&json, view);
         let json_str = serde_json::to_string_pretty(&results).map_err(|e| {
             tracing::warn!(error = %e, "Failed to serialize ModelSearchResult");
             McpError::internal_error(format!("serialize ModelSearchResult failed: {e}"), None)
@@ -9052,14 +9098,14 @@ mod tests {
     #[test]
     fn civitai_json_to_results_empty_items() {
         let json = serde_json::json!({"items": []});
-        let results = civitai_json_to_results(&json);
+        let results = civitai_json_to_results(&json, ModelSearchView::Compact);
         assert!(results.is_empty());
     }
 
     #[test]
     fn civitai_json_to_results_no_items_key() {
         let json = serde_json::json!({});
-        let results = civitai_json_to_results(&json);
+        let results = civitai_json_to_results(&json, ModelSearchView::Compact);
         assert!(results.is_empty());
     }
 
@@ -9077,7 +9123,7 @@ mod tests {
                 }]
             }]
         });
-        let results = civitai_json_to_results(&json);
+        let results = civitai_json_to_results(&json, ModelSearchView::Compact);
         assert_eq!(results.len(), 1);
         let r = &results[0];
         assert_eq!(r.name, "Test LoRA");
@@ -9109,7 +9155,7 @@ mod tests {
                 }]
             }]
         });
-        let results = civitai_json_to_results(&json);
+        let results = civitai_json_to_results(&json, ModelSearchView::Compact);
         assert_eq!(results.len(), 1);
         let r = &results[0];
         assert_eq!(r.model_type, ModelType::Unknown);
@@ -9133,7 +9179,7 @@ mod tests {
                 ]
             }]
         });
-        let results = civitai_json_to_results(&json);
+        let results = civitai_json_to_results(&json, ModelSearchView::Compact);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].base, BaseModel::Pony);
         assert_eq!(results[1].base, BaseModel::Sdxl);
@@ -9151,10 +9197,78 @@ mod tests {
                 "modelVersions": [{"id": 100, "baseModel": "SD 1.5", "files": [{"sizeKB": 4000000.0}]}]
             }]
         });
-        let results = civitai_json_to_results(&json);
+        let results = civitai_json_to_results(&json, ModelSearchView::Compact);
         assert_eq!(results.len(), 1);
         let obtain = results[0].obtain.as_deref().unwrap();
         assert!(obtain.contains("target=checkpoints"), "obtain={obtain}");
+    }
+
+    #[test]
+    fn civitai_json_to_results_compact_metadata_is_small() {
+        // Compact view should NOT include images / files / hashes — only stats subset.
+        let json = serde_json::json!({
+            "items": [{
+                "id": 1, "name": "X", "type": "Checkpoint",
+                "modelVersions": [{
+                    "id": 10, "baseModel": "Pony",
+                    "files": [{"sizeKB": 100.0}],
+                    "stats": {"downloadCount": 42, "thumbsUpCount": 7},
+                    "nsfwLevel": 1,
+                    "supportsGeneration": true,
+                    "trainedWords": ["trigger"],
+                    // Bloat that must NOT survive into compact:
+                    "images": [
+                        {"url": "x", "hash": "y"},
+                        {"url": "x", "hash": "y"},
+                        {"url": "x", "hash": "y"},
+                    ],
+                }]
+            }]
+        });
+        let results = civitai_json_to_results(&json, ModelSearchView::Compact);
+        assert_eq!(results.len(), 1);
+        let meta = &results[0].metadata;
+        assert!(meta.get("images").is_none(), "compact must drop images");
+        assert!(meta.get("files").is_none(), "compact must drop files");
+        assert_eq!(meta["downloadCount"], 42);
+        assert_eq!(meta["thumbsUpCount"], 7);
+        assert_eq!(meta["trainedWords"], serde_json::json!(["trigger"]));
+        let entry_json = serde_json::to_string(&results[0]).unwrap();
+        assert!(
+            entry_json.len() < 600,
+            "compact entry too large: {} chars",
+            entry_json.len()
+        );
+    }
+
+    #[test]
+    fn civitai_json_to_results_full_keeps_verbatim() {
+        let json = serde_json::json!({
+            "items": [{
+                "id": 1, "name": "X", "type": "Checkpoint",
+                "modelVersions": [{
+                    "id": 10, "baseModel": "Pony",
+                    "files": [{"sizeKB": 100.0, "name": "x.safetensors"}],
+                    "images": [{"url": "x"}]
+                }]
+            }]
+        });
+        let results = civitai_json_to_results(&json, ModelSearchView::Full);
+        assert_eq!(results.len(), 1);
+        // Full keeps images and files verbatim
+        assert!(results[0].metadata.get("images").is_some());
+        assert!(results[0].metadata.get("files").is_some());
+    }
+
+    #[test]
+    fn civitai_compact_metadata_omits_empty_trained_words() {
+        let ver = serde_json::json!({
+            "stats": {"downloadCount": 1},
+            "trainedWords": []
+        });
+        let meta = civitai_compact_metadata(&ver);
+        assert!(meta.get("trainedWords").is_none());
+        assert_eq!(meta["downloadCount"], 1);
     }
 
     // ---- extract_primary_checkpoint / sort tests ----
