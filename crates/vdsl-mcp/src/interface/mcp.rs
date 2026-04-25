@@ -23,7 +23,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::application::pod_service::{resolve_api_key, PodService};
 use crate::application::storage_service::{self, StorageService, RCLONE_OP_TIMEOUT_SECS};
-use crate::domain::models::{format_model_catalog_with_limit, parse_model_catalog};
+use crate::domain::models::{format_model_catalog_with_limit, parse_model_catalog, ModelType};
+// These will be used in subtask 2–4 (scope=remote/pod/archive dispatch).
+#[allow(unused_imports)]
+use crate::domain::models::{BaseModel, ModelSearchResult, Scope};
 use crate::domain::pod::{format_pod_list, format_volume_list};
 use crate::infra::comfyui_client::{proxy_url, ComfyUiClient};
 use crate::infra::config::SyncdConfig;
@@ -136,7 +139,13 @@ impl VdslMcpServer {
     /// Must be called BEFORE ensure_syncd_running so that pod_id is available
     /// for env propagation when spawning syncd.
     async fn ensure_pod_detected(&self) {
-        if self.last_pod_id.lock().ok().and_then(|g| g.clone()).is_some() {
+        if self
+            .last_pod_id
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .is_some()
+        {
             return; // already known
         }
         if let Some(detected) = Self::detect_running_pod().await {
@@ -728,19 +737,6 @@ const DOWNLOAD_TIMEOUT_SECS: u64 = 600;
 /// Interval between download status polls (seconds).
 const DOWNLOAD_POLL_INTERVAL_SECS: u64 = 5;
 
-/// ComfyUI model directory mapping (relative to models base dir).
-/// Matches Lua `MODEL_DIRS` in runpod.lua L256-266.
-const MODEL_DIRS: &[(&str, &str)] = &[
-    ("checkpoints", "checkpoints"),
-    ("loras", "loras"),
-    ("controlnet", "controlnet"),
-    ("vae", "vae"),
-    ("upscale", "upscale_models"),
-    ("embeddings", "embeddings"),
-    ("clip", "clip"),
-    ("unet", "unet"),
-];
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VdslDownloadRequest {
     /// RunPod pod ID (e.g. "pod_abc123def").
@@ -996,15 +992,20 @@ fn format_file_size(size_kb: f64) -> String {
     }
 }
 
-/// Resolve model directory name from target category.
+/// Resolve model directory name from a target category key (e.g. `"checkpoints"`).
+///
+/// Delegates to `ModelType::try_from` for key lookup, then returns the
+/// ComfyUI directory name via `as_dir_key()`.
+///
+/// # Errors
+///
+/// Returns a human-readable error string when `target` is not a known category key.
 fn resolve_model_dir(target: &str) -> Result<&'static str, String> {
-    MODEL_DIRS
-        .iter()
-        .find(|(k, _)| *k == target)
-        .map(|(_, v)| *v)
-        .ok_or_else(|| {
-            let valid: Vec<&str> = MODEL_DIRS.iter().map(|(k, _)| *k).collect();
-            format!("unknown target '{target}'. Valid: {}", valid.join(", "))
+    ModelType::try_from(target)
+        .map(|t| t.as_dir_key())
+        .map_err(|e| {
+            let valid: Vec<&str> = ModelType::all().iter().map(|t| t.as_dir_key()).collect();
+            format!("{}. Valid dirs: {}", e, valid.join(", "))
         })
 }
 
@@ -1489,32 +1490,6 @@ pub enum ModelSource {
     Cv,
     /// HuggingFace (huggingface.co)
     Hf,
-}
-
-/// Model type filter for search (aligned with ComfyUI model categories).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum ModelType {
-    Checkpoint,
-    Lora,
-    Controlnet,
-    Vae,
-    Upscale,
-    Embedding,
-}
-
-impl ModelType {
-    /// Convert to CivitAI API `types` parameter value.
-    fn to_civitai_type(self) -> &'static str {
-        match self {
-            Self::Checkpoint => "Checkpoint",
-            Self::Lora => "LORA",
-            Self::Controlnet => "Controlnet",
-            Self::Vae => "VAE",
-            Self::Upscale => "Upscaler",
-            Self::Embedding => "TextualInversion",
-        }
-    }
 }
 
 /// Sort order for model search results.
@@ -3314,7 +3289,9 @@ impl VdslMcpServer {
         );
 
         if let Some(mt) = req.model_type {
-            url.push_str(&format!("&type={}", mt.to_civitai_type()));
+            if let Some(s) = mt.to_civitai_type() {
+                url.push_str(&format!("&type={s}"));
+            }
         }
         if let Some(sort) = req.sort {
             url.push_str(&format!(
@@ -4144,7 +4121,13 @@ impl VdslMcpServer {
         self.ensure_pod_detected().await;
         // probe → syncd 委譲 / 未稼働なら spawn → fallback
         let pod_id_for_spawn = self.pod_id_for_syncd();
-        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client, pod_id_for_spawn.as_deref()).await {
+        match ensure_syncd_running(
+            &self.syncd_cfg,
+            &self.syncd_client,
+            pod_id_for_spawn.as_deref(),
+        )
+        .await
+        {
             SyncdStatus::Running => {
                 let resp = self.syncd_client.delegate_sync().await.map_err(|e| {
                     McpError::internal_error(format!("syncd delegate_sync failed: {e}"), None)
@@ -4194,7 +4177,13 @@ impl VdslMcpServer {
         self.ensure_pod_detected().await;
         // probe → syncd 委譲 / 未稼働なら spawn → fallback
         let pod_id_for_spawn = self.pod_id_for_syncd();
-        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client, pod_id_for_spawn.as_deref()).await {
+        match ensure_syncd_running(
+            &self.syncd_cfg,
+            &self.syncd_client,
+            pod_id_for_spawn.as_deref(),
+        )
+        .await
+        {
             SyncdStatus::Running => {
                 let resp = self
                     .syncd_client
@@ -4391,7 +4380,13 @@ impl VdslMcpServer {
         self.ensure_pod_detected().await;
         // probe → syncd 委譲 / 未稼働なら spawn → fallback
         let pod_id_for_spawn = self.pod_id_for_syncd();
-        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client, pod_id_for_spawn.as_deref()).await {
+        match ensure_syncd_running(
+            &self.syncd_cfg,
+            &self.syncd_client,
+            pod_id_for_spawn.as_deref(),
+        )
+        .await
+        {
             SyncdStatus::Running => {
                 let created = self
                     .syncd_client
@@ -4440,7 +4435,13 @@ impl VdslMcpServer {
         self.ensure_pod_detected().await;
         // probe → syncd 委譲 / 未稼働なら spawn → fallback
         let pod_id_for_spawn = self.pod_id_for_syncd();
-        match ensure_syncd_running(&self.syncd_cfg, &self.syncd_client, pod_id_for_spawn.as_deref()).await {
+        match ensure_syncd_running(
+            &self.syncd_cfg,
+            &self.syncd_client,
+            pod_id_for_spawn.as_deref(),
+        )
+        .await
+        {
             SyncdStatus::Running => {
                 self.syncd_client
                     .delegate_restore(&req.path, &req.revision)
@@ -7503,8 +7504,9 @@ mod tests {
     #[test]
     fn resolve_model_dir_invalid() {
         let err = resolve_model_dir("foobar").unwrap_err();
-        assert!(err.contains("unknown target"));
-        assert!(err.contains("loras"));
+        assert!(err.contains("foobar"));
+        // Error message must list at least one valid dir key
+        assert!(err.contains("loras") || err.contains("checkpoints"));
     }
 
     // --- Generate request tests ---
@@ -8327,12 +8329,19 @@ mod tests {
 
     #[test]
     fn model_type_to_civitai() {
-        assert_eq!(ModelType::Checkpoint.to_civitai_type(), "Checkpoint");
-        assert_eq!(ModelType::Lora.to_civitai_type(), "LORA");
-        assert_eq!(ModelType::Controlnet.to_civitai_type(), "Controlnet");
-        assert_eq!(ModelType::Vae.to_civitai_type(), "VAE");
-        assert_eq!(ModelType::Upscale.to_civitai_type(), "Upscaler");
-        assert_eq!(ModelType::Embedding.to_civitai_type(), "TextualInversion");
+        assert_eq!(ModelType::Checkpoint.to_civitai_type(), Some("Checkpoint"));
+        assert_eq!(ModelType::Lora.to_civitai_type(), Some("LORA"));
+        assert_eq!(ModelType::Controlnet.to_civitai_type(), Some("Controlnet"));
+        assert_eq!(ModelType::Vae.to_civitai_type(), Some("VAE"));
+        assert_eq!(ModelType::Upscale.to_civitai_type(), Some("Upscaler"));
+        assert_eq!(
+            ModelType::Embedding.to_civitai_type(),
+            Some("TextualInversion")
+        );
+        // Clip, Unet, Unknown have no CivitAI equivalent
+        assert_eq!(ModelType::Clip.to_civitai_type(), None);
+        assert_eq!(ModelType::Unet.to_civitai_type(), None);
+        assert_eq!(ModelType::Unknown.to_civitai_type(), None);
     }
 
     #[test]

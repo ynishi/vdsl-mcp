@@ -17,4 +17,7 @@ pub enum DomainError {
 
     #[error("command timed out after {seconds}s")]
     ExecTimeout { seconds: u64 },
+
+    #[error("unknown model dir key: {0}")]
+    ModelTypeParse(String),
 }
