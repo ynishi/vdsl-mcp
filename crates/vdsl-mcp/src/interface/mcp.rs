@@ -94,6 +94,11 @@ pub(crate) struct VdslMcpServer {
     /// `application::apply_registry` module docstring for the full
     /// rationale.
     apply_registry: crate::application::apply_registry::ApplyRegistry,
+    /// Registry for background `vdsl_run` tasks. `vdsl_run` defaults to
+    /// `background=true` and returns a `task_id` immediately; clients
+    /// poll `vdsl_run_status(task_id)` for completion. See
+    /// `application::run_registry` for the rationale.
+    run_registry: crate::application::run_registry::RunRegistry,
 }
 
 impl VdslMcpServer {
@@ -119,6 +124,7 @@ impl VdslMcpServer {
             syncd_cfg,
             syncd_client,
             apply_registry: crate::application::apply_registry::ApplyRegistry::new(),
+            run_registry: crate::application::run_registry::RunRegistry::new(),
         }
     }
 
@@ -1921,6 +1927,21 @@ pub struct VdslRunRequest {
     /// Lua execution backend: "process" or "mlua" (default when mlua-backend feature enabled).
     #[serde(default)]
     pub backend: LuaBackend,
+
+    /// Run in the background and return a `task_id` immediately
+    /// (poll with `vdsl_run_status`). Defaults to `true` so the MCP
+    /// call does not block 20-40 min on real sweeps. Pass `false` to
+    /// keep the historical synchronous behaviour (whole pipeline
+    /// finishes inside the single MCP call).
+    pub background: Option<bool>,
+}
+
+/// Request shape for `vdsl_run_status`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslRunStatusRequest {
+    /// Task ID returned by a prior `vdsl_run` call with `background=true`
+    /// (the default). Re-pollable until the MCP process exits.
+    pub task_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -5286,6 +5307,10 @@ impl VdslMcpServer {
             Set compile_only=true to skip generation — compiled workflows are checked \
             for required models and verified against the server if connected (preflight). \
             If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session. \
+            background=true (default): spawns the pipeline and returns { task_id } in < 1 s — \
+            poll vdsl_run_status(task_id) for progress and the terminal log. \
+            background=false: runs synchronously (historical behaviour) — the MCP call \
+            returns only after the whole pipeline completes (can be 20-40 min on real sweeps). \
             Pipeline judge gates: When a pipeline has a judge/pick gate and outputs are not \
             yet available, the pipeline pauses after the gate pass and returns candidate images. \
             Evaluate the images (Human or Agent), then call vdsl_run again with judge_result \
@@ -5301,6 +5326,64 @@ impl VdslMcpServer {
         &self,
         Parameters(req): Parameters<VdslRunRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // Default polling on. Foreground (sync) mode is opt-in via
+        // background=Some(false) — preserves the historical shape for
+        // smoke / compile_only callers that want the result inline.
+        let background = req.background.unwrap_or(true);
+        if !background {
+            let log = self.run_blocking(req).await?;
+            return Ok(CallToolResult::success(vec![Content::text(log)]));
+        }
+
+        // Background path: stage state, spawn, return task_id < 1 s.
+        // The spawned future captures a clone of the server (cheap —
+        // every owned field is Arc-wrapped) and writes the joined log
+        // (or the error message) to the registry on completion.
+        let script_label = req
+            .script_file
+            .clone()
+            .or_else(|| req.code.as_ref().map(|_| "<inline>".to_string()))
+            .unwrap_or_else(|| "<unspecified>".to_string());
+        let task_id = format!("run_{}", uuid::Uuid::new_v4());
+        let state = crate::application::run_registry::RunRunState::new(
+            task_id.clone(),
+            script_label.clone(),
+        );
+        let handle = self.run_registry.insert(state);
+        let server = self.clone();
+        let tid_for_log = task_id.clone();
+        tokio::spawn(async move {
+            match server.run_blocking(req).await {
+                Ok(log) => {
+                    crate::application::run_registry::finalize_ok(&handle, log).await;
+                }
+                Err(e) => {
+                    crate::application::run_registry::finalize_err(
+                        &handle,
+                        format!("{e}"),
+                        String::new(),
+                    )
+                    .await;
+                    tracing::warn!(task_id = %tid_for_log, error = %e, "vdsl_run background task failed");
+                }
+            }
+        });
+        let body = serde_json::json!({
+            "task_id": task_id,
+            "script": script_label,
+            "status": "running",
+            "poll_with": format!("vdsl_run_status(task_id: \"{task_id}\")"),
+        });
+        let text = serde_json::to_string_pretty(&body)
+            .map_err(|e| McpError::internal_error(format!("serialize response: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    /// Synchronous body of `vdsl_run`. Returns the joined log on success
+    /// or an `McpError` on failure. Used directly when
+    /// `background=false`; otherwise driven by the spawned task started
+    /// by `run` and finalized into [`crate::application::run_registry`].
+    async fn run_blocking(&self, req: VdslRunRequest) -> Result<String, McpError> {
         let (lua_args, script_label) =
             resolve_script_source(req.script_file.as_deref(), req.code.as_deref())?;
         let work_dir = resolve_working_dir(req.working_dir.as_deref(), req.script_file.as_deref())?;
@@ -5440,7 +5523,7 @@ impl VdslMcpServer {
                     }
                 }
             }
-            return Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]));
+            return Ok(log.join("\n"));
         }
 
         // --- Phase 2: Generate ---
@@ -5563,7 +5646,7 @@ impl VdslMcpServer {
             let jobs = submit_workflows(&client, &tagged, &mut log).await;
             if jobs.is_empty() {
                 log.push("All workflows failed to submit.".to_string());
-                return Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]));
+                return Ok(log.join("\n"));
             }
 
             let results = poll_jobs(
@@ -5610,7 +5693,43 @@ impl VdslMcpServer {
             }
         }
 
-        Ok(CallToolResult::success(vec![Content::text(log.join("\n"))]))
+        Ok(log.join("\n"))
+    }
+
+    #[tool(
+        name = "vdsl_run_status",
+        description = "[gen] Poll the status of a background vdsl_run task. \
+            Returns a snapshot: { task_id, script_label, status ∈ \"running\"|\"ok\"|\"failed\", \
+            log (full joined output on terminal state, empty while running), \
+            started_at_ms, finished_at_ms, error? }. \
+            Cheap (in-process state, no SSH, no HTTP). Safe to call repeatedly; \
+            terminal entries persist for the MCP-process lifetime.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn run_status(
+        &self,
+        Parameters(req): Parameters<VdslRunStatusRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let snap = self.run_registry.snapshot(&req.task_id).await;
+        match snap {
+            Some(state) => {
+                let body =
+                    serde_json::to_string_pretty(&state).unwrap_or_else(|_| format!("{state:?}"));
+                Ok(CallToolResult::success(vec![Content::text(body)]))
+            }
+            None => Err(McpError::invalid_params(
+                format!(
+                    "vdsl_run task_id not found: {}. \
+                     Either it never started, or the MCP process restarted (in-memory state lost).",
+                    req.task_id
+                ),
+                None,
+            )),
+        }
     }
 
     // =========================================================================
