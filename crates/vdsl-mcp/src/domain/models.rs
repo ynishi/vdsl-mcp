@@ -611,6 +611,166 @@ pub fn format_preflight_report(required: &RequiredModels, missing: &RequiredMode
 }
 
 // =============================================================================
+// Archive scope: rclone lsf parser and type inference
+// =============================================================================
+
+/// A single file entry produced by `rclone lsf --format tsp`.
+///
+/// The `tsp` format uses `;` (semicolon) as the field separator.
+/// Field order: `modtime;size;path`.
+/// Directory entries (path ending with `/`) are excluded by the parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveEntry {
+    /// Modification time string (e.g. `"2024-01-15 10:30:45"`).
+    pub modtime: String,
+    /// File size in bytes.
+    pub size: u64,
+    /// Relative path within the bucket/prefix (e.g. `"checkpoints/foo.safetensors"`).
+    pub path: String,
+}
+
+/// Parse `rclone lsf --format tsp` stdout into a list of [`ArchiveEntry`].
+///
+/// The `tsp` format separates fields with `;` (semicolon): `modtime;size;path`.
+/// Lines that are malformed (fewer than 3 semicolon-delimited fields) or that
+/// represent directory entries (path ending with `/`) are silently skipped.
+/// An unparseable size field is treated as `0`.
+///
+/// # Arguments
+///
+/// * `stdout` — The raw stdout string from the rclone command.
+///
+/// # Returns
+///
+/// A `Vec<ArchiveEntry>` containing only file entries in the order they appear.
+pub fn parse_rclone_lsf(stdout: &str) -> Vec<ArchiveEntry> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            // CRITICAL: separator is ';' (semicolon), NOT tab or whitespace.
+            let parts: Vec<&str> = line.split(';').collect();
+            if parts.len() < 3 {
+                return None;
+            }
+            let path = parts[2].to_string();
+            // Skip directory entries (trailing slash) and empty paths.
+            if path.is_empty() || path.ends_with('/') {
+                return None;
+            }
+            let size = parts[1].parse::<u64>().unwrap_or(0);
+            Some(ArchiveEntry {
+                modtime: parts[0].to_string(),
+                size,
+                path,
+            })
+        })
+        .collect()
+}
+
+/// Strip all extensions from a path to produce a basename stem.
+///
+/// For example `"checkpoints/foo.safetensors"` → `"checkpoints/foo"`,
+/// and `"loras/bar.lora.pt"` → `"loras/bar"`.
+/// Used to build the sidecar filename `<stem>.meta.json`.
+///
+/// # Arguments
+///
+/// * `path` — Relative path (with or without directory component).
+///
+/// # Returns
+///
+/// The path string with all extensions (dot-delimited suffixes) removed.
+pub fn strip_sidecar_stem(path: &str) -> &str {
+    // Find the filename portion (after last '/')
+    let filename_start = path.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let filename = &path[filename_start..];
+    // Strip from the first '.' in the filename
+    let stem_end = filename.find('.').unwrap_or(filename.len());
+    &path[..filename_start + stem_end]
+}
+
+/// Check whether a sidecar `.meta.json` file exists for the given path in the entry list.
+///
+/// Builds the expected sidecar name as `<stem>.meta.json` where `<stem>` is the
+/// path with all extensions stripped by [`strip_sidecar_stem`], then searches
+/// the entry list for an exact path match.
+///
+/// # Arguments
+///
+/// * `entries` — The full list of archive entries from [`parse_rclone_lsf`].
+/// * `path` — The path of the model file to check.
+///
+/// # Returns
+///
+/// `true` if a corresponding `.meta.json` sidecar exists in `entries`.
+pub fn has_sidecar(entries: &[ArchiveEntry], path: &str) -> bool {
+    let stem = strip_sidecar_stem(path);
+    let sidecar = format!("{stem}.meta.json");
+    entries.iter().any(|e| e.path == sidecar)
+}
+
+/// Infer a [`ModelType`] from archive context using a priority chain.
+///
+/// The chain evaluates in order:
+/// 1. **Sidecar** (`sidecar_exists`): if true, the sidecar content is not yet
+///    fetched (S5+ scope), so the chain continues to dir/size instead of
+///    short-circuiting to `Unknown`.
+/// 2. **Dir name**: path segment keyword match (e.g. `/checkpoints/` → `Checkpoint`).
+/// 3. **Size range**: file size checked against `ARCHIVE_SIZE_*` thresholds.
+///    Size signal **wins over dir name** when they conflict — this prevents the
+///    "LoRA in checkpoints/" accident (issue 1777089776-92148).
+/// 4. **Unknown** fallback if no signal matches.
+///
+/// This function is intentionally infallible; it always returns a `ModelType`.
+///
+/// # Arguments
+///
+/// * `path` — Relative path of the archive file (e.g. `"checkpoints/foo.safetensors"`).
+/// * `size` — File size in bytes.
+/// * `sidecar_exists` — Whether a `.meta.json` sidecar was found for this file.
+///
+/// # Returns
+///
+/// The inferred [`ModelType`] according to the priority chain described above.
+pub fn infer_archive_model_type(path: &str, size: u64, sidecar_exists: bool) -> ModelType {
+    // Step 1: sidecar exists → content is not fetched yet (S5+ scope).
+    // We do NOT short-circuit here; continue to dir/size chain.
+    // sidecar_exists is reserved for future use when content becomes available.
+    let _ = sidecar_exists;
+
+    // Steps 2+3: delegate to ModelType::from_archive_path_and_size which
+    // implements size-wins-over-dir logic correctly.
+    // size=0 becomes None so the dir fallback is tried; if dir also misses → Unknown.
+    let size_opt = if size == 0 { None } else { Some(size) };
+
+    // When size is non-zero, evaluate size ranges first to allow size to win
+    // over a conflicting dir name (R4 / issue 1777089776-92148).
+    if let Some(sz) = size_opt {
+        // Size takes priority: check if size matches any known range.
+        if (ARCHIVE_SIZE_CP_MIN..=ARCHIVE_SIZE_CP_MAX).contains(&sz) {
+            // Size says Checkpoint — return regardless of dir name.
+            return ModelType::Checkpoint;
+        }
+        if (ARCHIVE_SIZE_LORA_MIN..=ARCHIVE_SIZE_LORA_MAX).contains(&sz) {
+            // Size says Lora — return regardless of dir name (accident fix).
+            return ModelType::Lora;
+        }
+        if (ARCHIVE_SIZE_VAE_MIN..=ARCHIVE_SIZE_VAE_MAX).contains(&sz) {
+            // Size says Vae — return regardless of dir name.
+            return ModelType::Vae;
+        }
+        // Size is known but falls outside all known ranges.
+        // Per R4 spec (context.md §Type Inference Chain):
+        //   "dir=checkpoints/ + size out of range → Unknown"
+        // Dir name is NOT used as fallback when size is present but out of range.
+        ModelType::Unknown
+    } else {
+        // size=0 → dir name is the only available signal; fall through to dir match.
+        ModelType::from_archive_path_and_size(path, None)
+    }
+}
+
+// =============================================================================
 // Pod scope helper
 // =============================================================================
 
@@ -1319,5 +1479,149 @@ mod tests {
         assert_eq!(results[0].model_type, ModelType::Checkpoint);
         assert_eq!(results[0].size_bytes, None);
         assert_eq!(results[0].metadata, serde_json::Value::Null);
+    }
+
+    // =============================================================================
+    // parse_rclone_lsf tests
+    // =============================================================================
+
+    // T1 — Happy path: semicolon-delimited tsp format, directory entry skipped
+    #[test]
+    fn parse_rclone_lsf_basic() {
+        let stdout = "\
+2024-01-15 10:30:45;5368709120;checkpoints/some_model.safetensors\n\
+2024-01-15 10:31:00;239075328;checkpoints/Dark_Fantasy_Painting__Pony.safetensors\n\
+2024-01-15 10:32:00;0;loras/\n";
+        let entries = parse_rclone_lsf(stdout);
+        assert_eq!(entries.len(), 2, "directory entry must be skipped");
+        assert_eq!(entries[0].path, "checkpoints/some_model.safetensors");
+        assert_eq!(entries[0].size, 5_368_709_120);
+        assert_eq!(entries[0].modtime, "2024-01-15 10:30:45");
+        assert_eq!(
+            entries[1].path,
+            "checkpoints/Dark_Fantasy_Painting__Pony.safetensors"
+        );
+        assert_eq!(entries[1].size, 239_075_328);
+    }
+
+    // T2 — Edge: malformed lines (< 3 fields) are silently skipped
+    #[test]
+    fn parse_rclone_lsf_malformed_lines() {
+        let stdout = "\
+bad line\n\
+;;\n\
+2024-01-15 10:30:45;5368709120;checkpoints/good.safetensors\n\
+only_two;fields\n";
+        let entries = parse_rclone_lsf(stdout);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "checkpoints/good.safetensors");
+    }
+
+    // T2 — Edge: empty string produces no entries
+    #[test]
+    fn parse_rclone_lsf_empty_string() {
+        let entries = parse_rclone_lsf("");
+        assert!(entries.is_empty());
+    }
+
+    // T2 — Edge: tab-separated input must NOT be parsed (wrong separator)
+    #[test]
+    fn parse_rclone_lsf_tab_separator_not_parsed() {
+        // Tabs are NOT the rclone tsp separator; these should appear as 1-field lines → skip.
+        let stdout = "2024-01-15 10:30:45\t5368709120\tcheckpoints/foo.safetensors\n";
+        let entries = parse_rclone_lsf(stdout);
+        // Tab-delimited line has no semicolons → parts.len() == 1 < 3 → skipped.
+        assert!(
+            entries.is_empty(),
+            "tab-separated input must not be parsed as tsp"
+        );
+    }
+
+    // =============================================================================
+    // infer_archive_model_type tests
+    // =============================================================================
+
+    // T1 — Happy path: checkpoints/ dir + CP-range size → Checkpoint
+    #[test]
+    fn infer_type_checkpoint_normal() {
+        let size_5gb = 5 * 1024 * 1024 * 1024;
+        let result =
+            infer_archive_model_type("checkpoints/some_model.safetensors", size_5gb, false);
+        assert_eq!(result, ModelType::Checkpoint);
+    }
+
+    // T1 — Accident case (issue 1777089776-92148): LoRA in checkpoints/ → Lora (size wins)
+    #[test]
+    fn infer_type_lora_in_checkpoints() {
+        // 228 MB is within LoRA range (50-500 MB) — size signal must override dir name.
+        let size_228mb: u64 = 228 * 1024 * 1024;
+        let result = infer_archive_model_type(
+            "checkpoints/Dark_Fantasy_Painting__Pony.safetensors",
+            size_228mb,
+            false,
+        );
+        assert_eq!(
+            result,
+            ModelType::Lora,
+            "LoRA in checkpoints/ must be classified as Lora based on size"
+        );
+    }
+
+    // T2 — Edge: checkpoints/ + size out of all ranges → Unknown
+    #[test]
+    fn infer_type_checkpoints_out_of_range() {
+        // 1 MB is below LoRA min (50 MB) → no size match, dir=checkpoints/ has no size → Unknown
+        let size_1mb: u64 = 1024 * 1024;
+        let result = infer_archive_model_type("checkpoints/tiny_test.bin", size_1mb, false);
+        assert_eq!(result, ModelType::Unknown);
+    }
+
+    // T1 — Happy path: no dir keyword + size in LoRA range → Lora
+    #[test]
+    fn infer_type_no_dir_lora_range() {
+        let size_200mb: u64 = 200 * 1024 * 1024;
+        let result = infer_archive_model_type("misc/some_adapter.safetensors", size_200mb, false);
+        assert_eq!(result, ModelType::Lora);
+    }
+
+    // T1 — Sidecar present + dir=checkpoints/ + CP-range size → Checkpoint (chain continues)
+    #[test]
+    fn infer_type_sidecar_exists_uses_chain() {
+        // Sidecar=true must NOT force Unknown; chain must continue to size/dir.
+        let size_5gb: u64 = 5 * 1024 * 1024 * 1024;
+        let result =
+            infer_archive_model_type("checkpoints/model_with_sidecar.safetensors", size_5gb, true);
+        assert_eq!(
+            result,
+            ModelType::Checkpoint,
+            "sidecar=true must not prevent type resolution via dir/size chain"
+        );
+    }
+
+    // T2 — Edge: size=0 → Unknown (no size signal, no dir match)
+    #[test]
+    fn infer_type_size_zero() {
+        let result = infer_archive_model_type("misc/unknown_file.bin", 0, false);
+        assert_eq!(result, ModelType::Unknown);
+    }
+
+    // T1 — Happy path: loras/ dir + CP-range size → Checkpoint (size wins over dir)
+    #[test]
+    fn infer_type_cp_in_loras_dir() {
+        let size_4gb: u64 = 4 * 1024 * 1024 * 1024;
+        let result = infer_archive_model_type("loras/large_model.safetensors", size_4gb, false);
+        assert_eq!(
+            result,
+            ModelType::Checkpoint,
+            "CP size wins over loras/ dir"
+        );
+    }
+
+    // T3 — Error path: size=0 with dir match → dir-based fallback (no size override)
+    #[test]
+    fn infer_type_zero_size_dir_fallback() {
+        // size=0 → None → from_archive_path_and_size with None → dir segment only
+        let result = infer_archive_model_type("loras/adapter.safetensors", 0, false);
+        assert_eq!(result, ModelType::Lora, "size=0 falls back to dir name");
     }
 }
