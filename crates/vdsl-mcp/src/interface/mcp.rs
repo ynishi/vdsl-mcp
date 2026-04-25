@@ -27,7 +27,8 @@ use crate::domain::models::{
     catalog_to_search_results, format_model_catalog_with_limit, parse_model_catalog, ModelType,
 };
 use crate::domain::models::{
-    has_sidecar, infer_archive_model_type, parse_rclone_lsf, BaseModel, ModelSearchResult, Scope,
+    infer_archive_model_type, parse_rclone_lsf, strip_sidecar_stem, BaseModel, ModelSearchResult,
+    Scope,
 };
 use crate::domain::pod::{format_pod_list, format_volume_list};
 use crate::infra::comfyui_client::{proxy_url, ComfyUiClient};
@@ -3560,6 +3561,9 @@ impl VdslMcpServer {
 
         let entries = parse_rclone_lsf(&result.stdout);
 
+        let entry_paths: std::collections::HashSet<&str> =
+            entries.iter().map(|e| e.path.as_str()).collect();
+
         // Apply query as case-insensitive filename substring filter.
         // Empty query = return all (archive full scan is the intended use case).
         let query_lower = req.query.trim().to_lowercase();
@@ -3574,7 +3578,9 @@ impl VdslMcpServer {
                 }
             })
             .map(|entry| {
-                let sidecar_exists = has_sidecar(&entries, &entry.path);
+                let stem = strip_sidecar_stem(&entry.path);
+                let sidecar_name = format!("{stem}.meta.json");
+                let sidecar_exists = entry_paths.contains(sidecar_name.as_str());
                 let model_type = infer_archive_model_type(&entry.path, entry.size, sidecar_exists);
                 let name = entry
                     .path

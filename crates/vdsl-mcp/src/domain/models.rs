@@ -680,7 +680,7 @@ pub fn parse_rclone_lsf(stdout: &str) -> Vec<ArchiveEntry> {
 /// # Returns
 ///
 /// The path string with all extensions (dot-delimited suffixes) removed.
-fn strip_all_extensions(path: &str) -> &str {
+pub fn strip_sidecar_stem(path: &str) -> &str {
     // Find the filename portion (after last '/')
     let filename_start = path.rfind('/').map(|i| i + 1).unwrap_or(0);
     let filename = &path[filename_start..];
@@ -692,7 +692,7 @@ fn strip_all_extensions(path: &str) -> &str {
 /// Check whether a sidecar `.meta.json` file exists for the given path in the entry list.
 ///
 /// Builds the expected sidecar name as `<stem>.meta.json` where `<stem>` is the
-/// path with all extensions stripped by [`strip_all_extensions`], then searches
+/// path with all extensions stripped by [`strip_sidecar_stem`], then searches
 /// the entry list for an exact path match.
 ///
 /// # Arguments
@@ -704,7 +704,7 @@ fn strip_all_extensions(path: &str) -> &str {
 ///
 /// `true` if a corresponding `.meta.json` sidecar exists in `entries`.
 pub fn has_sidecar(entries: &[ArchiveEntry], path: &str) -> bool {
-    let stem = strip_all_extensions(path);
+    let stem = strip_sidecar_stem(path);
     let sidecar = format!("{stem}.meta.json");
     entries.iter().any(|e| e.path == sidecar)
 }
