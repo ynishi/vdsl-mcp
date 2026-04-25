@@ -26,7 +26,9 @@ use crate::application::storage_service::{self, StorageService, RCLONE_OP_TIMEOU
 use crate::domain::models::{
     catalog_to_search_results, format_model_catalog_with_limit, parse_model_catalog, ModelType,
 };
-use crate::domain::models::{BaseModel, ModelSearchResult, Scope};
+use crate::domain::models::{
+    has_sidecar, infer_archive_model_type, parse_rclone_lsf, BaseModel, ModelSearchResult, Scope,
+};
 use crate::domain::pod::{format_pod_list, format_volume_list};
 use crate::infra::comfyui_client::{proxy_url, ComfyUiClient};
 use crate::infra::config::SyncdConfig;
@@ -1652,6 +1654,22 @@ pub struct VdslModelSearchRequest {
     /// compact: one-line per version for quick comparison.
     /// full: includes trigger words and description for deep-diving.
     pub view: Option<ModelSearchView>,
+
+    /// Pod ID for rclone execution. Required when scope=archive; rclone runs on the pod.
+    /// Archive scope only. Ignored for scope=remote and scope=pod.
+    pub pod_id: Option<String>,
+
+    /// B2 bucket name. When omitted, falls back to VDSL_B2_BUCKET environment variable.
+    /// Archive scope only. Ignored for scope=remote and scope=pod.
+    pub bucket: Option<String>,
+
+    /// B2 bucket path prefix for the recursive scan. None = bucket root.
+    /// Archive scope only. Ignored for scope=remote and scope=pod.
+    pub path: Option<String>,
+
+    /// SSH key override for pod access. When omitted, uses VDSL_SSH_KEY env or the default key.
+    /// Archive scope only. Ignored for scope=remote and scope=pod.
+    pub ssh_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3344,10 +3362,15 @@ impl VdslMcpServer {
                 }
             }
             Scope::Pod => self.search_pod(&req).await,
-            Scope::Archive => Err(McpError::invalid_params(
-                "scope=archive is not yet implemented",
-                None,
-            )),
+            Scope::Archive => {
+                let pod_id = req.pod_id.clone().ok_or_else(|| {
+                    McpError::invalid_params(
+                        "scope=archive requires pod_id (rclone runs on pod)",
+                        None,
+                    )
+                })?;
+                self.search_archive(&req, pod_id).await
+            }
         }
     }
 
@@ -3474,6 +3497,130 @@ impl VdslMcpServer {
 
         let json = serde_json::to_string_pretty(&results).map_err(|e| {
             tracing::warn!(error = %e, "Failed to serialize pod ModelSearchResult list");
+            McpError::internal_error(format!("serialize ModelSearchResult failed: {e}"), None)
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Search B2 cold-storage archive via rclone `lsf --recursive --format tsp`.
+    ///
+    /// Runs rclone on the given `pod_id` to list all files under the specified bucket/path
+    /// prefix. For each file entry, the model type is inferred using a priority chain:
+    /// (1) sidecar `.meta.json` existence, (2) dir-name keyword, (3) file-size range,
+    /// (4) `Unknown`. Size signal **wins over dir name** when they conflict to prevent the
+    /// "LoRA in checkpoints/" misclassification (issue 1777089776-92148).
+    ///
+    /// # Arguments
+    ///
+    /// * `req` — The original `VdslModelSearchRequest` (provides bucket / path / ssh_key).
+    /// * `pod_id` — Pod ID on which rclone will be invoked. Already validated as non-None.
+    ///
+    /// # Errors
+    ///
+    /// * `McpError::internal_error` — rclone execution fails or returns non-zero exit code.
+    /// * `McpError::internal_error` — B2 credentials env vars are missing.
+    /// * `McpError::internal_error` — Result serialization fails.
+    async fn search_archive(
+        &self,
+        req: &VdslModelSearchRequest,
+        pod_id: String,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = Self::pod_service()?;
+        let ssh_key = resolve_ssh_key(req.ssh_key.as_deref());
+        let bucket =
+            storage_service::resolve_bucket(req.bucket.as_deref()).map_err(Self::to_mcp_error)?;
+        let path = req.path.as_deref().unwrap_or("");
+        let remote = storage_service::b2_remote(&bucket, path).map_err(Self::to_mcp_error)?;
+
+        StorageService::new(&svc)
+            .ensure_rclone(&pod_id, &ssh_key)
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        let result = svc
+            .pod_exec(
+                &pod_id,
+                &["rclone", "lsf", "--format", "tsp", "--recursive", &remote],
+                Some(&ssh_key),
+                Some(RCLONE_OP_TIMEOUT_SECS),
+            )
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        if !result.success {
+            return Err(McpError::internal_error(
+                format!(
+                    "rclone lsf failed (exit {}): {}",
+                    result.exit_code,
+                    result.stderr.trim()
+                ),
+                None,
+            ));
+        }
+
+        let entries = parse_rclone_lsf(&result.stdout);
+
+        // Apply query as case-insensitive filename substring filter.
+        // Empty query = return all (archive full scan is the intended use case).
+        let query_lower = req.query.trim().to_lowercase();
+
+        let mut results: Vec<ModelSearchResult> = entries
+            .iter()
+            .filter(|e| {
+                if query_lower.is_empty() {
+                    true
+                } else {
+                    e.path.to_lowercase().contains(&query_lower)
+                }
+            })
+            .map(|entry| {
+                let sidecar_exists = has_sidecar(&entries, &entry.path);
+                let model_type = infer_archive_model_type(&entry.path, entry.size, sidecar_exists);
+                let name = entry
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&entry.path)
+                    .to_string();
+                let base = BaseModel::from_filename(&name);
+                let location = format!("b2://{bucket}/{}", entry.path);
+                let obtain = format!(
+                    "vdsl_storage_pull pod_id={} bucket={} path={}",
+                    pod_id, bucket, entry.path
+                );
+                let metadata = serde_json::json!({
+                    "modtime": entry.modtime,
+                    "rclone_raw_path": entry.path,
+                });
+                ModelSearchResult {
+                    name,
+                    model_type,
+                    base,
+                    scope: Scope::Archive,
+                    size_bytes: Some(entry.size),
+                    location,
+                    obtain: Some(obtain),
+                    metadata,
+                }
+            })
+            .collect();
+
+        // Post-filter by model_type.
+        if let Some(mt) = req.model_type {
+            results.retain(|r| r.model_type == mt);
+        }
+
+        // Post-filter by base model.
+        if let Some(b) = req.base {
+            results.retain(|r| r.base == b);
+        }
+
+        // Truncate to limit.
+        let limit = req.limit.unwrap_or(DEFAULT_LIST_LIMIT as u32) as usize;
+        results.truncate(limit);
+
+        let json = serde_json::to_string_pretty(&results).map_err(|e| {
+            tracing::warn!(error = %e, "Failed to serialize archive ModelSearchResult list");
             McpError::internal_error(format!("serialize ModelSearchResult failed: {e}"), None)
         })?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
