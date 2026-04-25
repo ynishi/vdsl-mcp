@@ -832,12 +832,14 @@ async fn precheck_disk_avail(
 
 /// Resolve ComfyUI install base path for a per-call storage operation.
 ///
-/// Per-call detection (no caching, no global state mutation) — see
-/// 2026-04-25 design note: vdsl_connect's global state is a separate
-/// concern; storage_{pull,push,archive} resolve fresh on every invocation
-/// because the per-call SSH cost is negligible compared to the rclone
-/// transfer that follows, and stale globals previously caused writes to
-/// the wrong directory.
+/// Resolution order:
+/// 1. `explicit` parameter (caller-supplied, highest priority).
+/// 2. The global `COMFYUI_BASE` when `vdsl_connect` has already auto-detected
+///    the pod's actual path (i.e. it differs from `DEFAULT_COMFYUI_BASE`).
+/// 3. Fresh SSH-based detection via `detect_comfyui_base` (original fallback).
+///
+/// The global shortcut avoids a redundant SSH round-trip for users who ran
+/// `vdsl_connect` before `vdsl_storage_pull` in the same session.
 async fn resolve_storage_comfy_base(
     explicit: Option<&str>,
     pod_id: &str,
@@ -846,6 +848,10 @@ async fn resolve_storage_comfy_base(
         if !p.is_empty() {
             return Ok(p.to_string());
         }
+    }
+    let cached = comfyui_base();
+    if cached != DEFAULT_COMFYUI_BASE {
+        return Ok(cached);
     }
     detect_comfyui_base(pod_id)
         .await
@@ -986,14 +992,14 @@ fn inject_civitai_token(url: &str) -> String {
 
 /// Convert a CivitAI `/api/v1/models` JSON response to a list of `ModelSearchResult`.
 ///
-/// Each model × version pair becomes one entry. Fields missing in the response
-/// degrade gracefully to `None` / `Unknown` without panicking.
+/// **1 model = 1 entry** — the top version (`modelVersions[0]`, newest first per
+/// CivitAI ordering) acts as the representative. Additional version data is folded
+/// into `metadata` so entry count always equals `limit` (the number of models),
+/// keeping output size predictable.
 ///
 /// `view` controls how much CivitAI metadata is embedded in `ModelSearchResult.metadata`:
-/// - `Compact`: a small object with `downloadCount`, `thumbsUpCount`, `nsfwLevel`,
-///   `supportsGeneration`, and (if non-empty) `trainedWords`. ~200 chars/entry.
-/// - `Full`: the version JSON verbatim (images / files / hashes / scan status).
-///   Multi-KB per entry; suitable for deep-dive of a few results, not bulk listing.
+/// - `Compact`: top version's compact stats + `version_count`. ~300 chars/entry.
+/// - `Full`: top 3 versions verbatim + `model_id`. Multi-KB; suitable for deep-dive.
 fn civitai_json_to_results(
     json: &serde_json::Value,
     view: ModelSearchView,
@@ -1002,51 +1008,69 @@ fn civitai_json_to_results(
     let items = json["items"].as_array().unwrap_or(&empty);
     let mut results: Vec<ModelSearchResult> = Vec::new();
 
+    let versions_empty: Vec<serde_json::Value> = vec![];
+    let files_empty: Vec<serde_json::Value> = vec![];
+
     for model in items {
         let name = model["name"].as_str().unwrap_or("(unknown)").to_string();
         let model_type = ModelType::from_civitai_type(model["type"].as_str().unwrap_or(""));
         let model_id = model["id"].as_u64().unwrap_or(0);
 
-        let versions_empty = vec![];
         let versions = model["modelVersions"].as_array().unwrap_or(&versions_empty);
-
-        for ver in versions {
-            let version_id = ver["id"].as_u64().unwrap_or(0);
-            let base_str = ver["baseModel"].as_str().unwrap_or("");
-            let base = BaseModel::from_filename(base_str);
-
-            let files_empty = vec![];
-            let files = ver["files"].as_array().unwrap_or(&files_empty);
-            let size_kb = files.first().and_then(|f| f["sizeKB"].as_f64());
-            let size_bytes = size_kb.map(|kb| (kb * 1024.0) as u64);
-
-            let dir_key = if model_type == ModelType::Unknown {
-                "<target_dir>".to_string()
-            } else {
-                model_type.as_dir_key().to_string()
-            };
-            let obtain = Some(format!(
-                "vdsl_download source=cv:{version_id} target={dir_key}"
-            ));
-            let location =
-                format!("https://civitai.com/models/{model_id}?modelVersionId={version_id}");
-
-            let metadata = match view {
-                ModelSearchView::Full => ver.clone(),
-                ModelSearchView::Compact => civitai_compact_metadata(ver),
-            };
-
-            results.push(ModelSearchResult {
-                name: name.clone(),
-                model_type,
-                base,
-                scope: Scope::Remote,
-                size_bytes,
-                location,
-                obtain,
-                metadata,
-            });
+        if versions.is_empty() {
+            continue;
         }
+
+        // Top version (versions[0]) = newest per CivitAI ordering = representative.
+        let top_ver = &versions[0];
+        let version_id = top_ver["id"].as_u64().unwrap_or(0);
+        let base_str = top_ver["baseModel"].as_str().unwrap_or("");
+        let base = BaseModel::from_filename(base_str);
+
+        let files = top_ver["files"].as_array().unwrap_or(&files_empty);
+        let size_kb = files.first().and_then(|f| f["sizeKB"].as_f64());
+        let size_bytes = size_kb.map(|kb| (kb * 1024.0) as u64);
+
+        let dir_key = if model_type == ModelType::Unknown {
+            "<target_dir>".to_string()
+        } else {
+            model_type.as_dir_key().to_string()
+        };
+        let obtain = Some(format!(
+            "vdsl_download source=cv:{version_id} target={dir_key}"
+        ));
+        let location = format!("https://civitai.com/models/{model_id}?modelVersionId={version_id}");
+
+        let metadata = match view {
+            ModelSearchView::Full => {
+                // Full: up to 3 versions verbatim + model_id for reference.
+                let vers: Vec<serde_json::Value> = versions.iter().take(3).cloned().collect();
+                let mut m = serde_json::Map::new();
+                m.insert("model_id".into(), serde_json::json!(model_id));
+                m.insert("versions".into(), serde_json::json!(vers));
+                serde_json::Value::Object(m)
+            }
+            ModelSearchView::Compact => {
+                // Compact: top version compact stats + total version count.
+                let mut m = civitai_compact_metadata(top_ver)
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+                m.insert("version_count".into(), serde_json::json!(versions.len()));
+                serde_json::Value::Object(m)
+            }
+        };
+
+        results.push(ModelSearchResult {
+            name,
+            model_type,
+            base,
+            scope: Scope::Remote,
+            size_bytes,
+            location,
+            obtain,
+            metadata,
+        });
     }
 
     results
@@ -9421,7 +9445,8 @@ mod tests {
     }
 
     #[test]
-    fn civitai_json_to_results_multiple_versions_expand() {
+    fn civitai_json_to_results_multiple_versions_one_entry() {
+        // 1 model with 2 versions → exactly 1 entry (top version = representative).
         let json = serde_json::json!({
             "items": [{
                 "id": 1,
@@ -9434,11 +9459,13 @@ mod tests {
             }]
         });
         let results = civitai_json_to_results(&json, ModelSearchView::Compact);
-        assert_eq!(results.len(), 2);
+        // 1 model → 1 entry regardless of version count
+        assert_eq!(results.len(), 1);
+        // top version (index 0) is the representative
         assert_eq!(results[0].base, BaseModel::Pony);
-        assert_eq!(results[1].base, BaseModel::Sdxl);
         assert!(results[0].obtain.as_deref().unwrap().contains("cv:10"));
-        assert!(results[1].obtain.as_deref().unwrap().contains("cv:20"));
+        // version_count tells the caller there are more versions
+        assert_eq!(results[0].metadata["version_count"], 2);
     }
 
     #[test]
@@ -9509,9 +9536,18 @@ mod tests {
         });
         let results = civitai_json_to_results(&json, ModelSearchView::Full);
         assert_eq!(results.len(), 1);
-        // Full keeps images and files verbatim
-        assert!(results[0].metadata.get("images").is_some());
-        assert!(results[0].metadata.get("files").is_some());
+        // Full: metadata = {model_id, versions: [{...}]}
+        // images and files are verbatim inside versions[0]
+        assert_eq!(results[0].metadata["model_id"], 1);
+        let ver0 = &results[0].metadata["versions"][0];
+        assert!(
+            ver0.get("images").is_some(),
+            "full must keep images inside versions[0]"
+        );
+        assert!(
+            ver0.get("files").is_some(),
+            "full must keep files inside versions[0]"
+        );
     }
 
     #[test]
@@ -9523,6 +9559,46 @@ mod tests {
         let meta = civitai_compact_metadata(&ver);
         assert!(meta.get("trainedWords").is_none());
         assert_eq!(meta["downloadCount"], 1);
+    }
+
+    #[test]
+    fn civitai_json_to_results_full_caps_versions_at_3() {
+        // Full view must include at most 3 versions even when the model has more.
+        let versions: Vec<serde_json::Value> = (1u64..=5)
+            .map(
+                |i| serde_json::json!({"id": i, "baseModel": "Pony", "files": [{"sizeKB": 100.0}]}),
+            )
+            .collect();
+        let json = serde_json::json!({
+            "items": [{
+                "id": 99, "name": "Many Vers", "type": "Checkpoint",
+                "modelVersions": versions
+            }]
+        });
+        let results = civitai_json_to_results(&json, ModelSearchView::Full);
+        assert_eq!(results.len(), 1);
+        let vers_arr = results[0].metadata["versions"].as_array().unwrap();
+        assert_eq!(vers_arr.len(), 3, "full must cap versions at 3");
+        assert_eq!(results[0].metadata["model_id"], 99);
+    }
+
+    #[test]
+    fn civitai_json_to_results_entry_count_equals_model_count() {
+        // 3 models each with multiple versions → exactly 3 entries.
+        let make_model = |id: u64, n_vers: u64| {
+            serde_json::json!({
+                "id": id, "name": format!("Model {id}"), "type": "Checkpoint",
+                "modelVersions": (1..=n_vers).map(|v| serde_json::json!({"id": v, "baseModel": "Pony", "files": [{"sizeKB": 100.0}]})).collect::<Vec<_>>()
+            })
+        };
+        let json = serde_json::json!({
+            "items": [make_model(1, 5), make_model(2, 10), make_model(3, 1)]
+        });
+        let results = civitai_json_to_results(&json, ModelSearchView::Compact);
+        assert_eq!(results.len(), 3, "entry count must equal model count");
+        assert_eq!(results[0].metadata["version_count"], 5);
+        assert_eq!(results[1].metadata["version_count"], 10);
+        assert_eq!(results[2].metadata["version_count"], 1);
     }
 
     // ---- extract_primary_checkpoint / sort tests ----

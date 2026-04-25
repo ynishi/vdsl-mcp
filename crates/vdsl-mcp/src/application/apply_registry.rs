@@ -163,6 +163,11 @@ impl ApplyRegistry {
     pub fn len(&self) -> usize {
         self.inner.read().map(|m| m.len()).unwrap_or(0)
     }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// Runner-side helper: update progress after a step finishes.

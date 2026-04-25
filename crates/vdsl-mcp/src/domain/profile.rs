@@ -124,6 +124,12 @@ pub struct SystemConfig {
 pub struct PythonConfig {
     #[serde(default)]
     pub deps: Vec<String>,
+    /// Optional Python version pin (e.g. `"3.12"`). Advisory only:
+    /// when set, `profile_apply` emits a Phase 3 warn step that compares
+    /// the requested version to the actual `python3` on the pod.
+    /// Mismatch logs to stderr but does not fail the apply.
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 /// One custom-node clone entry.

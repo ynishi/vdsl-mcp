@@ -451,8 +451,29 @@ pub fn expand_phases(
         )));
     }
 
-    // ---- Phase 3: python.deps ----
+    // ---- Phase 3: python version check (advisory) + python.deps ----
     if let Some(python) = &manifest.python {
+        // Phase 3a: warn if python.version is set and mismatches pod python3.
+        if let Some(want) = &python.version {
+            assert_shell_safe(want, "python.version")?;
+            let warn_script = format!(
+                "set -e\n\
+                 actual=$(python3 -c 'import sys; print(f\"{{sys.version_info.major}}.{{sys.version_info.minor}}\")')\n\
+                 want={want}\n\
+                 if [ \"$actual\" != \"$want\" ]; then\n\
+                   echo \"WARN: python.version={want} requested but pod python3 reports $actual; proceeding with $actual\" >&2\n\
+                 else\n\
+                   echo \"python version match: $actual\"\n\
+                 fi"
+            );
+            steps.push(StepEntry::Leaf(exec_step(
+                "3a_python_version_check",
+                &warn_script,
+                pod_id,
+                &env_json,
+            )));
+        }
+        // Phase 3: install python deps.
         if !python.deps.is_empty() {
             for dep in &python.deps {
                 assert_shell_safe(dep, "python.deps")?;
@@ -886,6 +907,12 @@ fn comfyui_install_script(repo: &str, git_ref: &str) -> String {
          cd ComfyUI\n\
          git fetch --all --tags && git checkout {git_ref}\n\
          test -d .venv || python3 -m venv --system-site-packages .venv\n\
+         .venv/bin/pip uninstall -y \
+           nvidia-cublas-cu13 nvidia-cudnn-cu13 nvidia-cuda-runtime-cu13 \
+           nvidia-cuda-cupti-cu13 nvidia-cuda-nvrtc-cu13 nvidia-cufft-cu13 \
+           nvidia-curand-cu13 nvidia-cusolver-cu13 nvidia-cusparse-cu13 \
+           nvidia-cusparselt-cu12 nvidia-nccl-cu13 nvidia-nvjitlink-cu13 \
+           nvidia-nvtx-cu13 2>/dev/null || true\n\
          .venv/bin/pip install --upgrade pip\n\
          grep -viE '{regex}' requirements.txt \
            | .venv/bin/pip install -r /dev/stdin\n\
@@ -1021,7 +1048,11 @@ fn comfyui_restart_script(port: u16, extra_args: &str) -> String {
                kill -KILL \"$pid\" 2>/dev/null || true\n\
              done\n\
            fi\n\
-           [ $i -ge 30 ] && echo 'port $PORT still held after 30s' >&2 && exit 1\n\
+           if [ $i -ge 30 ]; then\n\
+             echo 'port $PORT still held after 30s' >&2\n\
+             [ -f /workspace/.vdsl/comfyui.log ] && tail -100 /workspace/.vdsl/comfyui.log >&2\n\
+             exit 1\n\
+           fi\n\
            sleep 1\n\
          done\n\
          mkdir -p /workspace/.vdsl\n\
@@ -1031,7 +1062,11 @@ fn comfyui_restart_script(port: u16, extra_args: &str) -> String {
          i=0\n\
          until curl -sf http://localhost:$PORT/ >/dev/null; do\n\
            i=$((i+1))\n\
-           [ $i -ge 180 ] && echo 'comfyui not ready after 180s' >&2 && exit 1\n\
+           if [ $i -ge 180 ]; then\n\
+             echo 'comfyui not ready after 180s' >&2\n\
+             tail -100 /workspace/.vdsl/comfyui.log >&2\n\
+             exit 1\n\
+           fi\n\
            sleep 1\n\
          done\n"
     )

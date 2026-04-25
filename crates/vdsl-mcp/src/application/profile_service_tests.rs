@@ -29,6 +29,7 @@ fn full_manifest() -> ProfileManifest {
         }),
         python: Some(PythonConfig {
             deps: vec!["numpy".to_string()],
+            version: None,
         }),
         custom_nodes: vec![crate::domain::profile::CustomNode {
             name: "ComfyUI-Manager".to_string(),
@@ -981,6 +982,81 @@ fn expand_phases_without_comfyui_skips_phase_2_9_10() {
             "{forbidden} must NOT fire when comfyui is None; got: {ids:?}"
         );
     }
+}
+
+// ----- python.version advisory check -----
+
+#[test]
+fn python_config_version_serde_round_trip() {
+    // version field deserializes correctly and is absent when not set.
+    let with_ver: PythonConfig =
+        serde_json::from_str(r#"{"deps":["numpy"],"version":"3.12"}"#).unwrap();
+    assert_eq!(with_ver.version.as_deref(), Some("3.12"));
+    assert_eq!(with_ver.deps, vec!["numpy"]);
+
+    let without_ver: PythonConfig = serde_json::from_str(r#"{"deps":["torch"]}"#).unwrap();
+    assert!(without_ver.version.is_none());
+
+    // Default (empty) PythonConfig has no version.
+    let default_cfg = PythonConfig::default();
+    assert!(default_cfg.version.is_none());
+    assert!(default_cfg.deps.is_empty());
+}
+
+#[test]
+fn expand_phases_emits_python_version_check_step_when_set() {
+    let mut m = full_manifest();
+    m.python = Some(PythonConfig {
+        deps: vec!["numpy".to_string()],
+        version: Some("3.12".to_string()),
+    });
+    let plan = expand_phases(&m, "abc", false).expect("ok");
+
+    let script = find_script(&plan, "3a_python_version_check")
+        .expect("3a step must be present when python.version is set");
+    assert!(
+        script.contains("python3"),
+        "expected python3 invocation; got: {script}"
+    );
+    assert!(
+        script.contains("3.12"),
+        "expected requested version '3.12' in script; got: {script}"
+    );
+    assert!(
+        script.contains("WARN:"),
+        "expected WARN: mismatch message; got: {script}"
+    );
+    assert!(
+        script.contains(">&2"),
+        "warn must go to stderr; got: {script}"
+    );
+    // Step must exit 0 (no `exit 1` in the warn branch).
+    assert!(
+        !script.contains("exit 1"),
+        "warn step must not fail; got: {script}"
+    );
+}
+
+#[test]
+fn expand_phases_omits_python_version_check_step_when_absent() {
+    // python.version not set → 3a step must NOT appear.
+    let m = full_manifest(); // full_manifest has version: None
+    let plan = expand_phases(&m, "abc", false).expect("ok");
+    assert!(
+        find_script(&plan, "3a_python_version_check").is_none(),
+        "3a step must be absent when python.version is None"
+    );
+}
+
+#[test]
+fn expand_phases_rejects_unsafe_python_version() {
+    let mut m = full_manifest();
+    m.python = Some(PythonConfig {
+        deps: vec![],
+        version: Some("3.12; rm -rf /".to_string()),
+    });
+    let err = expand_phases(&m, "abc", false).unwrap_err();
+    assert!(matches!(err, ProfileError::InvalidManifest(_)));
 }
 
 // ----- compute_profile_hash -----
