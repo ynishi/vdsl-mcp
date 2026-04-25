@@ -742,6 +742,119 @@ dirname "$abs"
 
     Ok(None)
 }
+
+/// Default minimum free disk required (GB) before storage_pull / profile_apply
+/// proceed. Override via `VDSL_DISK_AVAIL_MIN_GB` env. Default sized for
+/// multi-checkpoint Profile workloads (a stack of 3-4 SDXL + LoRA + VAE
+/// trivially exceeds 100 GB peak).
+const DEFAULT_DISK_AVAIL_MIN_GB: u32 = 300;
+
+/// Filesystem path checked by `precheck_disk_avail`. Override via
+/// `VDSL_DISK_CHECK_PATH` env.
+const DEFAULT_DISK_CHECK_PATH: &str = "/workspace";
+
+fn disk_avail_min_gb() -> u32 {
+    std::env::var("VDSL_DISK_AVAIL_MIN_GB")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_DISK_AVAIL_MIN_GB)
+}
+
+fn disk_check_path() -> String {
+    std::env::var("VDSL_DISK_CHECK_PATH")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_DISK_CHECK_PATH.to_string())
+}
+
+/// Fail-fast disk capacity precheck. Runs `df -BG <path>` over SSH on the
+/// pod, parses the Available column, and returns `Err(invalid_params)` when
+/// it falls below the configured threshold.
+///
+/// Threshold and check path are env-tunable so operators can right-size for
+/// their model stack without recompiling. The default 300 GB is intentionally
+/// generous: pulling a single SDXL checkpoint is ~7 GB, but a Profile apply
+/// commonly stages 5-10+ models plus working set, and shrinking a RunPod
+/// network volume after the fact is impossible.
+async fn precheck_disk_avail(
+    svc: &PodService,
+    pod_id: &str,
+    ssh_key: &str,
+) -> Result<(), McpError> {
+    let path = disk_check_path();
+    let min_gb = disk_avail_min_gb();
+    let df_cmd = format!(
+        "df -BG {} | tail -1 | awk '{{print $4}}' | sed 's/G$//'",
+        path
+    );
+    let out = svc
+        .pod_exec(pod_id, &["bash", "-c", &df_cmd], Some(ssh_key), Some(20))
+        .await
+        .map_err(VdslMcpServer::to_mcp_error)?;
+    if !out.success {
+        return Err(McpError::internal_error(
+            format!(
+                "disk precheck failed on pod {pod_id} ({path}): exit={} stderr={}",
+                out.exit_code,
+                out.stderr.trim()
+            ),
+            None,
+        ));
+    }
+    let avail: u32 = out.stdout.trim().parse().map_err(|_| {
+        McpError::internal_error(
+            format!(
+                "disk precheck: unparseable df output on pod {pod_id} ({path}): {:?}",
+                out.stdout
+            ),
+            None,
+        )
+    })?;
+    if avail < min_gb {
+        return Err(McpError::invalid_params(
+            format!(
+                "disk full: avail={avail}GB on {path} (required ≥ {min_gb}GB). \
+                 Resize the volume, or run vdsl_storage_archive on stale models first. \
+                 Threshold tunable via VDSL_DISK_AVAIL_MIN_GB env."
+            ),
+            None,
+        ));
+    }
+    tracing::debug!(%pod_id, %path, avail, min_gb, "precheck_disk_avail: ok");
+    Ok(())
+}
+
+/// Resolve ComfyUI install base path for a per-call storage operation.
+///
+/// Per-call detection (no caching, no global state mutation) — see
+/// 2026-04-25 design note: vdsl_connect's global state is a separate
+/// concern; storage_{pull,push,archive} resolve fresh on every invocation
+/// because the per-call SSH cost is negligible compared to the rclone
+/// transfer that follows, and stale globals previously caused writes to
+/// the wrong directory.
+async fn resolve_storage_comfy_base(
+    explicit: Option<&str>,
+    pod_id: &str,
+) -> Result<String, McpError> {
+    if let Some(p) = explicit {
+        if !p.is_empty() {
+            return Ok(p.to_string());
+        }
+    }
+    detect_comfyui_base(pod_id)
+        .await
+        .map_err(VdslMcpServer::to_mcp_error)?
+        .ok_or_else(|| {
+            McpError::invalid_params(
+                format!(
+                    "ComfyUI install not found on pod {pod_id}. \
+                     Pass comfy_base explicitly or ensure ComfyUI is running."
+                ),
+                None,
+            )
+        })
+}
+
 /// Max wait time for downloads (seconds).
 const DOWNLOAD_TIMEOUT_SECS: u64 = 600;
 /// Interval between download status polls (seconds).
@@ -1153,6 +1266,10 @@ pub struct VdslStoragePullRequest {
 
     /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519.
     pub ssh_key: Option<String>,
+
+    /// Explicit ComfyUI install base path on the pod (e.g. "/workspace/ComfyUI").
+    /// When omitted, the path is auto-detected via SSH on every call (no caching).
+    pub comfy_base: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1176,6 +1293,9 @@ pub struct VdslStoragePushRequest {
 
     /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519.
     pub ssh_key: Option<String>,
+
+    /// Explicit ComfyUI install base path on the pod. Auto-detected when omitted.
+    pub comfy_base: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1197,6 +1317,9 @@ pub struct VdslStorageArchiveRequest {
 
     /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519.
     pub ssh_key: Option<String>,
+
+    /// Explicit ComfyUI install base path on the pod. Auto-detected when omitted.
+    pub comfy_base: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1955,7 +2078,10 @@ impl VdslMcpServer {
         description = "[infra] Create a new ComfyUI pod on RunPod. \
             Omit volume_id to create an ephemeral pod (no persistent storage, disk default 100GB). \
             Use vdsl_storage_pull after setup to restore models from B2 cold storage. \
-            Applies ComfyUI defaults (template, ports) automatically.",
+            Applies ComfyUI defaults (template, ports) automatically. \
+            For multi-checkpoint workloads or vdsl_profile_apply set volume_gb≥100 \
+            (default 20GB is for single-image smoke tests only). Volume size cannot be \
+            shrunk later — err on the larger side.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1989,10 +2115,7 @@ impl VdslMcpServer {
         // 2026-04-24 accident record. Use `image_name` with a pytorch
         // base + `vdsl_profile_apply` to install ComfyUI fresh.
         if let Some(image) = req.image_name.as_ref() {
-            spec.insert(
-                "imageName".into(),
-                serde_json::Value::String(image.clone()),
-            );
+            spec.insert("imageName".into(), serde_json::Value::String(image.clone()));
         } else {
             let template = req
                 .template_id
@@ -2019,10 +2142,7 @@ impl VdslMcpServer {
             // volume provides its own size). A stack of multiple SDXL
             // checkpoints (~7 GB each) easily overflows the default
             // 20 GB, so the caller typically passes 100+.
-            spec.insert(
-                "volumeInGb".into(),
-                serde_json::Value::Number(vgb.into()),
-            );
+            spec.insert("volumeInGb".into(), serde_json::Value::Number(vgb.into()));
         }
 
         if let Some(gpu) = req.gpu {
@@ -4074,7 +4194,11 @@ impl VdslMcpServer {
             storage_service::b2_remote(&bucket, &req.source).map_err(Self::to_mcp_error)?;
         let dir_name =
             resolve_model_dir(&req.target).map_err(|e| McpError::invalid_params(e, None))?;
-        let dest = format!("{}/{dir_name}/", comfyui_models_base());
+
+        precheck_disk_avail(&svc, &req.pod_id, &ssh_key).await?;
+
+        let comfy_base = resolve_storage_comfy_base(req.comfy_base.as_deref(), &req.pod_id).await?;
+        let dest = format!("{comfy_base}/models/{dir_name}/");
 
         StorageService::new(&svc)
             .ensure_rclone(&req.pod_id, &ssh_key)
@@ -4133,7 +4257,8 @@ impl VdslMcpServer {
         let dir_name =
             resolve_model_dir(&req.source_target).map_err(|e| McpError::invalid_params(e, None))?;
 
-        let models_base = comfyui_models_base();
+        let comfy_base = resolve_storage_comfy_base(req.comfy_base.as_deref(), &req.pod_id).await?;
+        let models_base = format!("{comfy_base}/models");
         let source = match req.filename {
             Some(ref f) => format!("{models_base}/{dir_name}/{f}"),
             None => format!("{models_base}/{dir_name}/"),
@@ -4210,7 +4335,8 @@ impl VdslMcpServer {
         let dir_name =
             resolve_model_dir(&req.source_target).map_err(|e| McpError::invalid_params(e, None))?;
 
-        let source_path = format!("{}/{dir_name}/{}", comfyui_models_base(), req.filename);
+        let comfy_base = resolve_storage_comfy_base(req.comfy_base.as_deref(), &req.pod_id).await?;
+        let source_path = format!("{comfy_base}/models/{dir_name}/{}", req.filename);
         let dest_path = req.dest_path.as_deref().unwrap_or("").trim_matches('/');
         let remote_dir = if dest_path.is_empty() {
             format!("models/{dir_name}")
@@ -5615,6 +5741,15 @@ impl VdslMcpServer {
             .map_err(|e| McpError::invalid_params(format!("profile secrets: {e}"), None))?;
         let plan = expand_phases(&manifest, &req.pod_id, req.dry_run)
             .map_err(|e| McpError::invalid_params(format!("profile expand: {e}"), None))?;
+
+        // Skip the SSH-based disk precheck for dry_run: the call is expected
+        // to be cheap and offline (no pod required). Real apply hits SSH
+        // anyway via batch dispatch, so the added round trip is noise-level.
+        if !req.dry_run {
+            let pod_svc = Self::pod_service()?;
+            let ssh_key = resolve_ssh_key(None);
+            precheck_disk_avail(&pod_svc, &req.pod_id, &ssh_key).await?;
+        }
 
         let svc = BatchService::new(self.clone());
 
