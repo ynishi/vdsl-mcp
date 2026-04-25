@@ -32,8 +32,7 @@ impl SyncStoreSdk for SdkImpl {
 
         // Phase 0a: Ensure — 全拠点の到達確認 + 外部ツール確保
         // 失敗したLocationはスキャン/転送対象から除外し、syncは続行する。
-        let location_ids: Vec<String> =
-            self.locations.iter().map(|l| l.id().to_string()).collect();
+        let location_ids: Vec<String> = self.locations.iter().map(|l| l.id().to_string()).collect();
         info!(
             location_count = self.locations.len(),
             locations = %location_ids.join(", "),
@@ -65,8 +64,7 @@ impl SyncStoreSdk for SdkImpl {
         if failed_locations.is_empty() {
             info!("sdk_impl::sync: ensure done — all locations reachable");
         } else {
-            let excluded: Vec<String> =
-                failed_locations.iter().map(|l| l.to_string()).collect();
+            let excluded: Vec<String> = failed_locations.iter().map(|l| l.to_string()).collect();
             warn!(
                 excluded = %excluded.join(", "),
                 "sdk_impl::sync: ensure done — {} location(s) excluded due to ensure failure",

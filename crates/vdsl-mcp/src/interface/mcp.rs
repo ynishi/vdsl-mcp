@@ -24,8 +24,6 @@ use std::sync::{Arc, Mutex};
 use crate::application::pod_service::{resolve_api_key, PodService};
 use crate::application::storage_service::{self, StorageService, RCLONE_OP_TIMEOUT_SECS};
 use crate::domain::models::{format_model_catalog_with_limit, parse_model_catalog, ModelType};
-// These will be used in subtask 2–4 (scope=remote/pod/archive dispatch).
-#[allow(unused_imports)]
 use crate::domain::models::{BaseModel, ModelSearchResult, Scope};
 use crate::domain::pod::{format_pod_list, format_volume_list};
 use crate::infra::comfyui_client::{proxy_url, ComfyUiClient};
@@ -855,11 +853,69 @@ fn inject_civitai_token(url: &str) -> String {
     format!("{url}{sep}token={token}")
 }
 
+/// Convert a CivitAI `/api/v1/models` JSON response to a list of `ModelSearchResult`.
+///
+/// Each model × version pair becomes one entry. Fields missing in the response
+/// degrade gracefully to `None` / `Unknown` without panicking.
+fn civitai_json_to_results(json: &serde_json::Value) -> Vec<ModelSearchResult> {
+    let empty = vec![];
+    let items = json["items"].as_array().unwrap_or(&empty);
+    let mut results: Vec<ModelSearchResult> = Vec::new();
+
+    for model in items {
+        let name = model["name"].as_str().unwrap_or("(unknown)").to_string();
+        let model_type = ModelType::from_civitai_type(model["type"].as_str().unwrap_or(""));
+        let model_id = model["id"].as_u64().unwrap_or(0);
+
+        let versions_empty = vec![];
+        let versions = model["modelVersions"].as_array().unwrap_or(&versions_empty);
+
+        for ver in versions {
+            let version_id = ver["id"].as_u64().unwrap_or(0);
+            let base_str = ver["baseModel"].as_str().unwrap_or("");
+            let base = BaseModel::from_filename(base_str);
+
+            let files_empty = vec![];
+            let files = ver["files"].as_array().unwrap_or(&files_empty);
+            let size_kb = files.first().and_then(|f| f["sizeKB"].as_f64());
+            let size_bytes = size_kb.map(|kb| (kb * 1024.0) as u64);
+
+            let dir_key = if model_type == ModelType::Unknown {
+                "<target_dir>".to_string()
+            } else {
+                model_type.as_dir_key().to_string()
+            };
+            let obtain = Some(format!(
+                "vdsl_download source=cv:{version_id} target={dir_key}"
+            ));
+            let location =
+                format!("https://civitai.com/models/{model_id}?modelVersionId={version_id}");
+
+            results.push(ModelSearchResult {
+                name: name.clone(),
+                model_type,
+                base,
+                scope: Scope::Remote,
+                size_bytes,
+                location,
+                obtain,
+                metadata: ver.clone(),
+            });
+        }
+    }
+
+    results
+}
+
 /// Format CivitAI /api/v1/models response into human-readable text.
+///
+/// Kept for backward compatibility. New code should use `civitai_json_to_results`
+/// to obtain `Vec<ModelSearchResult>` JSON.
 ///
 /// `view` controls detail level:
 /// - Compact: one-line per version (name, cv:ID, base, size, DL, rating)
 /// - Full: compact + trigger words + description
+#[allow(dead_code)]
 fn format_civitai_results(json: &serde_json::Value, view: ModelSearchView) -> String {
     let items = match json["items"].as_array() {
         Some(arr) if !arr.is_empty() => arr,
@@ -982,6 +1038,7 @@ fn format_civitai_results(json: &serde_json::Value, view: ModelSearchView) -> St
 }
 
 /// Format file size from KB to human-readable string.
+#[allow(dead_code)]
 fn format_file_size(size_kb: f64) -> String {
     if size_kb >= 1_048_576.0 {
         format!("{:.1} GB", size_kb / 1_048_576.0)
@@ -1574,7 +1631,17 @@ pub struct VdslModelSearchRequest {
     pub limit: Option<u32>,
 
     /// Filter by base model (e.g. "SDXL 1.0", "SD 1.5", "Flux.1 D").
+    /// Deprecated: use `base` (typed enum) for new callers. Kept for backward compatibility.
+    /// When both `base` and `base_model` are specified, `base` takes precedence.
     pub base_model: Option<String>,
+
+    /// Search scope: remote (CivitAI marketplace), archive (B2 cold storage), pod (running ComfyUI). Default: remote.
+    pub scope: Option<Scope>,
+
+    /// Filter by base model architecture (typed). Use this instead of base_model (free string) for new code.
+    /// base_model is kept for backward compatibility.
+    /// type (model_type field): see model_type for filtering by category.
+    pub base: Option<BaseModel>,
 
     /// Include NSFW results (default: false).
     pub nsfw: Option<bool>,
@@ -3262,17 +3329,28 @@ impl VdslMcpServer {
             return Err(McpError::invalid_params("query is required", None));
         }
 
-        let source = req.source.unwrap_or(ModelSource::Cv);
-        match source {
-            ModelSource::Cv => self.search_civitai(&req).await,
-            ModelSource::Hf => Err(McpError::invalid_params(
-                "HuggingFace search is not yet supported. Use source: \"cv\" (CivitAI) for now.",
+        let scope = req.scope.unwrap_or(Scope::Remote);
+        match scope {
+            Scope::Remote => {
+                let source = req.source.unwrap_or(ModelSource::Cv);
+                match source {
+                    ModelSource::Cv => self.search_civitai(&req).await,
+                    ModelSource::Hf => Err(McpError::invalid_params(
+                        "HuggingFace search is not yet supported. Use source: \"cv\" (CivitAI) for now.",
+                        None,
+                    )),
+                }
+            }
+            Scope::Pod | Scope::Archive => Err(McpError::invalid_params(
+                "scope=pod is not yet implemented in this subtask, will be added in next subtask",
                 None,
             )),
         }
     }
 
     /// CivitAI model search via GET /api/v1/models.
+    ///
+    /// Returns a JSON-serialized `Vec<ModelSearchResult>` as text content.
     async fn search_civitai(
         &self,
         req: &VdslModelSearchRequest,
@@ -3304,9 +3382,13 @@ impl VdslMcpServer {
         let period = req.period.unwrap_or_default();
         url.push_str(&format!("&period={}", period.to_civitai_period()));
 
-        if let Some(ref bm) = req.base_model {
+        // base (typed enum) takes precedence over base_model (free string).
+        if let Some(bm_str) = req.base.as_ref().and_then(|b| b.to_civitai_str()) {
+            url.push_str(&format!("&baseModels={}", urlencoding::encode(bm_str)));
+        } else if let Some(ref bm) = req.base_model {
             url.push_str(&format!("&baseModels={}", urlencoding::encode(bm)));
         }
+
         if let Some(nsfw) = req.nsfw {
             url.push_str(&format!("&nsfw={nsfw}"));
         }
@@ -3320,12 +3402,14 @@ impl VdslMcpServer {
         }
 
         let resp = request.send().await.map_err(|e| {
+            tracing::warn!(error = %e, "CivitAI API request failed");
             McpError::internal_error(format!("CivitAI API request failed: {e}"), None)
         })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(status = %status, body = %body, "CivitAI API returned error");
             return Err(McpError::internal_error(
                 format!("CivitAI API returned {status}: {body}"),
                 None,
@@ -3333,11 +3417,16 @@ impl VdslMcpServer {
         }
 
         let json: serde_json::Value = resp.json().await.map_err(|e| {
+            tracing::warn!(error = %e, "Failed to parse CivitAI response");
             McpError::internal_error(format!("Failed to parse CivitAI response: {e}"), None)
         })?;
 
-        let output = format_civitai_results(&json, view);
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        let results = civitai_json_to_results(&json);
+        let json_str = serde_json::to_string_pretty(&results).map_err(|e| {
+            tracing::warn!(error = %e, "Failed to serialize ModelSearchResult");
+            McpError::internal_error(format!("serialize ModelSearchResult failed: {e}"), None)
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(json_str)]))
     }
 
     #[tool(
@@ -8293,6 +8382,8 @@ mod tests {
         assert!(req.sort.is_none());
         assert!(req.limit.is_none());
         assert!(req.base_model.is_none());
+        assert!(req.scope.is_none());
+        assert!(req.base.is_none());
         assert!(req.nsfw.is_none());
         assert!(req.view.is_none());
     }
@@ -8484,6 +8575,148 @@ mod tests {
         assert!(out.contains("cv:10"));
         assert!(!out.contains("cv:11"));
         assert!(out.contains("2 more version"));
+    }
+
+    // ---- S2: scope/base fields on VdslModelSearchRequest ----
+
+    #[test]
+    fn model_search_request_scope_and_base_fields() {
+        // scope=remote, base=sdxl parse correctly
+        let req: VdslModelSearchRequest =
+            serde_json::from_str(r#"{"query":"test","scope":"remote","base":"sdxl"}"#).unwrap();
+        assert!(matches!(req.scope, Some(Scope::Remote)));
+        assert!(matches!(req.base, Some(BaseModel::Sdxl)));
+    }
+
+    #[test]
+    fn model_search_request_scope_archive_parses() {
+        let req: VdslModelSearchRequest =
+            serde_json::from_str(r#"{"query":"test","scope":"archive"}"#).unwrap();
+        assert!(matches!(req.scope, Some(Scope::Archive)));
+    }
+
+    #[test]
+    fn model_search_request_scope_pod_parses() {
+        let req: VdslModelSearchRequest =
+            serde_json::from_str(r#"{"query":"test","scope":"pod"}"#).unwrap();
+        assert!(matches!(req.scope, Some(Scope::Pod)));
+    }
+
+    #[test]
+    fn model_search_request_minimal_has_no_scope_or_base() {
+        let req: VdslModelSearchRequest = serde_json::from_str(r#"{"query":"test"}"#).unwrap();
+        assert!(req.scope.is_none());
+        assert!(req.base.is_none());
+    }
+
+    // ---- S2: civitai_json_to_results ----
+
+    #[test]
+    fn civitai_json_to_results_empty_items() {
+        let json = serde_json::json!({"items": []});
+        let results = civitai_json_to_results(&json);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn civitai_json_to_results_no_items_key() {
+        let json = serde_json::json!({});
+        let results = civitai_json_to_results(&json);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn civitai_json_to_results_happy_path() {
+        let json = serde_json::json!({
+            "items": [{
+                "id": 999,
+                "name": "Test LoRA",
+                "type": "LORA",
+                "modelVersions": [{
+                    "id": 12345,
+                    "baseModel": "SDXL 1.0",
+                    "files": [{"sizeKB": 153600.0}]
+                }]
+            }]
+        });
+        let results = civitai_json_to_results(&json);
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert_eq!(r.name, "Test LoRA");
+        assert_eq!(r.model_type, ModelType::Lora);
+        // SDXL 1.0 → BaseModel::from_filename → Sdxl
+        assert_eq!(r.base, BaseModel::Sdxl);
+        assert_eq!(r.scope, Scope::Remote);
+        // 153600 KB * 1024 = 157286400 bytes
+        assert_eq!(r.size_bytes, Some(153600 * 1024));
+        assert_eq!(
+            r.location,
+            "https://civitai.com/models/999?modelVersionId=12345"
+        );
+        let obtain = r.obtain.as_deref().unwrap();
+        assert!(obtain.contains("cv:12345"));
+        assert!(obtain.contains("loras"));
+    }
+
+    #[test]
+    fn civitai_json_to_results_missing_fields_degrade_gracefully() {
+        // No "type", no "modelVersions" files, no sizeKB
+        let json = serde_json::json!({
+            "items": [{
+                "id": 1,
+                "name": "Mystery Model",
+                "modelVersions": [{
+                    "id": 42,
+                    "baseModel": ""
+                }]
+            }]
+        });
+        let results = civitai_json_to_results(&json);
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert_eq!(r.model_type, ModelType::Unknown);
+        assert_eq!(r.base, BaseModel::Unknown);
+        assert!(r.size_bytes.is_none());
+        // Unknown type → "<target_dir>" placeholder in obtain
+        let obtain = r.obtain.as_deref().unwrap();
+        assert!(obtain.contains("<target_dir>"));
+    }
+
+    #[test]
+    fn civitai_json_to_results_multiple_versions_expand() {
+        let json = serde_json::json!({
+            "items": [{
+                "id": 1,
+                "name": "Multi-Version",
+                "type": "Checkpoint",
+                "modelVersions": [
+                    {"id": 10, "baseModel": "Pony", "files": [{"sizeKB": 3000000.0}]},
+                    {"id": 20, "baseModel": "SDXL 1.0", "files": [{"sizeKB": 4000000.0}]}
+                ]
+            }]
+        });
+        let results = civitai_json_to_results(&json);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].base, BaseModel::Pony);
+        assert_eq!(results[1].base, BaseModel::Sdxl);
+        assert!(results[0].obtain.as_deref().unwrap().contains("cv:10"));
+        assert!(results[1].obtain.as_deref().unwrap().contains("cv:20"));
+    }
+
+    #[test]
+    fn civitai_json_to_results_checkpoint_has_checkpoints_in_obtain() {
+        let json = serde_json::json!({
+            "items": [{
+                "id": 5,
+                "name": "My Checkpoint",
+                "type": "Checkpoint",
+                "modelVersions": [{"id": 100, "baseModel": "SD 1.5", "files": [{"sizeKB": 4000000.0}]}]
+            }]
+        });
+        let results = civitai_json_to_results(&json);
+        assert_eq!(results.len(), 1);
+        let obtain = results[0].obtain.as_deref().unwrap();
+        assert!(obtain.contains("target=checkpoints"), "obtain={obtain}");
     }
 
     // ---- extract_primary_checkpoint / sort tests ----
