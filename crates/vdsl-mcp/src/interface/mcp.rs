@@ -2014,12 +2014,17 @@ pub struct VdslProfileApplyRequest {
     /// Exactly one of `manifest`, `script_file`, or `code` must be provided.
     pub manifest: Option<String>,
 
-    /// Path to a Lua script that constructs and returns a Profile object via
-    /// `return profile.new({...})`. Mutually exclusive with `manifest` and `code`.
+    /// Path to a Lua script that constructs a Profile object and emits it via
+    /// `vdsl.profile_emit(profile)`. Mutually exclusive with `manifest` and `code`.
+    ///
+    /// The script must call `vdsl.profile_emit(profile)` at the end; the function
+    /// writes the manifest JSON to `VDSL_PROFILE_OUT` (set by the MCP layer).
+    /// In standalone CLI mode (`VDSL_PROFILE_OUT` unset) `profile_emit` is a no-op,
+    /// so existing CLI workflows are unaffected.
     pub script_file: Option<String>,
 
-    /// Inline Lua code that constructs and returns a Profile object.
-    /// Mutually exclusive with `manifest` and `script_file`.
+    /// Inline Lua code that constructs a Profile object and emits it via
+    /// `vdsl.profile_emit(profile)`. Mutually exclusive with `manifest` and `script_file`.
     pub code: Option<String>,
 
     /// Working directory for Lua `require()` resolution (must contain `lua/`).
@@ -7719,37 +7724,8 @@ fn match_workflow_label<'a>(image_path: &std::path::Path, labels: &'a [String]) 
 // Profile Lua subprocess helpers
 // =============================================================================
 
-/// Timeout for the profile Lua subprocess that extracts manifest_json (seconds).
+/// Timeout for the profile Lua subprocess (seconds).
 const VDSL_PROFILE_LUA_TIMEOUT_SECS: u64 = 30;
-
-/// Wrapper Lua that loads a user profile script via `loadfile`, calls it, validates
-/// the returned Profile object, and writes `manifest_json(false)` to stdout.
-///
-/// The user script path is passed via `VDSL_PROFILE_USER_SCRIPT` env var so that
-/// the path can contain arbitrary characters without shell quoting issues.
-const VDSL_PROFILE_WRAPPER_LUA: &str = r#"
-local script_path = os.getenv("VDSL_PROFILE_USER_SCRIPT")
-if not script_path then
-    io.stderr:write("VDSL_PROFILE_USER_SCRIPT not set\n")
-    os.exit(1)
-end
-local chunk, err = loadfile(script_path)
-if not chunk then
-    io.stderr:write("loadfile failed: " .. tostring(err) .. "\n")
-    os.exit(1)
-end
-local ok, result = pcall(chunk)
-if not ok then
-    io.stderr:write("script error: " .. tostring(result) .. "\n")
-    os.exit(1)
-end
-local p = result
-if type(p) ~= "table" or p.schema ~= "vdsl.profile/1" then
-    io.stderr:write("expected Profile object (vdsl.profile/1), got schema=" .. tostring(type(p) == "table" and p.schema or type(p)) .. "\n")
-    os.exit(2)
-end
-io.write(p:manifest_json(false))
-"#;
 
 /// Resolve the default working directory for profile Lua subprocess.
 ///
@@ -7818,28 +7794,30 @@ fn resolve_profile_working_dir(
 }
 
 /// Run a user profile Lua script (or inline code) via subprocess and return
-/// the manifest JSON string captured from stdout.
+/// the manifest JSON string.
 ///
-/// Writes inline `code` to a tempfile and sets `VDSL_PROFILE_USER_SCRIPT` to
-/// the path. For `script_file`, the path is passed directly via the same env var.
+/// Uses the emit pattern: the MCP layer sets `VDSL_PROFILE_OUT` to a temporary
+/// file path, and the user script must call `vdsl.profile_emit(profile)` which
+/// writes `profile:manifest_json(false)` to that path.
+///
+/// This decouples manifest extraction from stdout, so any `print()` or
+/// `io.write()` calls in the user script cannot corrupt the manifest JSON.
+///
+/// In standalone CLI mode (`VDSL_PROFILE_OUT` unset), `vdsl.profile_emit` is
+/// a no-op, so existing scripts run unchanged outside of MCP.
+///
+/// Note: `vdsl.profile_emit` must be available in the vdsl runtime
+/// (`lua/vdsl/init.lua`). Users must add `vdsl.profile_emit(profile)` to
+/// their profile scripts to use the `script_file` / `code` sources.
 async fn run_profile_lua(
     script_file: Option<&str>,
     code: Option<&str>,
     work_dir: &std::path::Path,
 ) -> Result<String, McpError> {
-    // Write the wrapper to a tempfile.
-    let wrapper_file = tempfile::Builder::new()
-        .suffix("_vdsl_profile_wrapper.lua")
-        .tempfile()
-        .map_err(|e| McpError::internal_error(format!("tempfile create failed: {e}"), None))?;
-    std::fs::write(wrapper_file.path(), VDSL_PROFILE_WRAPPER_LUA)
-        .map_err(|e| McpError::internal_error(format!("wrapper write failed: {e}"), None))?;
-
-    // Write inline code to a tempfile if needed; otherwise use script_file.
-    let user_script_file;
+    // 1. Resolve user script path (file or inline code → tempfile).
+    let _inline_script_file; // keep alive for the duration of the call
     let user_script_path: &std::path::Path = match (script_file, code) {
         (Some(path), None) => {
-            // Validate file exists.
             if !std::path::Path::new(path).exists() {
                 return Err(McpError::invalid_params(
                     format!("script_file not found: {path}"),
@@ -7849,16 +7827,16 @@ async fn run_profile_lua(
             std::path::Path::new(path)
         }
         (None, Some(c)) => {
-            user_script_file = tempfile::Builder::new()
+            _inline_script_file = tempfile::Builder::new()
                 .suffix("_vdsl_profile_user.lua")
                 .tempfile()
                 .map_err(|e| {
-                    McpError::internal_error(format!("user script tempfile failed: {e}"), None)
+                    McpError::internal_error(format!("inline script tempfile failed: {e}"), None)
                 })?;
-            std::fs::write(user_script_file.path(), c).map_err(|e| {
-                McpError::internal_error(format!("user script write failed: {e}"), None)
+            std::fs::write(_inline_script_file.path(), c).map_err(|e| {
+                McpError::internal_error(format!("inline script write failed: {e}"), None)
             })?;
-            user_script_file.path()
+            _inline_script_file.path()
         }
         _ => {
             return Err(McpError::invalid_params(
@@ -7868,30 +7846,43 @@ async fn run_profile_lua(
         }
     };
 
-    let user_script_str = user_script_path.to_string_lossy();
-    let wrapper_str = wrapper_file.path().to_string_lossy().to_string();
-    let lua_args = vec![wrapper_str.clone()];
+    // 2. Manifest output tempfile. The user script writes to this path via
+    //    vdsl.profile_emit(). Keep the file alive until we have read it.
+    let manifest_out = tempfile::NamedTempFile::new()
+        .map_err(|e| McpError::internal_error(format!("manifest tempfile failed: {e}"), None))?;
+    let manifest_out_path = manifest_out.path().to_string_lossy().to_string();
+
+    // 3. Run user script directly (no wrapper). VDSL_PROFILE_OUT tells
+    //    vdsl.profile_emit() where to write the manifest JSON.
+    let script_str = user_script_path.to_string_lossy().to_string();
+    let lua_args = vec![script_str];
 
     let result = exec_lua_process(
         &lua_args,
         work_dir,
         VDSL_PROFILE_LUA_TIMEOUT_SECS,
-        &[("VDSL_PROFILE_USER_SCRIPT", user_script_str.as_ref())],
+        &[("VDSL_PROFILE_OUT", &manifest_out_path)],
     )
     .await?;
 
+    // 4. Non-zero exit: report stderr as the error.
     if result.exit_code != 0 {
         let stderr = result.stderr.trim();
         return Err(McpError::invalid_params(
-            format!("profile Lua failed (exit {}): {}", result.exit_code, stderr),
+            format!("profile Lua failed (exit {}): {stderr}", result.exit_code),
             None,
         ));
     }
 
-    let manifest_json = result.stdout.trim().to_string();
+    // 5. Read the manifest from the output file.
+    let manifest_json = std::fs::read_to_string(manifest_out.path())
+        .map_err(|e| McpError::internal_error(format!("manifest read failed: {e}"), None))?;
+    let manifest_json = manifest_json.trim().to_string();
+
     if manifest_json.is_empty() {
         return Err(McpError::invalid_params(
-            "profile Lua produced no output — ensure the script returns a Profile object",
+            "profile script did not emit a manifest — add `vdsl.profile_emit(profile)` \
+             at the end of your script (requires vdsl.profile_emit in lua/vdsl/init.lua)",
             None,
         ));
     }
@@ -10624,13 +10615,29 @@ return M
         root
     }
 
+    // =========================================================================
+    // run_profile_lua — emit pattern tests
+    //
+    // These tests use lua directly (no vdsl.profile_emit dependency).
+    // The user script writes to VDSL_PROFILE_OUT via plain io.open().
+    // This validates that the MCP side correctly:
+    //   1. passes VDSL_PROFILE_OUT to the subprocess
+    //   2. reads the manifest from the output file
+    //   3. returns an error when the file remains empty
+    //   4. is immune to user script print() output
+    // =========================================================================
+
     #[tokio::test]
     #[ignore = "requires lua on PATH"]
-    async fn run_profile_lua_inline_code_happy_path() {
+    async fn run_profile_lua_inline_code_emit_happy_path() {
+        // Simulate vdsl.profile_emit: write directly to VDSL_PROFILE_OUT.
         let root = make_lua_fixture();
         let code = r#"
-local profile = require("vdsl.runtime.profile")
-return profile.new({ name = "test_profile" })
+local out = os.getenv("VDSL_PROFILE_OUT")
+if not out then error("VDSL_PROFILE_OUT not set") end
+local f = io.open(out, "w")
+f:write('{"schema":"vdsl.profile/1","name":"test_profile"}')
+f:close()
 "#;
         let result = run_profile_lua(None, Some(code), root.path()).await;
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
@@ -10643,7 +10650,7 @@ return profile.new({ name = "test_profile" })
 
     #[tokio::test]
     #[ignore = "requires lua on PATH"]
-    async fn run_profile_lua_script_file_happy_path() {
+    async fn run_profile_lua_script_file_emit_happy_path() {
         let root = make_lua_fixture();
         let script_dir = root.path().join("scripts");
         std::fs::create_dir_all(&script_dir).unwrap();
@@ -10651,8 +10658,11 @@ return profile.new({ name = "test_profile" })
         std::fs::write(
             &script_path,
             r#"
-local profile = require("vdsl.runtime.profile")
-return profile.new({ name = "file_profile" })
+local out = os.getenv("VDSL_PROFILE_OUT")
+if not out then error("VDSL_PROFILE_OUT not set") end
+local f = io.open(out, "w")
+f:write('{"schema":"vdsl.profile/1","name":"file_profile"}')
+f:close()
 "#,
         )
         .unwrap();
@@ -10668,20 +10678,57 @@ return profile.new({ name = "file_profile" })
 
     #[tokio::test]
     #[ignore = "requires lua on PATH"]
-    async fn run_profile_lua_schema_mismatch_returns_error() {
+    async fn run_profile_lua_no_emit_returns_error() {
+        // Script does NOT call profile_emit → VDSL_PROFILE_OUT remains empty.
         let root = make_lua_fixture();
-        // Script returns a plain table without schema field.
-        let code = r#"return { name = "bad" }"#;
+        let code = r#"
+-- deliberate: no io.open(VDSL_PROFILE_OUT)
+local x = 1 + 1
+"#;
         let result = run_profile_lua(None, Some(code), root.path()).await;
-        assert!(
-            result.is_err(),
-            "expected Err for schema mismatch, got: {:?}",
-            result
-        );
+        assert!(result.is_err(), "expected Err when emit is missing, got Ok");
         let err_msg = format!("{:?}", result.unwrap_err());
         assert!(
-            err_msg.contains("vdsl.profile/1") || err_msg.contains("exit"),
-            "error should mention schema or exit: {err_msg}"
+            err_msg.contains("profile_emit") || err_msg.contains("manifest"),
+            "error should mention profile_emit or manifest: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lua on PATH"]
+    async fn run_profile_lua_print_does_not_corrupt_manifest() {
+        // User script emits via VDSL_PROFILE_OUT AND also calls print() —
+        // the manifest must not be affected by stdout noise.
+        let root = make_lua_fixture();
+        let code = r#"
+print("debug: building profile")
+io.write("extra stdout noise\n")
+local out = os.getenv("VDSL_PROFILE_OUT")
+local f = io.open(out, "w")
+f:write('{"schema":"vdsl.profile/1","name":"noisy_profile"}')
+f:close()
+print("debug: done")
+"#;
+        let result = run_profile_lua(None, Some(code), root.path()).await;
+        assert!(
+            result.is_ok(),
+            "expected Ok even with print() calls, got: {:?}",
+            result
+        );
+        let json_str = result.unwrap();
+        // Must be clean JSON — no stray print output prepended/appended.
+        assert!(
+            json_str.starts_with('{'),
+            "manifest must start with '{{': {json_str}"
+        );
+        assert!(
+            json_str.contains("vdsl.profile/1"),
+            "manifest JSON should contain schema: {json_str}"
+        );
+        // Ensure no stray "debug:" lines leaked into the manifest.
+        assert!(
+            !json_str.contains("debug:"),
+            "manifest must not contain debug output: {json_str}"
         );
     }
 
