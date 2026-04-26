@@ -2059,6 +2059,26 @@ pub struct VdslBatchToolsRequest {
     pub secrets: std::collections::HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct VdslProjectInitRequest {
+    /// Project slug (kebab/snake case, e.g. "gravure_2606", "bust_kawaii_run").
+    /// Must match `^[a-zA-Z0-9_\-]+$`.
+    pub name: String,
+
+    /// Template selection: "concept_planned" (default) or "exploration".
+    #[serde(default)]
+    pub template: Option<String>,
+
+    /// Projects root directory. Defaults to `$VDSL_WORK_DIR/projects` or
+    /// `~/projects/vdsl-work/vdsl/projects`.
+    #[serde(default)]
+    pub root: Option<String>,
+
+    /// Allow writing into an existing `<root>/<name>` directory. Default: false.
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
 // =============================================================================
 // Tool implementations
 // =============================================================================
@@ -6036,6 +6056,57 @@ impl VdslMcpServer {
             .execute(plan, req.secrets)
             .await
             .map_err(|e| McpError::internal_error(format!("batch execute: {e}"), None))?;
+
+        let body = serde_json::to_string_pretty(&result)
+            .map_err(|e| McpError::internal_error(format!("serialize result: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
+
+    // =========================================================================
+    // Project scaffold
+    // =========================================================================
+
+    #[tool(
+        name = "vdsl_project_init",
+        description = "[repo] Scaffold a new VDSL image-generation project directory. \
+            Creates per-project dirs (notes/, refs/, sweeps/, final/) and root-level shared \
+            dirs (profiles/, catalogs/, assets/) idempotently. \
+            Two templates: \
+            'concept_planned' (default) — adds notes/kickoff.md + notes/journal.md; \
+            'exploration' — adds notes/journal.md only. \
+            All .md files include frontmatter (class/project/created/updated/topics/catalog_pins/status). \
+            Root is resolved from: 1) explicit 'root' param, 2) $VDSL_WORK_DIR/projects, \
+            3) ~/projects/vdsl-work/vdsl/projects. \
+            Returns project_path, files_created list, root_dirs_ensured list.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn project_init(
+        &self,
+        Parameters(req): Parameters<VdslProjectInitRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::domain::project::{resolve_projects_root, scaffold_project, ScaffoldError};
+
+        let root = resolve_projects_root(req.root.as_deref()).map_err(|e| match e {
+            ScaffoldError::NoHomeDir => McpError::internal_error("home directory not found", None),
+            other => McpError::internal_error(format!("{other}"), None),
+        })?;
+
+        let result = scaffold_project(&req.name, &root, req.template.as_deref(), req.overwrite)
+            .map_err(|e| match e {
+                ScaffoldError::InvalidName(_)
+                | ScaffoldError::InvalidTemplate(_)
+                | ScaffoldError::AlreadyExists(_) => McpError::invalid_params(format!("{e}"), None),
+                ScaffoldError::Io(io_err) => {
+                    McpError::internal_error(format!("I/O error: {io_err}"), None)
+                }
+                ScaffoldError::NoHomeDir => {
+                    McpError::internal_error("home directory not found", None)
+                }
+            })?;
 
         let body = serde_json::to_string_pretty(&result)
             .map_err(|e| McpError::internal_error(format!("serialize result: {e}"), None))?;
