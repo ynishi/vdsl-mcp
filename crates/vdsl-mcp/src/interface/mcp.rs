@@ -2246,24 +2246,33 @@ impl VdslMcpServer {
 
         let spec_json = serde_json::to_string(&spec).map_err(Self::to_mcp_error)?;
         let svc = Self::pod_service()?;
-        let result = svc
+        let mut result = svc
             .create_pod(&spec_json)
             .await
             .map_err(Self::to_mcp_error)?;
 
-        let pod_id = result["id"].as_str().unwrap_or("?");
-        let pod_name = result["name"].as_str().unwrap_or("?");
-        let ephemeral_note = if is_ephemeral {
-            "\n\n⚠ Ephemeral pod (no network volume). Data is lost on deletion.\n\
-             Use vdsl_storage_pull to restore models from B2 cold storage."
-        } else {
-            ""
-        };
-        let output = format!(
-            "Pod created: {pod_id} ({pod_name}){ephemeral_note}\n\n{}",
-            serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"))
-        );
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        // Embed any user-facing notices inside the JSON result so callers
+        // get a single structured payload instead of preamble-text-then-JSON
+        // (which forced a regex split on the consumer side). The previous
+        // shape was `"Pod created: {id} ({name})\n\n⚠ Ephemeral...\n\n{json}"` —
+        // a single text block mixing prose and JSON that broke MCP clients
+        // expecting one parseable JSON document per call.
+        if let Some(obj) = result.as_object_mut() {
+            let mut notices: Vec<serde_json::Value> = Vec::new();
+            if is_ephemeral {
+                notices.push(serde_json::Value::String(
+                    "Ephemeral pod (no network volume). Data is lost on deletion. \
+                     Use vdsl_storage_pull to restore models from B2 cold storage."
+                        .to_string(),
+                ));
+            }
+            if !notices.is_empty() {
+                obj.insert("notices".into(), serde_json::Value::Array(notices));
+            }
+        }
+        let json_str = serde_json::to_string_pretty(&result)
+            .unwrap_or_else(|_| format!("{result:?}"));
+        Ok(CallToolResult::success(vec![Content::text(json_str)]))
     }
 
     #[tool(
@@ -5393,7 +5402,10 @@ impl VdslMcpServer {
         // smoke / compile_only callers that want the result inline.
         let background = req.background.unwrap_or(true);
         if !background {
-            let log = self.run_blocking(req).await?;
+            // Foreground (sync) mode: discard all_failed flag — caller sees
+            // the full log inline and judges from text. Background path uses
+            // the flag to flip Ok→Failed for status reporting.
+            let (log, _all_failed) = self.run_blocking(req).await?;
             return Ok(CallToolResult::success(vec![Content::text(log)]));
         }
 
@@ -5416,8 +5428,21 @@ impl VdslMcpServer {
         let tid_for_log = task_id.clone();
         tokio::spawn(async move {
             match server.run_blocking(req).await {
-                Ok(log) => {
-                    crate::application::run_registry::finalize_ok(&handle, log).await;
+                Ok((log, all_failed)) => {
+                    if all_failed {
+                        // B fix: flat-batch all-submission-failed surfaced
+                        // as run-level Failed so pollers see status:"failed"
+                        // instead of the misleading status:"ok" they got
+                        // before. Full log preserved as partial_log.
+                        crate::application::run_registry::finalize_err(
+                            &handle,
+                            "All workflows failed to submit (see log)".into(),
+                            log,
+                        )
+                        .await;
+                    } else {
+                        crate::application::run_registry::finalize_ok(&handle, log).await;
+                    }
                 }
                 Err(e) => {
                     crate::application::run_registry::finalize_err(
@@ -5445,7 +5470,16 @@ impl VdslMcpServer {
     /// or an `McpError` on failure. Used directly when
     /// `background=false`; otherwise driven by the spawned task started
     /// by `run` and finalized into [`crate::application::run_registry`].
-    async fn run_blocking(&self, req: VdslRunRequest) -> Result<String, McpError> {
+    /// Run the script-compile + (optional) batch-generate pipeline synchronously.
+    ///
+    /// Returns `(log, all_failed)`:
+    /// - `log` is the full joined output text shown to the caller.
+    /// - `all_failed` is `true` when 0 workflows successfully submitted in the
+    ///   single-pass / flat batch mode (or zero workflows compiled). Background
+    ///   path uses this to finalize the run as `Failed` instead of `Ok` so a
+    ///   poller can distinguish "all SKIP" from real success without log
+    ///   scraping.
+    async fn run_blocking(&self, req: VdslRunRequest) -> Result<(String, bool), McpError> {
         let (lua_args, script_label) =
             resolve_script_source(req.script_file.as_deref(), req.code.as_deref())?;
         let work_dir = resolve_working_dir(req.working_dir.as_deref(), req.script_file.as_deref())?;
@@ -5585,7 +5619,8 @@ impl VdslMcpServer {
                     }
                 }
             }
-            return Ok(log.join("\n"));
+            // compile_only path: no submission, no fail count.
+            return Ok((log.join("\n"), false));
         }
 
         // --- Phase 2: Generate ---
@@ -5708,7 +5743,9 @@ impl VdslMcpServer {
             let jobs = submit_workflows(&client, &tagged, &mut log).await;
             if jobs.is_empty() {
                 log.push("All workflows failed to submit.".to_string());
-                return Ok(log.join("\n"));
+                // Flat batch mode all-fail → background path will mark status=Failed
+                // (B fix). Foreground caller stays Ok for backwards-compat.
+                return Ok((log.join("\n"), true));
             }
 
             let results = poll_jobs(
@@ -5755,7 +5792,12 @@ impl VdslMcpServer {
             }
         }
 
-        Ok(log.join("\n"))
+        // Run reached terminal pipeline / flat-batch end without an early
+        // all-fail short-circuit. Pipeline mode may have skipped some
+        // workflows within passes; that is reported in the log but does
+        // not flip the run-level status to Failed (B fix only handles the
+        // flat batch all-fail case for now).
+        Ok((log.join("\n"), false))
     }
 
     #[tool(

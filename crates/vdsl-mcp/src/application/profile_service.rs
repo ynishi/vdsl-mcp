@@ -454,9 +454,20 @@ pub fn expand_phases(
     // ---- Phase 3: python version check (advisory) + python.deps ----
     if let Some(python) = &manifest.python {
         // Phase 3a: warn if python.version is set and mismatches pod python3.
+        //
+        // Skip when version equals the vdsl runtime default ("3.12"). The
+        // runtime's `normalize_python` injects this default whenever the
+        // user omits `python.version`, so emitting the check unconditionally
+        // makes every apply (including ones with no explicit version) carry
+        // a Phase 3a step that is meaningful only when the user actually
+        // chose 3.12 deliberately. The advisory has no effect at the default,
+        // so skipping it keeps the BatchPlan minimal and avoids confusing
+        // pollers ("why is there a 3a step when I didn't ask for one?").
+        const PYTHON_DEFAULT_VERSION: &str = "3.12";
         if let Some(want) = &python.version {
-            assert_shell_safe(want, "python.version")?;
-            let warn_script = format!(
+            if want != PYTHON_DEFAULT_VERSION {
+                assert_shell_safe(want, "python.version")?;
+                let warn_script = format!(
                 "set -e\n\
                  actual=$(python3 -c 'import sys; print(f\"{{sys.version_info.major}}.{{sys.version_info.minor}}\")')\n\
                  want={want}\n\
@@ -465,13 +476,14 @@ pub fn expand_phases(
                  else\n\
                    echo \"python version match: $actual\"\n\
                  fi"
-            );
-            steps.push(StepEntry::Leaf(exec_step(
-                "3a_python_version_check",
-                &warn_script,
-                pod_id,
-                &env_json,
-            )));
+                );
+                steps.push(StepEntry::Leaf(exec_step(
+                    "3a_python_version_check",
+                    &warn_script,
+                    pod_id,
+                    &env_json,
+                )));
+            }
         }
         // Phase 3: install python deps.
         if !python.deps.is_empty() {

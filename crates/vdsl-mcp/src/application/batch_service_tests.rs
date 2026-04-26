@@ -591,3 +591,34 @@ fn count_leaf_steps_groups_flatten_to_children() {
     ];
     assert_eq!(count_leaf_steps(&steps), 5);
 }
+
+// ============================================================================
+// truncate_step_output (A fix)
+// ============================================================================
+
+#[test]
+fn truncate_step_output_under_limit_returns_unchanged() {
+    let s = "small log".to_string();
+    assert_eq!(truncate_step_output(s.clone()), s);
+}
+
+#[test]
+fn truncate_step_output_over_limit_truncates_with_marker() {
+    let big = "x".repeat(STEP_OUTPUT_MAX_BYTES + 100);
+    let out = truncate_step_output(big);
+    assert!(out.ends_with("[…truncated…]"), "must mark truncation: {out}");
+    assert!(
+        out.len() < STEP_OUTPUT_MAX_BYTES + 50,
+        "must shrink to ~ STEP_OUTPUT_MAX_BYTES; got {} bytes",
+        out.len()
+    );
+}
+
+#[test]
+fn truncate_step_output_respects_utf8_boundary() {
+    // Multibyte chars at the boundary must not produce invalid UTF-8.
+    let s = "日".repeat(STEP_OUTPUT_MAX_BYTES); // each char is 3 bytes
+    let out = truncate_step_output(s);
+    // String::is_char_boundary is implicit — if invalid, format!() panics.
+    assert!(out.ends_with("[…truncated…]"));
+}

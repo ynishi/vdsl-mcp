@@ -1004,23 +1004,25 @@ fn python_config_version_serde_round_trip() {
 }
 
 #[test]
-fn expand_phases_emits_python_version_check_step_when_set() {
+fn expand_phases_emits_python_version_check_step_when_non_default() {
+    // Non-default version → 3a step emitted. Default value "3.12" is
+    // skipped (see expand_phases_omits_python_version_check_step_at_default).
     let mut m = full_manifest();
     m.python = Some(PythonConfig {
         deps: vec!["numpy".to_string()],
-        version: Some("3.12".to_string()),
+        version: Some("3.13".to_string()),
     });
     let plan = expand_phases(&m, "abc", false).expect("ok");
 
     let script = find_script(&plan, "3a_python_version_check")
-        .expect("3a step must be present when python.version is set");
+        .expect("3a step must be present when python.version differs from default");
     assert!(
         script.contains("python3"),
         "expected python3 invocation; got: {script}"
     );
     assert!(
-        script.contains("3.12"),
-        "expected requested version '3.12' in script; got: {script}"
+        script.contains("3.13"),
+        "expected requested version '3.13' in script; got: {script}"
     );
     assert!(
         script.contains("WARN:"),
@@ -1034,6 +1036,24 @@ fn expand_phases_emits_python_version_check_step_when_set() {
     assert!(
         !script.contains("exit 1"),
         "warn step must not fail; got: {script}"
+    );
+}
+
+#[test]
+fn expand_phases_omits_python_version_check_step_at_default() {
+    // version "3.12" matches the vdsl runtime default → step skipped to
+    // keep BatchPlan minimal. Runtime injects this default whenever the
+    // user omits python.version, so emitting unconditionally would put a
+    // no-op step in every apply.
+    let mut m = full_manifest();
+    m.python = Some(PythonConfig {
+        deps: vec![],
+        version: Some("3.12".to_string()),
+    });
+    let plan = expand_phases(&m, "abc", false).expect("ok");
+    assert!(
+        find_script(&plan, "3a_python_version_check").is_none(),
+        "3a step must be skipped when python.version equals default '3.12'"
     );
 }
 

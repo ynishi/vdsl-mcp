@@ -415,7 +415,7 @@ async fn dispatch_exec_bg(
             if exit_code != 0 {
                 return Err(format!("shell exit code {exit_code}\n{log_text}"));
             }
-            return Ok(log_text);
+            return Ok(truncate_step_output(log_text));
         }
 
         if std::time::Instant::now() >= deadline {
@@ -560,6 +560,33 @@ fn shell_escape_single_quote(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+/// Maximum byte length stored in [`BatchStepResult::output`].
+///
+/// Shell steps can produce megabytes of log for long-running installs
+/// (e.g. `pip install mediapipe` prints every sub-dependency). Storing
+/// the full text in the in-memory registry causes `vdsl_profile_apply_status`
+/// to return multi-MB JSON responses that exceed the MCP threshold.
+///
+/// This cap keeps each step's stored output to ≤ 4 KB, which is enough
+/// for diagnostics.  The full log is still visible via `vdsl_task_log` for
+/// individual `exec_bg` jobs.  Truncated text gets a `[…truncated…]` trailer.
+const STEP_OUTPUT_MAX_BYTES: usize = 4096;
+
+/// Truncate `text` to at most [`STEP_OUTPUT_MAX_BYTES`] bytes, appending a
+/// `[…truncated…]` marker when truncation occurs.  Truncation is on a UTF-8
+/// char boundary so the result is always valid UTF-8.
+fn truncate_step_output(text: String) -> String {
+    if text.len() <= STEP_OUTPUT_MAX_BYTES {
+        return text;
+    }
+    // Walk back from the byte limit to a char boundary.
+    let mut end = STEP_OUTPUT_MAX_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}[…truncated…]", &text[..end])
 }
 
 /// Extract the concatenated text content from a [`CallToolResult`].
@@ -949,7 +976,7 @@ where
         return BatchStepResult {
             id,
             status: StepStatus::Ok,
-            output: Some(first_output),
+            output: Some(truncate_step_output(first_output)),
             error: None,
         };
     };
@@ -961,7 +988,7 @@ where
                 Ok(()) => BatchStepResult {
                     id,
                     status: StepStatus::Ok,
-                    output: Some(out2),
+                    output: Some(truncate_step_output(out2)),
                     error: None,
                 },
                 Err(verr2) => {
@@ -969,7 +996,7 @@ where
                     BatchStepResult {
                         id,
                         status: StepStatus::Failed,
-                        output: Some(out2),
+                        output: Some(truncate_step_output(out2)),
                         error: Some(format!("validation failed after retry: {verr2}")),
                     }
                 }
@@ -977,7 +1004,7 @@ where
             Err(e) => BatchStepResult {
                 id,
                 status: StepStatus::Failed,
-                output: Some(first_output),
+                output: Some(truncate_step_output(first_output)),
                 error: Some(e),
             },
         }
@@ -985,7 +1012,7 @@ where
         BatchStepResult {
             id,
             status: StepStatus::Ok,
-            output: Some(first_output),
+            output: Some(truncate_step_output(first_output)),
             error: None,
         }
     }
