@@ -2010,9 +2010,22 @@ pub struct VdslImageSearchRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VdslProfileApplyRequest {
-    /// Profile manifest JSON string (schema tag "vdsl.profile/1").
-    /// Emitted by the vdsl Lua Profile DSL.
-    pub manifest: String,
+    /// Profile manifest JSON string (schema "vdsl.profile/1").
+    /// Exactly one of `manifest`, `script_file`, or `code` must be provided.
+    pub manifest: Option<String>,
+
+    /// Path to a Lua script that constructs and returns a Profile object via
+    /// `return profile.new({...})`. Mutually exclusive with `manifest` and `code`.
+    pub script_file: Option<String>,
+
+    /// Inline Lua code that constructs and returns a Profile object.
+    /// Mutually exclusive with `manifest` and `script_file`.
+    pub code: Option<String>,
+
+    /// Working directory for Lua `require()` resolution (must contain `lua/`).
+    /// Defaults to the `script_file`'s parent directory (walked upward for `lua/`),
+    /// or `VDSL_RUNTIME_DIR` env / `~/vdsl` when using inline `code`.
+    pub working_dir: Option<String>,
 
     /// Target RunPod pod ID (e.g. "pod_abc123def").
     pub pod_id: String,
@@ -5878,7 +5891,42 @@ impl VdslMcpServer {
         use crate::application::batch_service::BatchService;
         use crate::application::profile_service::{expand_phases, parse_manifest, resolve_secrets};
 
-        let manifest = parse_manifest(&req.manifest)
+        // Validate: exactly one of manifest / script_file / code must be set.
+        let source_count = [
+            req.manifest.is_some(),
+            req.script_file.is_some(),
+            req.code.is_some(),
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+
+        if source_count == 0 {
+            return Err(McpError::invalid_params(
+                "one of 'manifest', 'script_file', or 'code' is required",
+                None,
+            ));
+        }
+        if source_count > 1 {
+            return Err(McpError::invalid_params(
+                "specify exactly one of 'manifest', 'script_file', or 'code'",
+                None,
+            ));
+        }
+
+        // Resolve manifest JSON string from whichever source was provided.
+        let manifest_json: String = if let Some(ref m) = req.manifest {
+            m.clone()
+        } else {
+            // Lua subprocess path (script_file or code).
+            let work_dir = resolve_profile_working_dir(
+                req.working_dir.as_deref(),
+                req.script_file.as_deref(),
+            )?;
+            run_profile_lua(req.script_file.as_deref(), req.code.as_deref(), &work_dir).await?
+        };
+
+        let manifest = parse_manifest(&manifest_json)
             .map_err(|e| McpError::invalid_params(format!("profile parse: {e}"), None))?;
         let secrets = resolve_secrets(&manifest)
             .map_err(|e| McpError::invalid_params(format!("profile secrets: {e}"), None))?;
@@ -7594,6 +7642,190 @@ fn match_workflow_label<'a>(image_path: &std::path::Path, labels: &'a [String]) 
         }
     }
     best
+}
+
+// =============================================================================
+// Profile Lua subprocess helpers
+// =============================================================================
+
+/// Timeout for the profile Lua subprocess that extracts manifest_json (seconds).
+const VDSL_PROFILE_LUA_TIMEOUT_SECS: u64 = 30;
+
+/// Wrapper Lua that loads a user profile script via `loadfile`, calls it, validates
+/// the returned Profile object, and writes `manifest_json(false)` to stdout.
+///
+/// The user script path is passed via `VDSL_PROFILE_USER_SCRIPT` env var so that
+/// the path can contain arbitrary characters without shell quoting issues.
+const VDSL_PROFILE_WRAPPER_LUA: &str = r#"
+local script_path = os.getenv("VDSL_PROFILE_USER_SCRIPT")
+if not script_path then
+    io.stderr:write("VDSL_PROFILE_USER_SCRIPT not set\n")
+    os.exit(1)
+end
+local chunk, err = loadfile(script_path)
+if not chunk then
+    io.stderr:write("loadfile failed: " .. tostring(err) .. "\n")
+    os.exit(1)
+end
+local ok, result = pcall(chunk)
+if not ok then
+    io.stderr:write("script error: " .. tostring(result) .. "\n")
+    os.exit(1)
+end
+local p = result
+if type(p) ~= "table" or p.schema ~= "vdsl.profile/1" then
+    io.stderr:write("expected Profile object (vdsl.profile/1), got schema=" .. tostring(type(p) == "table" and p.schema or type(p)) .. "\n")
+    os.exit(2)
+end
+io.write(p:manifest_json(false))
+"#;
+
+/// Resolve the default working directory for profile Lua subprocess.
+///
+/// Resolution order:
+/// 1. `explicit` if provided
+/// 2. Walk upward from `script_file` parent, looking for `lua/` directory
+/// 3. `VDSL_RUNTIME_DIR` env var
+/// 4. `~/vdsl` fallback
+fn resolve_profile_working_dir(
+    explicit: Option<&str>,
+    script_file: Option<&str>,
+) -> Result<std::path::PathBuf, McpError> {
+    if let Some(d) = explicit {
+        let p = std::path::PathBuf::from(d);
+        if !p.join("lua").is_dir() {
+            return Err(McpError::invalid_params(
+                format!(
+                    "working_dir '{}' does not contain a lua/ directory",
+                    p.display()
+                ),
+                None,
+            ));
+        }
+        let canonical = p.canonicalize().map_err(|e| {
+            McpError::invalid_params(
+                format!("cannot resolve working_dir '{}': {e}", p.display()),
+                None,
+            )
+        })?;
+        return Ok(canonical);
+    }
+
+    // Try to walk upward from script_file's parent.
+    if let Some(path) = script_file {
+        let script_path = std::path::Path::new(path).canonicalize().map_err(|e| {
+            McpError::invalid_params(format!("cannot resolve script path '{path}': {e}"), None)
+        })?;
+        let mut dir = script_path.parent();
+        loop {
+            match dir {
+                Some(d) if d.join("lua").is_dir() => return Ok(d.to_path_buf()),
+                Some(d) => dir = d.parent(),
+                None => break, // fall through to env/default
+            }
+        }
+    }
+
+    // Fall back: VDSL_RUNTIME_DIR env or ~/vdsl
+    let fallback = std::env::var("VDSL_RUNTIME_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            std::path::PathBuf::from(home).join("vdsl")
+        });
+
+    if !fallback.join("lua").is_dir() {
+        return Err(McpError::invalid_params(
+            "cannot auto-detect working_dir for profile Lua: no lua/ directory found. \
+             Specify working_dir explicitly, or set VDSL_RUNTIME_DIR to the vdsl runtime root.",
+            None,
+        ));
+    }
+    Ok(fallback)
+}
+
+/// Run a user profile Lua script (or inline code) via subprocess and return
+/// the manifest JSON string captured from stdout.
+///
+/// Writes inline `code` to a tempfile and sets `VDSL_PROFILE_USER_SCRIPT` to
+/// the path. For `script_file`, the path is passed directly via the same env var.
+async fn run_profile_lua(
+    script_file: Option<&str>,
+    code: Option<&str>,
+    work_dir: &std::path::Path,
+) -> Result<String, McpError> {
+    // Write the wrapper to a tempfile.
+    let wrapper_file = tempfile::Builder::new()
+        .suffix("_vdsl_profile_wrapper.lua")
+        .tempfile()
+        .map_err(|e| McpError::internal_error(format!("tempfile create failed: {e}"), None))?;
+    std::fs::write(wrapper_file.path(), VDSL_PROFILE_WRAPPER_LUA)
+        .map_err(|e| McpError::internal_error(format!("wrapper write failed: {e}"), None))?;
+
+    // Write inline code to a tempfile if needed; otherwise use script_file.
+    let user_script_file;
+    let user_script_path: &std::path::Path = match (script_file, code) {
+        (Some(path), None) => {
+            // Validate file exists.
+            if !std::path::Path::new(path).exists() {
+                return Err(McpError::invalid_params(
+                    format!("script_file not found: {path}"),
+                    None,
+                ));
+            }
+            std::path::Path::new(path)
+        }
+        (None, Some(c)) => {
+            user_script_file = tempfile::Builder::new()
+                .suffix("_vdsl_profile_user.lua")
+                .tempfile()
+                .map_err(|e| {
+                    McpError::internal_error(format!("user script tempfile failed: {e}"), None)
+                })?;
+            std::fs::write(user_script_file.path(), c).map_err(|e| {
+                McpError::internal_error(format!("user script write failed: {e}"), None)
+            })?;
+            user_script_file.path()
+        }
+        _ => {
+            return Err(McpError::invalid_params(
+                "exactly one of script_file or code is required",
+                None,
+            ))
+        }
+    };
+
+    let user_script_str = user_script_path.to_string_lossy();
+    let wrapper_str = wrapper_file.path().to_string_lossy().to_string();
+    let lua_args = vec![wrapper_str.clone()];
+
+    let result = exec_lua_process(
+        &lua_args,
+        work_dir,
+        VDSL_PROFILE_LUA_TIMEOUT_SECS,
+        &[("VDSL_PROFILE_USER_SCRIPT", user_script_str.as_ref())],
+    )
+    .await?;
+
+    if result.exit_code != 0 {
+        let stderr = result.stderr.trim();
+        return Err(McpError::invalid_params(
+            format!("profile Lua failed (exit {}): {}", result.exit_code, stderr),
+            None,
+        ));
+    }
+
+    let manifest_json = result.stdout.trim().to_string();
+    if manifest_json.is_empty() {
+        return Err(McpError::invalid_params(
+            "profile Lua produced no output — ensure the script returns a Profile object",
+            None,
+        ));
+    }
+
+    Ok(manifest_json)
 }
 
 // =============================================================================
@@ -10152,5 +10384,241 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = load_recipe(dir.path(), "nonexistent");
         assert_eq!(result, None);
+    }
+
+    // =========================================================================
+    // profile_apply — VdslProfileApplyRequest validation tests
+    // =========================================================================
+
+    #[test]
+    fn profile_apply_request_manifest_only_parses() {
+        let req: VdslProfileApplyRequest = serde_json::from_str(
+            r#"{"manifest":"{\"schema\":\"vdsl.profile/1\"}","pod_id":"pod_abc"}"#,
+        )
+        .unwrap();
+        assert!(req.manifest.is_some());
+        assert!(req.script_file.is_none());
+        assert!(req.code.is_none());
+        assert!(req.working_dir.is_none());
+        assert_eq!(req.pod_id, "pod_abc");
+        assert!(!req.dry_run);
+    }
+
+    #[test]
+    fn profile_apply_request_script_file_parses() {
+        let req: VdslProfileApplyRequest = serde_json::from_str(
+            r#"{"script_file":"/tmp/profile.lua","pod_id":"pod_abc","dry_run":true}"#,
+        )
+        .unwrap();
+        assert!(req.manifest.is_none());
+        assert_eq!(req.script_file.as_deref(), Some("/tmp/profile.lua"));
+        assert!(req.code.is_none());
+        assert!(req.dry_run);
+    }
+
+    #[test]
+    fn profile_apply_request_code_parses() {
+        let req: VdslProfileApplyRequest = serde_json::from_str(
+            r#"{"code":"return {schema='vdsl.profile/1'}","pod_id":"pod_abc"}"#,
+        )
+        .unwrap();
+        assert!(req.manifest.is_none());
+        assert!(req.script_file.is_none());
+        assert!(req.code.is_some());
+    }
+
+    #[test]
+    fn profile_apply_request_all_none_passes_deserialization() {
+        // Deserialization succeeds; runtime validation rejects it.
+        let req: VdslProfileApplyRequest = serde_json::from_str(r#"{"pod_id":"pod_abc"}"#).unwrap();
+        let count = [
+            req.manifest.is_some(),
+            req.script_file.is_some(),
+            req.code.is_some(),
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+        assert_eq!(
+            count, 0,
+            "expected 0 sources — validation should reject at runtime"
+        );
+    }
+
+    #[test]
+    fn profile_apply_request_two_sources_invalid() {
+        // Two sources: manifest + code — runtime validation should reject.
+        let req: VdslProfileApplyRequest =
+            serde_json::from_str(r#"{"manifest":"{}","code":"return nil","pod_id":"pod_abc"}"#)
+                .unwrap();
+        let count = [
+            req.manifest.is_some(),
+            req.script_file.is_some(),
+            req.code.is_some(),
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+        assert!(
+            count > 1,
+            "expected >1 source — validation should reject at runtime"
+        );
+    }
+
+    // =========================================================================
+    // resolve_profile_working_dir unit tests
+    // =========================================================================
+
+    #[test]
+    fn resolve_profile_working_dir_explicit_with_lua_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("lua")).unwrap();
+        let result = resolve_profile_working_dir(Some(dir.path().to_str().unwrap()), None);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), dir.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_profile_working_dir_explicit_without_lua_dir_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // No lua/ subdirectory
+        let result = resolve_profile_working_dir(Some(dir.path().to_str().unwrap()), None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_profile_working_dir_walks_up_from_script() {
+        let root = tempfile::tempdir().unwrap();
+        // Create: root/lua/ and root/scripts/myprofile.lua
+        std::fs::create_dir_all(root.path().join("lua")).unwrap();
+        std::fs::create_dir_all(root.path().join("scripts")).unwrap();
+        let script = root.path().join("scripts").join("myprofile.lua");
+        std::fs::write(&script, "").unwrap();
+
+        let result = resolve_profile_working_dir(None, script.to_str());
+        assert!(result.is_ok());
+        // macOS: tempdir returns /var/… but canonicalize() inside the fn resolves
+        // it to /private/var/… via the OS symlink; compare both sides canonicalized.
+        assert_eq!(result.unwrap(), root.path().canonicalize().unwrap());
+    }
+
+    // =========================================================================
+    // run_profile_lua unit tests (require lua on PATH; skipped if absent)
+    // =========================================================================
+
+    /// Build a minimal vdsl working_dir fixture with a stub profile module.
+    fn make_lua_fixture() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        // Create lua/vdsl/runtime/ directory tree
+        let rt_dir = root.path().join("lua").join("vdsl").join("runtime");
+        std::fs::create_dir_all(&rt_dir).unwrap();
+
+        // Stub profile module: profile.new() returns a table with schema and
+        // a manifest_json() method that returns compact JSON.
+        let profile_lua = r#"
+local M = {}
+local profile_mt = {}
+profile_mt.__index = profile_mt
+
+function profile_mt:manifest_json(_pretty)
+    local json = require("vdsl.util.json") or nil
+    -- Minimal JSON serialisation without a full json lib dependency.
+    local function tbl_to_json(t)
+        local parts = {}
+        for k, v in pairs(t) do
+            local val
+            if type(v) == "string" then
+                val = '"' .. v .. '"'
+            elseif type(v) == "table" then
+                val = tbl_to_json(v)
+            else
+                val = tostring(v)
+            end
+            parts[#parts+1] = '"' .. k .. '":' .. val
+        end
+        return "{" .. table.concat(parts, ",") .. "}"
+    end
+    return tbl_to_json(self._data)
+end
+
+function M.new(spec)
+    local obj = setmetatable({ _data = spec or {} }, profile_mt)
+    obj._data.schema = "vdsl.profile/1"
+    return obj
+end
+
+return M
+"#;
+        std::fs::write(rt_dir.join("profile.lua"), profile_lua).unwrap();
+        root
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lua on PATH"]
+    async fn run_profile_lua_inline_code_happy_path() {
+        let root = make_lua_fixture();
+        let code = r#"
+local profile = require("vdsl.runtime.profile")
+return profile.new({ name = "test_profile" })
+"#;
+        let result = run_profile_lua(None, Some(code), root.path()).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+        let json_str = result.unwrap();
+        assert!(
+            json_str.contains("vdsl.profile/1"),
+            "manifest JSON should contain schema: {json_str}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lua on PATH"]
+    async fn run_profile_lua_script_file_happy_path() {
+        let root = make_lua_fixture();
+        let script_dir = root.path().join("scripts");
+        std::fs::create_dir_all(&script_dir).unwrap();
+        let script_path = script_dir.join("test_profile.lua");
+        std::fs::write(
+            &script_path,
+            r#"
+local profile = require("vdsl.runtime.profile")
+return profile.new({ name = "file_profile" })
+"#,
+        )
+        .unwrap();
+
+        let result = run_profile_lua(script_path.to_str(), None, root.path()).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+        let json_str = result.unwrap();
+        assert!(
+            json_str.contains("vdsl.profile/1"),
+            "manifest JSON should contain schema: {json_str}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lua on PATH"]
+    async fn run_profile_lua_schema_mismatch_returns_error() {
+        let root = make_lua_fixture();
+        // Script returns a plain table without schema field.
+        let code = r#"return { name = "bad" }"#;
+        let result = run_profile_lua(None, Some(code), root.path()).await;
+        assert!(
+            result.is_err(),
+            "expected Err for schema mismatch, got: {:?}",
+            result
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("vdsl.profile/1") || err_msg.contains("exit"),
+            "error should mention schema or exit: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lua on PATH"]
+    async fn run_profile_lua_script_file_not_found_returns_error() {
+        let root = make_lua_fixture();
+        let result = run_profile_lua(Some("/nonexistent/profile.lua"), None, root.path()).await;
+        assert!(result.is_err());
     }
 }
