@@ -22,7 +22,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use futures::FutureExt;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::application::apply_registry::{self, ApplyRegistry, ApplyRunState, ApplyStatus};
@@ -84,10 +84,30 @@ impl BatchService {
     ///
     /// `secrets` is consumed at dispatch time for `__secret:NAME` substitution.
     /// Pass `HashMap::new()` if the plan contains no secret placeholders.
+    ///
+    /// Thin wrapper that delegates to [`Self::execute_with_progress`] without
+    /// a progress handle. Exists for backward compatibility.
     pub async fn execute(
         &self,
         plan: BatchPlan,
         secrets: HashMap<String, String>,
+    ) -> Result<BatchResult, BatchError> {
+        self.execute_with_progress(plan, secrets, None).await
+    }
+
+    /// Execute `plan`, writing per-step progress into `progress` if provided.
+    ///
+    /// When `progress` is `Some(handle)`, calls
+    /// [`apply_registry::mark_step_started`] immediately before each step
+    /// dispatch and [`apply_registry::mark_step_complete`] after the step's
+    /// final [`BatchStepResult`] is determined (including validator retry).
+    /// This is the core that [`Self::run_background`] uses to enable real-time
+    /// `vdsl_profile_apply_status` polling.
+    pub async fn execute_with_progress(
+        &self,
+        plan: BatchPlan,
+        secrets: HashMap<String, String>,
+        progress: Option<Arc<Mutex<ApplyRunState>>>,
     ) -> Result<BatchResult, BatchError> {
         let plan_id = format!("bt_{}", uuid::Uuid::new_v4());
 
@@ -107,7 +127,7 @@ impl BatchService {
                     let srv = server.clone();
                     async move { dispatch_step_with_server(&srv, &step).await }
                 };
-                run_seq_generic(plan.steps, &secrets, dispatcher).await
+                run_seq_generic(plan.steps, &secrets, dispatcher, progress).await
             }
             PlanMode::Dag => {
                 // DAG mode takes a flat `Vec<BatchStep>`. Flatten any groups
@@ -120,7 +140,7 @@ impl BatchService {
                     let srv = server.clone();
                     async move { dispatch_step_with_server(&srv, &step).await }
                 };
-                run_dag_generic(leaves, &secrets, dispatcher).await?
+                run_dag_generic(leaves, &secrets, dispatcher, progress).await?
             }
         };
 
@@ -159,11 +179,16 @@ impl BatchService {
         let handle = registry.insert(state);
 
         let server = self.server.clone();
+        let progress_handle = handle.clone();
         tokio::spawn(async move {
             let service = BatchService::new(server);
-            match AssertUnwindSafe(service.execute(plan, secrets))
-                .catch_unwind()
-                .await
+            match AssertUnwindSafe(service.execute_with_progress(
+                plan,
+                secrets,
+                Some(progress_handle),
+            ))
+            .catch_unwind()
+            .await
             {
                 Ok(Ok(result)) => {
                     // Replace the live results with the authoritative
@@ -807,10 +832,14 @@ fn dry_run_step(step: &BatchStep) -> BatchStepResult {
 ///
 /// `dispatch` receives the step *with placeholders already resolved* and
 /// returns `Ok(output_text)` or `Err(error_text)`.
+///
+/// When `progress` is `Some(handle)`, per-step progress marks are written
+/// before and after each leaf dispatch.
 async fn run_seq_generic<F, Fut>(
     steps: Vec<StepEntry>,
     secrets: &HashMap<String, String>,
     dispatch: F,
+    progress: Option<Arc<Mutex<ApplyRunState>>>,
 ) -> Vec<BatchStepResult>
 where
     F: Fn(BatchStep) -> Fut + Clone + Send + Sync + 'static,
@@ -836,7 +865,13 @@ where
 
         match entry {
             StepEntry::Leaf(step) => {
+                if let Some(h) = &progress {
+                    apply_registry::mark_step_started(h, step.id.clone()).await;
+                }
                 let r = run_leaf_with_validation(&step, secrets, &accumulated, &dispatch).await;
+                if let Some(h) = &progress {
+                    apply_registry::mark_step_complete(h, r.clone(), None).await;
+                }
                 let failed = r.status == StepStatus::Failed;
                 if let Some(ref out) = r.output {
                     accumulated.insert(r.id.clone(), out.clone());
@@ -849,6 +884,11 @@ where
             StepEntry::Group(group) => {
                 let group_results =
                     run_group_generic(group, secrets, &accumulated, dispatch.clone()).await;
+                if let Some(h) = &progress {
+                    for r in &group_results {
+                        apply_registry::mark_step_complete(h, r.clone(), None).await;
+                    }
+                }
                 let any_failed = group_results.iter().any(|r| r.status == StepStatus::Failed);
                 for r in &group_results {
                     if let Some(ref out) = r.output {
@@ -1070,10 +1110,14 @@ where
 }
 
 /// DAG mode: Kahn's algorithm with bounded concurrency.
+///
+/// When `progress` is `Some(handle)`, per-step progress marks are written
+/// before each step is enqueued and after its result is determined.
 async fn run_dag_generic<F, Fut>(
     steps: Vec<BatchStep>,
     secrets: &HashMap<String, String>,
     dispatch: F,
+    progress: Option<Arc<Mutex<ApplyRunState>>>,
 ) -> Result<Vec<BatchStepResult>, BatchError>
 where
     F: Fn(BatchStep) -> Fut + Clone + Send + Sync + 'static,
@@ -1166,6 +1210,9 @@ where
             resolved_step.args = resolved_args;
             let step_for_validation = step.clone();
             let dispatcher = dispatch.clone();
+            if let Some(h) = &progress {
+                apply_registry::mark_step_started(h, id.clone()).await;
+            }
             in_flight.spawn(async move {
                 let out = AssertUnwindSafe(async { dispatcher(resolved_step).await })
                     .catch_unwind()
@@ -1230,6 +1277,9 @@ where
             }
         } else {
             mark_descendants_skipped(&id, &adjacency, &mut skipped);
+        }
+        if let Some(h) = &progress {
+            apply_registry::mark_step_complete(h, step_result.clone(), None).await;
         }
         results.insert(id.clone(), step_result);
         propagate_dag_ready(&id, &adjacency, &mut in_degree, &mut ready);

@@ -51,7 +51,7 @@ async fn execute_seq_3_steps_all_ok() {
         StepEntry::Leaf(leaf("c", "exec", json!({"command": "echo c"}))),
     ];
     let log = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
-    let results = run_seq_generic(steps, &HashMap::new(), ok_dispatcher(log.clone())).await;
+    let results = run_seq_generic(steps, &HashMap::new(), ok_dispatcher(log.clone()), None).await;
 
     assert_eq!(results.len(), 3);
     assert!(results.iter().all(|r| r.status == StepStatus::Ok));
@@ -76,7 +76,7 @@ async fn execute_seq_step2_fails_step3_skipped() {
             Ok(format!("ok:{}", step.id))
         }
     };
-    let results = run_seq_generic(steps, &HashMap::new(), dispatcher).await;
+    let results = run_seq_generic(steps, &HashMap::new(), dispatcher, None).await;
     assert_eq!(results.len(), 3);
     assert_eq!(results[0].status, StepStatus::Ok);
     assert_eq!(results[1].status, StepStatus::Failed);
@@ -94,7 +94,7 @@ async fn execute_dag_diamond_order() {
     ];
     let log = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
     let dispatcher = ok_dispatcher(log.clone());
-    let results = run_dag_generic(steps, &HashMap::new(), dispatcher)
+    let results = run_dag_generic(steps, &HashMap::new(), dispatcher, None)
         .await
         .expect("diamond ok");
     assert_eq!(results.len(), 4);
@@ -113,7 +113,7 @@ async fn execute_dag_cycle_detected() {
     // A -> B, B -> A
     let steps = vec![leaf_with_deps("A", &["B"]), leaf_with_deps("B", &["A"])];
     let log = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
-    let err = run_dag_generic(steps, &HashMap::new(), ok_dispatcher(log))
+    let err = run_dag_generic(steps, &HashMap::new(), ok_dispatcher(log), None)
         .await
         .expect_err("should detect cycle");
     match err {
@@ -313,7 +313,7 @@ async fn execute_dag_validator_retry_succeeds_on_second_attempt() {
             min_size: Some(10),
         }),
     };
-    let results = run_dag_generic(vec![step], &HashMap::new(), dispatcher)
+    let results = run_dag_generic(vec![step], &HashMap::new(), dispatcher, None)
         .await
         .expect("dag ok");
     assert_eq!(results.len(), 1);
@@ -336,7 +336,7 @@ async fn execute_dag_validator_fail_after_retry_marks_descendants_skipped() {
         }),
     };
     let b = leaf_with_deps("B", &["A"]);
-    let results = run_dag_generic(vec![a, b], &HashMap::new(), dispatcher)
+    let results = run_dag_generic(vec![a, b], &HashMap::new(), dispatcher, None)
         .await
         .expect("dag ok");
     let by_id: HashMap<&str, &BatchStepResult> =
@@ -372,7 +372,7 @@ async fn execute_seq_validator_retry_succeeds_on_second_attempt() {
         }),
     };
     let steps = vec![StepEntry::Leaf(step)];
-    let results = run_seq_generic(steps, &HashMap::new(), dispatcher).await;
+    let results = run_seq_generic(steps, &HashMap::new(), dispatcher, None).await;
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].status, StepStatus::Ok);
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
@@ -458,6 +458,101 @@ fn build_exec_request_rejects_non_string_env_value() {
     });
     let err = build_exec_request(&args).unwrap_err();
     assert!(err.contains("env[K]"), "got: {err}");
+}
+
+// =============================================================================
+// execute_with_progress — per-step progress streaming via ApplyRegistry
+// =============================================================================
+
+/// After a 3-step seq plan completes, registry must show completed_steps == 3
+/// and results.len() == 3.
+#[tokio::test]
+async fn execute_with_progress_3steps_all_ok_registry_complete() {
+    let steps = vec![
+        StepEntry::Leaf(leaf("s1", "exec", json!({"command": "echo 1"}))),
+        StepEntry::Leaf(leaf("s2", "exec", json!({"command": "echo 2"}))),
+        StepEntry::Leaf(leaf("s3", "exec", json!({"command": "echo 3"}))),
+    ];
+    let registry = ApplyRegistry::new();
+    let state = ApplyRunState::new("apply_test_3".into(), "pod_x".into(), 3);
+    let handle = registry.insert(state);
+
+    let dispatcher = ok_dispatcher(Arc::new(tokio::sync::Mutex::new(Vec::new())));
+    run_seq_generic(steps, &HashMap::new(), dispatcher, Some(handle)).await;
+
+    let snap = registry
+        .snapshot("apply_test_3")
+        .await
+        .expect("state present");
+    assert_eq!(snap.completed_steps, 3);
+    assert_eq!(snap.results.len(), 3);
+    // After the final step, current_step is None (mark_step_complete sets it to None).
+    assert!(snap.current_step.is_none());
+}
+
+/// During seq execution, mark_step_started is called before each dispatch,
+/// so current_step changes as each step starts. We verify this by interleaving
+/// a registry snapshot inside a delayed dispatcher.
+#[tokio::test]
+async fn execute_with_progress_intermediate_current_step_observed() {
+    let registry = Arc::new(ApplyRegistry::new());
+    let state = ApplyRunState::new("apply_test_mid".into(), "pod_x".into(), 2);
+    let handle = registry.insert(state);
+    let registry_c = registry.clone();
+
+    // step s1: captures the current_step snapshot while "executing"
+    let observed_during_s1: Arc<tokio::sync::Mutex<Option<String>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let observed_c = observed_during_s1.clone();
+
+    let dispatcher = move |step: BatchStep| {
+        let reg = registry_c.clone();
+        let obs = observed_c.clone();
+        async move {
+            if step.id == "s1" {
+                // Snapshot the registry while s1 is "in-flight".
+                // mark_step_started was already called before dispatch, so
+                // current_step should be Some("s1").
+                let snap = reg.snapshot("apply_test_mid").await;
+                *obs.lock().await = snap.and_then(|s| s.current_step);
+            }
+            Ok(format!("ok:{}", step.id))
+        }
+    };
+
+    let steps = vec![
+        StepEntry::Leaf(leaf("s1", "exec", json!({}))),
+        StepEntry::Leaf(leaf("s2", "exec", json!({}))),
+    ];
+    run_seq_generic(steps, &HashMap::new(), dispatcher, Some(handle)).await;
+
+    let observed = observed_during_s1.lock().await.clone();
+    assert_eq!(
+        observed.as_deref(),
+        Some("s1"),
+        "current_step should be 's1' while s1 is dispatching"
+    );
+
+    let snap = registry
+        .snapshot("apply_test_mid")
+        .await
+        .expect("state present");
+    assert_eq!(snap.completed_steps, 2);
+}
+
+/// execute (no handle) is a thin wrapper — must not regress existing behavior.
+#[tokio::test]
+async fn execute_without_progress_handle_runs_normally() {
+    let steps = vec![
+        StepEntry::Leaf(leaf("a", "exec", json!({"command": "echo a"}))),
+        StepEntry::Leaf(leaf("b", "exec", json!({"command": "echo b"}))),
+    ];
+    let log = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+    let results = run_seq_generic(steps, &HashMap::new(), ok_dispatcher(log.clone()), None).await;
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r.status == StepStatus::Ok));
+    let seen = log.lock().await.clone();
+    assert_eq!(seen, vec!["a".to_string(), "b".to_string()]);
 }
 
 // =============================================================================
