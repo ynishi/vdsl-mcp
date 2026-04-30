@@ -724,9 +724,19 @@ pub fn expand_phases(
         assert_shell_safe(&service.name, "services[].name")?;
         let launch = build_service_launch_cmd(&service.platform)?;
 
-        // Launch step (detached). `kill -0 $!` after a 1s settle catches
-        // immediate-exit failures (binary missing / arg parse error) so
-        // we don't silently mark a dead daemon "started".
+        // Launch step (detached). Writes pid to a file so the readiness
+        // poll can detect a service that dies during the readiness wait
+        // (e.g. vllm crashes on `sock.bind()` only after a ~10-30s
+        // import phase, well past any sleep-N + `kill -0` settle check
+        // we could put here). The 1s `kill -0` still catches the
+        // fastest-fail cases (binary missing / arg parse error).
+        //
+        // 2026-04-30 accident: vllm port-bind conflict (8188 already
+        // taken by ComfyUI bundled in default RunPod template) crashed
+        // the daemon ~10s after launch. The pre-fix start step was
+        // marked ok at sleep 1 because vllm was still loading, and
+        // ready_check then waited the full 600s timeout instead of
+        // failing in seconds.
         steps.push(StepEntry::Leaf(exec_bg_step(
             &format!("11_service_{idx}_start"),
             &format!(
@@ -734,6 +744,7 @@ pub fn expand_phases(
                  mkdir -p /workspace/.vdsl\n\
                  nohup {launch} > /workspace/.vdsl/service_{name}.log 2>&1 &\n\
                  pid=$!\n\
+                 echo $pid > /workspace/.vdsl/service_{name}.pid\n\
                  sleep 1\n\
                  kill -0 $pid 2>/dev/null || {{ \
                    echo 'service {name} died immediately' >&2; \
@@ -747,14 +758,24 @@ pub fn expand_phases(
             &env_json,
         )));
 
-        // Readiness poll step (HTTP only for now).
+        // Readiness poll step. Each iteration also checks that the
+        // launched pid is still alive — a daemon that crashed during
+        // import / bind must fail readiness immediately, not after the
+        // full timeout. See the accident note on the start step.
         if let Some(check) = &service.ready_check {
             let timeout = check.timeout_sec.unwrap_or(300);
             steps.push(StepEntry::Leaf(exec_bg_step(
                 &format!("11_service_{idx}_ready"),
                 &format!(
-                    "i=0\n\
+                    "pid_file=/workspace/.vdsl/service_{name}.pid\n\
+                     i=0\n\
                      until curl -sf {url} >/dev/null; do\n\
+                       pid=$(cat \"$pid_file\" 2>/dev/null)\n\
+                       if [ -z \"$pid\" ] || ! kill -0 \"$pid\" 2>/dev/null; then\n\
+                         echo 'service {name} died during readiness wait' >&2\n\
+                         tail -100 /workspace/.vdsl/service_{name}.log >&2\n\
+                         exit 1\n\
+                       fi\n\
                        i=$((i+1))\n\
                        if [ $i -ge {timeout} ]; then\n\
                          echo 'service {name} not ready after {timeout}s' >&2\n\

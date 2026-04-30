@@ -1133,10 +1133,27 @@ fn expand_phases_llm_models_and_vllm_service() {
     ));
     // kill -0 liveness check guards against immediate-exit failures.
     assert!(start_script.contains("kill -0 $pid"));
+    // pid file lets the readiness step detect crashes during startup.
+    assert!(start_script.contains("echo $pid > /workspace/.vdsl/service_vllm.pid"));
 
     let ready_script = find_script(&plan, "11_service_0_ready").expect("service ready present");
     assert!(ready_script.contains("until curl -sf http://localhost:8000/v1/models >/dev/null; do"));
     assert!(ready_script.contains("if [ $i -ge 60 ]; then"));
+    // Regression for 2026-04-30 vllm port-conflict accident: readiness
+    // wait must abort early when the launched pid dies, instead of
+    // burning the full timeout.
+    assert!(
+        ready_script.contains("pid_file=/workspace/.vdsl/service_vllm.pid"),
+        "ready script must reference pid file; got: {ready_script}"
+    );
+    assert!(
+        ready_script.contains("kill -0 \"$pid\""),
+        "ready loop must check pid liveness; got: {ready_script}"
+    );
+    assert!(
+        ready_script.contains("died during readiness wait"),
+        "ready loop must report crash; got: {ready_script}"
+    );
 }
 
 #[test]
