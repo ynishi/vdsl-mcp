@@ -506,14 +506,35 @@ pub fn expand_phases(
             }
         }
         // Phase 3: install python deps.
+        //
+        // Pip target depends on whether a `comfyui` block is present:
+        //   - present: install into the ComfyUI venv (custom_nodes,
+        //     ComfyUI itself, and python.deps share one env)
+        //   - absent (vllm-only / pure-LLM workload): install into the
+        //     base image's system python — there is no ComfyUI venv to
+        //     target and `cd /workspace/ComfyUI` would fail
+        //
+        // `force_reinstall` is opt-in. Required when a base-image
+        // package must be replaced (e.g. torch 2.4 → 2.10 for vllm
+        // 0.18.1, see workspace/qwen3.6-vllm-runpod-setup.md §Step 3).
         if !python.deps.is_empty() {
             for dep in &python.deps {
                 assert_shell_safe(dep, "python.deps")?;
             }
             let deps = python.deps.join(" ");
+            let pip_cmd = if manifest.comfyui.is_some() {
+                "cd /workspace/ComfyUI && .venv/bin/pip install".to_string()
+            } else {
+                "python3 -m pip install".to_string()
+            };
+            let force_flag = if python.force_reinstall.unwrap_or(false) {
+                " --force-reinstall"
+            } else {
+                ""
+            };
             steps.push(StepEntry::Leaf(exec_bg_step(
                 "3_python_deps",
-                &format!("cd /workspace/ComfyUI && .venv/bin/pip install {deps}"),
+                &format!("{pip_cmd}{force_flag} {deps}"),
                 pod_id,
                 &env_json,
             )));

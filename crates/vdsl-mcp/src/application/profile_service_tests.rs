@@ -30,6 +30,7 @@ fn full_manifest() -> ProfileManifest {
         python: Some(PythonConfig {
             deps: vec!["numpy".to_string()],
             version: None,
+            force_reinstall: None,
         }),
         custom_nodes: vec![crate::domain::profile::CustomNode {
             name: "ComfyUI-Manager".to_string(),
@@ -1019,6 +1020,7 @@ fn expand_phases_emits_python_version_check_step_when_non_default() {
     m.python = Some(PythonConfig {
         deps: vec!["numpy".to_string()],
         version: Some("3.13".to_string()),
+        force_reinstall: None,
     });
     let plan = expand_phases(&m, "abc", false).expect("ok");
 
@@ -1057,6 +1059,7 @@ fn expand_phases_omits_python_version_check_step_at_default() {
     m.python = Some(PythonConfig {
         deps: vec![],
         version: Some("3.12".to_string()),
+        force_reinstall: None,
     });
     let plan = expand_phases(&m, "abc", false).expect("ok");
     assert!(
@@ -1082,6 +1085,7 @@ fn expand_phases_rejects_unsafe_python_version() {
     m.python = Some(PythonConfig {
         deps: vec![],
         version: Some("3.12; rm -rf /".to_string()),
+        force_reinstall: None,
     });
     let err = expand_phases(&m, "abc", false).unwrap_err();
     assert!(matches!(err, ProfileError::InvalidManifest(_)));
@@ -1187,4 +1191,90 @@ fn compute_profile_hash_differs_for_different_input() {
     let a = compute_profile_hash("hello");
     let b = compute_profile_hash("hellO");
     assert_ne!(a, b);
+}
+
+// ----- python.deps target (comfyui venv vs system pip) + force_reinstall -----
+
+#[test]
+fn expand_phases_python_deps_no_comfyui_uses_system_pip() {
+    // vllm-only / pure-LLM profile: comfyui block absent. Phase 3 must
+    // install into the base image's system python because there is no
+    // ComfyUI venv on the pod. The pre-fix path emitted
+    // `cd /workspace/ComfyUI && .venv/bin/pip install ...` which fails
+    // immediately on a profile that never declared comfyui (no such
+    // directory). See workspace/qwen3.6-vllm-runpod-setup.md (vllm
+    // serve is the canonical non-ComfyUI workload).
+    let m = ProfileManifest {
+        schema: PROFILE_SCHEMA.to_string(),
+        name: "vllm-only".to_string(),
+        comfyui: None,
+        system: None,
+        python: Some(PythonConfig {
+            deps: vec!["vllm==0.18.1".to_string(), "huggingface_hub".to_string()],
+            version: None,
+            force_reinstall: None,
+        }),
+        custom_nodes: vec![],
+        sync: None,
+        staging: None,
+        models: vec![],
+        llm_models: vec![],
+        services: vec![],
+        env: HashMap::new(),
+        hooks: None,
+    };
+    let plan = expand_phases(&m, "abc", false).expect("ok");
+    let script = find_script(&plan, "3_python_deps").expect("3_python_deps must be present");
+    assert!(
+        script.contains("python3 -m pip install"),
+        "non-comfyui profile must use system pip; got: {script}"
+    );
+    assert!(
+        !script.contains("/workspace/ComfyUI"),
+        "non-comfyui profile must NOT cd into ComfyUI; got: {script}"
+    );
+    assert!(
+        !script.contains(".venv/bin/pip"),
+        "non-comfyui profile must NOT use ComfyUI venv; got: {script}"
+    );
+    assert!(
+        !script.contains("--force-reinstall"),
+        "force_reinstall=None must NOT add --force-reinstall; got: {script}"
+    );
+    assert!(
+        script.contains("vllm==0.18.1"),
+        "deps must be passed; got: {script}"
+    );
+}
+
+#[test]
+fn expand_phases_python_deps_force_reinstall_flag() {
+    // Required for cases where a base-image package must be replaced
+    // (e.g. torch 2.4 → 2.10 for vllm 0.18.1, see
+    // workspace/qwen3.6-vllm-runpod-setup.md §Step 3).
+    let m = ProfileManifest {
+        schema: PROFILE_SCHEMA.to_string(),
+        name: "vllm-only".to_string(),
+        comfyui: None,
+        system: None,
+        python: Some(PythonConfig {
+            deps: vec!["vllm==0.18.1".to_string()],
+            version: None,
+            force_reinstall: Some(true),
+        }),
+        custom_nodes: vec![],
+        sync: None,
+        staging: None,
+        models: vec![],
+        llm_models: vec![],
+        services: vec![],
+        env: HashMap::new(),
+        hooks: None,
+    };
+    let plan = expand_phases(&m, "abc", false).expect("ok");
+    let script = find_script(&plan, "3_python_deps").expect("3_python_deps must be present");
+    assert!(
+        script.contains("python3 -m pip install --force-reinstall vllm==0.18.1"),
+        "force_reinstall=true must emit --force-reinstall after install; got: {script}"
+    );
 }

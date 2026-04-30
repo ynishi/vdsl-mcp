@@ -143,6 +143,12 @@ pub struct PythonConfig {
     /// Mismatch logs to stderr but does not fail the apply.
     #[serde(default)]
     pub version: Option<String>,
+    /// When true, Phase 3 pip install adds `--force-reinstall`. Required
+    /// for cases where a base-image package (e.g. torch 2.4 from
+    /// runpod/pytorch) must be replaced by a wheel pulled by a dep
+    /// (e.g. vllm 0.18.1 needs torch 2.10).
+    #[serde(default)]
+    pub force_reinstall: Option<bool>,
 }
 
 /// One custom-node clone entry.
