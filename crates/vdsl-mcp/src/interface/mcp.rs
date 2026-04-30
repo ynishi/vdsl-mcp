@@ -2270,8 +2270,8 @@ impl VdslMcpServer {
                 obj.insert("notices".into(), serde_json::Value::Array(notices));
             }
         }
-        let json_str = serde_json::to_string_pretty(&result)
-            .unwrap_or_else(|_| format!("{result:?}"));
+        let json_str =
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"));
         Ok(CallToolResult::success(vec![Content::text(json_str)]))
     }
 

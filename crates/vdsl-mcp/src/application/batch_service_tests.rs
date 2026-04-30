@@ -606,7 +606,10 @@ fn truncate_step_output_under_limit_returns_unchanged() {
 fn truncate_step_output_over_limit_truncates_with_marker() {
     let big = "x".repeat(STEP_OUTPUT_MAX_BYTES + 100);
     let out = truncate_step_output(big);
-    assert!(out.ends_with("[…truncated…]"), "must mark truncation: {out}");
+    assert!(
+        out.ends_with("[…truncated…]"),
+        "must mark truncation: {out}"
+    );
     assert!(
         out.len() < STEP_OUTPUT_MAX_BYTES + 50,
         "must shrink to ~ STEP_OUTPUT_MAX_BYTES; got {} bytes",
