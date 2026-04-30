@@ -67,6 +67,8 @@ fn full_manifest() -> ProfileManifest {
                 subdir: "loras".to_string(),
             },
         ],
+        llm_models: Vec::new(),
+        services: Vec::new(),
         env: HashMap::new(),
         hooks: Some(Hooks {
             post_install: Some("echo done".to_string()),
@@ -212,6 +214,8 @@ fn resolve_secrets_reads_env_var() {
         sync: None,
         staging: None,
         models: vec![],
+        llm_models: vec![],
+        services: vec![],
         env: HashMap::new(),
         hooks: None,
     };
@@ -251,6 +255,8 @@ fn resolve_secrets_collects_all_missing() {
         sync: None,
         staging: None,
         models: vec![],
+        llm_models: vec![],
+        services: vec![],
         env: HashMap::new(),
         hooks: None,
     };
@@ -957,6 +963,8 @@ fn expand_phases_without_comfyui_skips_phase_2_9_10() {
             }],
         }),
         models: vec![],
+        llm_models: vec![],
+        services: vec![],
         env: HashMap::new(),
         hooks: None,
     };
@@ -1077,6 +1085,91 @@ fn expand_phases_rejects_unsafe_python_version() {
     });
     let err = expand_phases(&m, "abc", false).unwrap_err();
     assert!(matches!(err, ProfileError::InvalidManifest(_)));
+}
+
+#[test]
+fn expand_phases_llm_models_and_vllm_service() {
+    use crate::domain::profile::{HttpReadyCheck, LlmModel, ServiceConfig, ServicePlatform};
+
+    let mut m = full_manifest();
+    m.llm_models.push(LlmModel {
+        src: "hf://org/repo".to_string(),
+        dst_dir: "/root/models/llama".to_string(),
+        revision: None,
+    });
+    m.services.push(ServiceConfig {
+        name: "vllm".to_string(),
+        platform: ServicePlatform::Vllm {
+            model: "/root/models/llama".to_string(),
+            port: 8000,
+            dtype: Some("half".to_string()),
+            tensor_parallel_size: Some(2),
+            extra_args: vec![],
+        },
+        ready_check: Some(HttpReadyCheck {
+            http: "http://localhost:8000/v1/models".to_string(),
+            timeout_sec: Some(60),
+        }),
+    });
+
+    let plan = expand_phases(&m, "abc", false).expect("ok");
+
+    // LLM model step (Phase 7b).
+    let script = find_script(&plan, "7b_llm_model_0").expect("llm model step present");
+    assert!(
+        script.contains("huggingface-cli download \"org/repo\" --local-dir \"/root/models/llama\"")
+    );
+    assert!(script.contains("import huggingface_hub"));
+    assert!(script.contains("${HF_TOKEN:-}"));
+
+    // Service launch step (Phase 11).
+    let start_script = find_script(&plan, "11_service_0_start").expect("service start present");
+    assert!(start_script.contains(
+        "nohup vllm serve \"/root/models/llama\" --port 8000 --tensor-parallel-size 2 --dtype half"
+    ));
+    // kill -0 liveness check guards against immediate-exit failures.
+    assert!(start_script.contains("kill -0 $pid"));
+
+    let ready_script = find_script(&plan, "11_service_0_ready").expect("service ready present");
+    assert!(ready_script.contains("until curl -sf http://localhost:8000/v1/models >/dev/null; do"));
+    assert!(ready_script.contains("if [ $i -ge 60 ]; then"));
+}
+
+#[test]
+fn expand_phases_ollama_service_launch_command() {
+    use crate::domain::profile::{ServiceConfig, ServicePlatform};
+    let mut m = full_manifest();
+    m.services.push(ServiceConfig {
+        name: "ollama".to_string(),
+        platform: ServicePlatform::Ollama {
+            port: 11434,
+            models: vec!["llama3:8b".to_string()],
+        },
+        ready_check: None,
+    });
+    let plan = expand_phases(&m, "abc", false).expect("ok");
+    let s = find_script(&plan, "11_service_0_start").expect("ollama start present");
+    assert!(s.contains("nohup OLLAMA_HOST=0.0.0.0:11434 ollama serve"));
+}
+
+#[test]
+fn expand_phases_rejects_duplicate_service_names() {
+    use crate::domain::profile::{ServiceConfig, ServicePlatform};
+    let mut m = full_manifest();
+    let svc = |n: &str| ServiceConfig {
+        name: n.to_string(),
+        platform: ServicePlatform::Ollama {
+            port: 11434,
+            models: vec![],
+        },
+        ready_check: None,
+    };
+    m.services.push(svc("ollama"));
+    m.services.push(svc("ollama"));
+    let err = expand_phases(&m, "pod-x", false).unwrap_err();
+    assert!(
+        matches!(err, ProfileError::InvalidManifest(ref s) if s.contains("duplicate services[].name"))
+    );
 }
 
 // ----- compute_profile_hash -----

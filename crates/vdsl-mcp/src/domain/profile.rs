@@ -75,10 +75,23 @@ pub struct ProfileManifest {
     #[serde(default)]
     pub staging: Option<StagingConfig>,
 
-    /// Checkpoints / LoRAs / VAEs etc. to stage into
-    /// `/workspace/ComfyUI/models/<subdir>/<dst>`.
+    /// ComfyUI checkpoints / LoRAs / VAEs etc. to stage into
+    /// `/workspace/ComfyUI/models/<subdir>/<dst>`. Reserved for ComfyUI;
+    /// non-ComfyUI workloads use [`Self::llm_models`] instead.
     #[serde(default)]
     pub models: Vec<Model>,
+
+    /// Raw LLM weight staging for non-ComfyUI workloads (vLLM / Ollama
+    /// / TEI etc.). Independent of [`Self::models`] so ComfyUI subdir /
+    /// kind semantics don't bleed into LLM staging.
+    #[serde(default)]
+    pub llm_models: Vec<LlmModel>,
+
+    /// Adjacent AI daemon services (vLLM / Ollama / etc.). Each entry
+    /// names a known platform; the launch command is generated from the
+    /// platform variant — no free-form shell strings.
+    #[serde(default)]
+    pub services: Vec<ServiceConfig>,
 
     /// Environment variables. Plain strings or `{"__secret": "NAME"}`.
     #[serde(default)]
@@ -189,9 +202,72 @@ pub struct SyncRoute {
     pub dst: String,
 }
 
-/// One model staging entry.
+/// Adjacent daemon service. Launch command is derived from `platform`
+/// — there is no free-form `cmd: String` field by design. Adding a new
+/// platform requires extending [`ServicePlatform`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceConfig {
+    /// Identifier used for log file naming (`service_<name>.log`) and
+    /// step ids. Must be `is_shell_safe`.
+    pub name: String,
+
+    /// Platform-specific launch config. The variant determines which
+    /// fields are required and how the launch shell command is built.
+    #[serde(flatten)]
+    pub platform: ServicePlatform,
+
+    #[serde(default)]
+    pub ready_check: Option<HttpReadyCheck>,
+}
+
+/// Closed set of supported service platforms. Each variant carries its
+/// own typed config; the launch command is generated, not user-supplied.
+/// New platforms require a code change (intentional — keeps the surface
+/// small and auditable).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ServicePlatform {
+    /// vLLM OpenAI-compatible server.
+    /// `vllm serve <model> --port <port> [--tensor-parallel-size N] [--dtype X] [extra_args...]`
+    Vllm {
+        /// HF repo id (e.g. `meta-llama/Llama-3-8B-Instruct`) or local path.
+        model: String,
+        port: u16,
+        #[serde(default)]
+        dtype: Option<String>,
+        #[serde(default)]
+        tensor_parallel_size: Option<u32>,
+        /// Free-form extra flags (single-token each, validated with
+        /// `is_shell_safe_with_spaces`).
+        #[serde(default)]
+        extra_args: Vec<String>,
+    },
+    /// Ollama daemon. `ollama serve` listens on `port`; `models` are
+    /// pre-pulled with `ollama pull <name>` after the daemon is up.
+    Ollama {
+        port: u16,
+        #[serde(default)]
+        models: Vec<String>,
+    },
+}
+
+/// HTTP readiness probe. `curl -sf <http>` is polled every second up
+/// to `timeout_sec` (default 300).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpReadyCheck {
+    /// Full URL (operator-authored; substituted verbatim into the poll
+    /// shell command — same trust model as the rest of the manifest).
+    pub http: String,
+    #[serde(default)]
+    pub timeout_sec: Option<u32>,
+}
+
+/// ComfyUI model staging entry.
 ///
-/// `subdir` is authoritative — MCP does not re-derive it from `kind`.
+/// Reserved for ComfyUI's `models/<subdir>/<dst>` layout. `subdir` and
+/// `kind` are ComfyUI-specific terms (`checkpoints`, `loras`, `vae`,
+/// ...). For raw LLM weight staging targeting non-ComfyUI workloads
+/// (vLLM / Ollama / TEI), use [`LlmModel`] instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
     /// Source URI (`b2://...` or `file://...`).
@@ -200,11 +276,30 @@ pub struct Model {
     /// Destination filename (relative to `subdir`).
     pub dst: String,
 
-    /// Model kind (`checkpoint`, `lora`, ..., or `"custom"` sentinel).
+    /// Model kind (`checkpoint`, `lora`, ...). Trusted verbatim from
+    /// the DSL; MCP does not re-derive `subdir` from it.
     pub kind: String,
 
     /// Sub-directory under `/workspace/ComfyUI/models/`.
     pub subdir: String,
+}
+
+/// Raw LLM weight staging entry for non-ComfyUI workloads.
+///
+/// Unlike [`Model`] which is constrained to ComfyUI's layout, `LlmModel`
+/// targets an arbitrary directory and pulls a HuggingFace repo in full.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmModel {
+    /// Source URI. Currently only `hf://<org>/<repo>` is supported.
+    pub src: String,
+
+    /// Absolute directory the repo is materialized into (passed to
+    /// `huggingface-cli download --local-dir`).
+    pub dst_dir: String,
+
+    /// Optional git revision / branch / tag passed to `--revision`.
+    #[serde(default)]
+    pub revision: Option<String>,
 }
 
 /// Environment value: plain string or a `__secret` reference.

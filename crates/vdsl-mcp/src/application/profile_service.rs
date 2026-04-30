@@ -76,7 +76,9 @@
 //! non-preset subdirs, new source schemes), and the 2026-04-21
 //! accident record.
 
-use crate::domain::profile::{EnvValue, Model, ProfileManifest, SyncRoute, PROFILE_SCHEMA};
+use crate::domain::profile::{
+    EnvValue, LlmModel, Model, ProfileManifest, ServicePlatform, SyncRoute, PROFILE_SCHEMA,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -360,6 +362,21 @@ pub fn resolve_secrets(
         }
     }
 
+    // HF_TOKEN is optional: public repos work without it. We pick it up
+    // if present so private repos work, but missing is not a hard error.
+    let needs_hf = manifest.models.iter().any(|m| m.src.starts_with("hf://"));
+    if needs_hf {
+        for name in HF_PULL_SECRET_NAMES {
+            if resolved.contains_key(*name) {
+                continue;
+            }
+            if let Ok(v) = std::env::var(name) {
+                if !v.is_empty() {
+                    resolved.insert((*name).to_string(), v);
+                }
+            }
+        }
+    }
     if !missing.is_empty() {
         missing.sort();
         missing.dedup();
@@ -375,6 +392,9 @@ pub fn resolve_secrets(
 /// `resolve_secrets` pre-populates these in the secrets map so the
 /// apply handler fails fast if any are unset.
 const B2_PULL_SECRET_NAMES: &[&str] = &["VDSL_B2_KEY_ID", "VDSL_B2_KEY"];
+
+/// MCP-side env var names injected for hf:// model pulls.
+const HF_PULL_SECRET_NAMES: &[&str] = &["HF_TOKEN"];
 
 /// Expand a manifest into a concrete [`BatchPlan`] targeting `pod_id`.
 ///
@@ -586,6 +606,23 @@ pub fn expand_phases(
         }));
     }
 
+    // ---- Phase 7b: llm_models (raw LLM weight staging, serial) ----
+    // Independent of Phase 7 — `models[]` targets ComfyUI's models tree,
+    // `llm_models[]` targets arbitrary dst_dir for non-ComfyUI workloads.
+    // Serial for the same reason: each repo is large, parallel pulls
+    // saturate network/disk.
+    if !manifest.llm_models.is_empty() {
+        let mut llm_steps: Vec<BatchStep> = Vec::with_capacity(manifest.llm_models.len());
+        for (idx, lm) in manifest.llm_models.iter().enumerate() {
+            llm_steps.push(build_llm_model_step(idx, lm, pod_id, &env_json)?);
+        }
+        steps.push(StepEntry::Group(GroupBlock {
+            id: Some("7b_llm_models".to_string()),
+            parallel: 1,
+            steps: llm_steps,
+        }));
+    }
+
     // ---- Phase 8: hooks.post_install ----
     if let Some(hooks) = &manifest.hooks {
         if let Some(script) = &hooks.post_install {
@@ -647,6 +684,74 @@ pub fn expand_phases(
         }));
     }
 
+    // ---- Phase 11: generic services ----
+    // Reject duplicate service names — log files would collide on
+    // /workspace/.vdsl/service_{name}.log and ready_check messages
+    // would mis-attribute failures.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for service in &manifest.services {
+            if !seen.insert(service.name.as_str()) {
+                return Err(ProfileError::InvalidManifest(format!(
+                    "duplicate services[].name: '{}'",
+                    service.name
+                )));
+            }
+        }
+    }
+    for (idx, service) in manifest.services.iter().enumerate() {
+        assert_shell_safe(&service.name, "services[].name")?;
+        let launch = build_service_launch_cmd(&service.platform)?;
+
+        // Launch step (detached). `kill -0 $!` after a 1s settle catches
+        // immediate-exit failures (binary missing / arg parse error) so
+        // we don't silently mark a dead daemon "started".
+        steps.push(StepEntry::Leaf(exec_bg_step(
+            &format!("11_service_{idx}_start"),
+            &format!(
+                "set -e\n\
+                 mkdir -p /workspace/.vdsl\n\
+                 nohup {launch} > /workspace/.vdsl/service_{name}.log 2>&1 &\n\
+                 pid=$!\n\
+                 sleep 1\n\
+                 kill -0 $pid 2>/dev/null || {{ \
+                   echo 'service {name} died immediately' >&2; \
+                   tail -100 /workspace/.vdsl/service_{name}.log >&2; \
+                   exit 1; \
+                 }}\n",
+                launch = launch,
+                name = service.name
+            ),
+            pod_id,
+            &env_json,
+        )));
+
+        // Readiness poll step (HTTP only for now).
+        if let Some(check) = &service.ready_check {
+            let timeout = check.timeout_sec.unwrap_or(300);
+            steps.push(StepEntry::Leaf(exec_bg_step(
+                &format!("11_service_{idx}_ready"),
+                &format!(
+                    "i=0\n\
+                     until curl -sf {url} >/dev/null; do\n\
+                       i=$((i+1))\n\
+                       if [ $i -ge {timeout} ]; then\n\
+                         echo 'service {name} not ready after {timeout}s' >&2\n\
+                         tail -100 /workspace/.vdsl/service_{name}.log >&2\n\
+                         exit 1\n\
+                       fi\n\
+                       sleep 1\n\
+                     done\n",
+                    url = check.http,
+                    timeout = timeout,
+                    name = service.name
+                ),
+                pod_id,
+                &env_json,
+            )));
+        }
+    }
+
     Ok(BatchPlan {
         mode: PlanMode::Seq,
         steps,
@@ -687,17 +792,6 @@ fn is_shell_safe(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || "-._/@:+=~".contains(c))
-}
-
-/// Like [`is_shell_safe`] but additionally allows single spaces.
-/// Intended for `comfyui.args` where multiple flags are space-separated
-/// (e.g. `--lowvram --preview-method auto`). Double spaces are rejected.
-#[cfg(test)]
-fn is_shell_safe_with_spaces(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-._/@:+=~ ".contains(c))
-        && !s.contains("  ")
 }
 
 fn assert_shell_safe(value: &str, field: &str) -> Result<(), ProfileError> {
@@ -1102,7 +1196,9 @@ fn build_model_step(
 ) -> Result<BatchStep, ProfileError> {
     assert_shell_safe(&model.subdir, "models[].subdir")?;
     assert_shell_safe(&model.dst, "models[].dst")?;
+
     let dst_path = format!("/workspace/ComfyUI/models/{}/{}", model.subdir, model.dst);
+    let dst_dir = format!("/workspace/ComfyUI/models/{}", model.subdir);
 
     if let Some(rest) = model.src.strip_prefix("b2://") {
         assert_shell_safe(rest, "models[].src (b2 path)")?;
@@ -1129,12 +1225,12 @@ fn build_model_step(
         let script = format!(
             "set -e\n\
              command -v rclone >/dev/null 2>&1 || curl -sL https://rclone.org/install.sh | bash\n\
-             mkdir -p /workspace/ComfyUI/models/{subdir}\n\
+             mkdir -p {dst_dir}\n\
              export RCLONE_CONFIG_B2_TYPE=b2\n\
              export RCLONE_CONFIG_B2_ACCOUNT=\"$VDSL_B2_KEY_ID\"\n\
              export RCLONE_CONFIG_B2_KEY=\"$VDSL_B2_KEY\"\n\
              rclone copyto --progress b2:{bucket}/{object} {dst}\n",
-            subdir = model.subdir,
+            dst_dir = dst_dir,
             bucket = bucket,
             object = object,
             dst = dst_path,
@@ -1149,8 +1245,8 @@ fn build_model_step(
     } else if let Some(rest) = model.src.strip_prefix("file://") {
         assert_shell_safe(rest, "models[].src (file path)")?;
         let script = format!(
-            "mkdir -p /workspace/ComfyUI/models/{subdir} && cp {src} {dst}",
-            subdir = model.subdir,
+            "mkdir -p {dst_dir} && cp {src} {dst}",
+            dst_dir = dst_dir,
             src = rest,
             dst = dst_path,
         );
@@ -1163,10 +1259,110 @@ fn build_model_step(
     } else {
         tracing::warn!(src = %model.src, "unsupported model src scheme");
         Err(ProfileError::InvalidManifest(format!(
-            "unsupported model src scheme: '{}' (expected 'b2://' or 'file://')",
+            "unsupported model src scheme: '{}' (expected 'b2://' or 'file://'; for hf:// use llm_models[])",
             model.src
         )))
     }
+}
+
+/// Build a Phase 7b llm_model step. Currently only `hf://<org>/<repo>`
+/// is supported — pulled with `huggingface-cli download` into
+/// `dst_dir`. HF_TOKEN is injected when the host env has it (required
+/// only for private repos; public pulls work anonymously).
+fn build_llm_model_step(
+    idx: usize,
+    lm: &LlmModel,
+    pod_id: &str,
+    env: &serde_json::Value,
+) -> Result<BatchStep, ProfileError> {
+    assert_shell_safe(&lm.dst_dir, "llm_models[].dst_dir")?;
+    if let Some(rev) = &lm.revision {
+        assert_shell_safe(rev, "llm_models[].revision")?;
+    }
+    let Some(repo) = lm.src.strip_prefix("hf://") else {
+        return Err(ProfileError::InvalidManifest(format!(
+            "unsupported llm_models src scheme: '{}' (expected 'hf://<org>/<repo>')",
+            lm.src
+        )));
+    };
+    assert_shell_safe(repo, "llm_models[].src (hf repo)")?;
+    let revision_arg = lm
+        .revision
+        .as_deref()
+        .map(|r| format!(" --revision \"{r}\""))
+        .unwrap_or_default();
+    let script = format!(
+        "set -e\n\
+         mkdir -p \"{dst_dir}\"\n\
+         python3 -c 'import huggingface_hub' 2>/dev/null || pip install -q huggingface_hub\n\
+         HF_TOKEN=\"${{HF_TOKEN:-}}\" huggingface-cli download \"{repo}\" --local-dir \"{dst_dir}\"{revision_arg}\n",
+        dst_dir = lm.dst_dir,
+        repo = repo,
+        revision_arg = revision_arg,
+    );
+    let step_env = merge_hf_env(env);
+    Ok(exec_bg_step(
+        &format!("7b_llm_model_{idx}"),
+        &script,
+        pod_id,
+        &step_env,
+    ))
+}
+
+/// Build the launch shell command for a service platform. The command
+/// is generated from the typed variant — there is no free-form `cmd`
+/// field by design. New platforms require extending [`ServicePlatform`].
+fn build_service_launch_cmd(platform: &ServicePlatform) -> Result<String, ProfileError> {
+    match platform {
+        ServicePlatform::Vllm {
+            model,
+            port,
+            dtype,
+            tensor_parallel_size,
+            extra_args,
+        } => {
+            assert_shell_safe(model, "services[].vllm.model")?;
+            if let Some(d) = dtype {
+                assert_shell_safe(d, "services[].vllm.dtype")?;
+            }
+            for a in extra_args {
+                if !is_shell_safe_with_spaces(a) {
+                    return Err(ProfileError::InvalidManifest(format!(
+                        "services[].vllm.extra_args contains unsafe token: {a:?}"
+                    )));
+                }
+            }
+            let mut cmd = format!("vllm serve \"{model}\" --port {port}");
+            if let Some(tp) = tensor_parallel_size {
+                cmd.push_str(&format!(" --tensor-parallel-size {tp}"));
+            }
+            if let Some(d) = dtype {
+                cmd.push_str(&format!(" --dtype {d}"));
+            }
+            for a in extra_args {
+                cmd.push(' ');
+                cmd.push_str(a);
+            }
+            Ok(cmd)
+        }
+        ServicePlatform::Ollama { port, models: _ } => {
+            // Daemon only — model pulls are out of scope for the launch
+            // command (operator runs `ollama pull` via hooks.post_install
+            // or a follow-up tool call after readiness).
+            Ok(format!("OLLAMA_HOST=0.0.0.0:{port} ollama serve"))
+        }
+    }
+}
+
+/// Like [`is_shell_safe`] but additionally allows single spaces.
+/// Intended for fields that legitimately carry multi-token strings
+/// (e.g. `comfyui.args`, `services[].vllm.extra_args`). Double spaces
+/// are rejected.
+fn is_shell_safe_with_spaces(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-._/@:+=~ ".contains(c))
+        && !s.contains("  ")
 }
 
 /// Clone `base_env` (the profile-global env object) and overlay
@@ -1183,6 +1379,28 @@ fn merge_b2_env(base_env: &serde_json::Value) -> serde_json::Value {
             (*name).to_string(),
             serde_json::Value::String(format!("__secret:{name}")),
         );
+    }
+    serde_json::Value::Object(map)
+}
+
+/// Similar to merge_b2_env, but for HF_TOKEN. Unlike B2 (required for
+/// b2:// pulls), HF_TOKEN is optional — public repos work anonymously.
+/// We emit the `__secret:HF_TOKEN` placeholder only when the host env
+/// actually has it set, matching the optional-resolution path in
+/// [`resolve_secrets`]. Missing HF_TOKEN with a private repo will fail
+/// at huggingface-cli download time, not at dispatch.
+fn merge_hf_env(base_env: &serde_json::Value) -> serde_json::Value {
+    let mut map = match base_env {
+        serde_json::Value::Object(m) => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+    for name in HF_PULL_SECRET_NAMES {
+        if std::env::var(name).map(|v| !v.is_empty()).unwrap_or(false) {
+            map.insert(
+                (*name).to_string(),
+                serde_json::Value::String(format!("__secret:{name}")),
+            );
+        }
     }
     serde_json::Value::Object(map)
 }
