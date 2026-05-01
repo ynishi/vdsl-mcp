@@ -91,6 +91,18 @@ it provides the `lua/` directory containing catalog definitions, compilers, and 
 | `VDSL_B2_BUCKET` | For B2 storage (optional) | Default B2 bucket name (can also be specified per-call) |
 | `VDSL_COMFYUI_BASE` | Optional | Override ComfyUI install path on pod (default: `/workspace/runpod-slim/ComfyUI`). Community templates may use `/workspace/ComfyUI` etc. |
 | `VDSL_INLINE_HISTORY_DIR` | Optional | Override directory for saving inline Lua code history |
+| `VDSL_ENV_FILE` | Optional | Explicit `.env` file path. Highest-priority among `.env` sources (still below OS env) |
+
+#### `.env` file auto-loading
+
+`vdsl-mcp` loads variables from `.env` files at startup so that secrets do not need to be embedded in `.mcp.json`. Search order (first writer wins; OS env is always preserved):
+
+1. OS environment (already exported in the shell / parent process)
+2. `$VDSL_ENV_FILE` if set
+3. `~/.config/vdsl-mcp/.env`
+4. `$CWD/.env`
+
+Recommended layout: keep the `.mcp.json` `env` block free of secrets (only `VDSL_WORK_DIR` and similar non-secret paths) and place tokens in `~/.config/vdsl-mcp/.env` with `chmod 600`. Values containing literal `$` (e.g. bcrypt hashes) must be single-quoted in the `.env` file because `dotenvy` performs `$VAR` expansion in unquoted values.
 
 ### MCP Client Configuration
 

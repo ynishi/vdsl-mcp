@@ -4,25 +4,134 @@ use tracing_appender::rolling;
 use tracing_subscriber::{fmt, EnvFilter};
 use vdsl_mcp::infra::config::{AppConfig, SyncdCliOverrides};
 
+/// Load environment variables from .env files into process env.
+///
+/// Priority (highest first; first writer wins because dotenvy::from_path
+/// does not override existing variables):
+///   1. OS env (already set in the process)
+///   2. `$VDSL_ENV_FILE` (explicit override path)
+///   3. `~/.config/vdsl-mcp/.env` (XDG-ish user config)
+///   4. `$CWD/.env` (project-local fallback)
+///
+/// Missing files are silently ignored. Parse errors are logged via stderr
+/// because tracing is not yet initialised at this point.
+fn load_env_files() {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Ok(p) = std::env::var("VDSL_ENV_FILE") {
+        candidates.push(PathBuf::from(p));
+    }
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".config/vdsl-mcp/.env"));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join(".env"));
+    }
+
+    for path in candidates {
+        if !path.exists() {
+            continue;
+        }
+        match dotenvy::from_path(&path) {
+            Ok(()) => {
+                eprintln!("vdsl-mcp: loaded env from {}", path.display());
+            }
+            Err(e) => {
+                eprintln!("vdsl-mcp: failed to load env from {}: {e}", path.display());
+            }
+        }
+    }
+}
+
 /// Initialize file-based tracing for MCP stdio server.
 ///
 /// MCP stdio transport uses stdout for JSON-RPC protocol messages.
 /// All application logging MUST go to a file, not stdout/stderr.
+///
+/// # Log directory resolution
+///
+/// `vdsl-mcp` is **mount-status agnostic**: it does not care whether the
+/// configured `VDSL_LOG_DIR` lives on a mounted external volume. Instead,
+/// it probes each candidate for write access and falls back through three
+/// tiers so a stale `VDSL_LOG_DIR` (e.g. an unmounted external drive) never
+/// panics the MCP server at startup.
+///
+/// Resolution order (first writable wins):
+/// 1. **Primary** — `$VDSL_LOG_DIR` if set, otherwise `~/.vdsl/logs`.
+///    Typical use case: User points this at an external volume
+///    (`/Volumes/<drive>/vdsl/logs`) for bulk image-generation projects.
+/// 2. **Local stable fallback** — `~/.vdsl/logs`. Persistent across reboots,
+///    survives external volume unmounts. Used when the primary is configured
+///    to an external location that is currently unavailable.
+/// 3. **Last resort** — `/tmp/vdsl-mcp-logs`. Volatile (cleared on reboot).
+///    Used only when even `~/.vdsl/logs` cannot be written (e.g. HOME
+///    unreadable, restricted sandbox).
+///
+/// When tier 2 or tier 3 is selected, a `WARN`-level event is emitted *after*
+/// tracing initialisation so the operator can grep the log for unexpected
+/// fallbacks. Pre-init diagnostics also go to stderr.
 ///
 /// Configuration:
 /// - `VDSL_LOG_DIR`: Log directory (default: `~/.vdsl/logs`)
 /// - `RUST_LOG`: Filter directives (overrides `default_level`)
 /// - `default_level`: Used when `RUST_LOG` is not set (e.g. "info", "debug")
 fn init_tracing(default_level: &str) -> tracing_appender::non_blocking::WorkerGuard {
-    let log_dir = std::env::var("VDSL_LOG_DIR").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        format!("{home}/.vdsl/logs")
-    });
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let primary = std::env::var("VDSL_LOG_DIR").unwrap_or_else(|_| format!("{home}/.vdsl/logs"));
+    let local_stable = format!("{home}/.vdsl/logs");
+    let last_resort = "/tmp/vdsl-mcp-logs".to_string();
 
-    // Ensure log directory exists
-    let _ = std::fs::create_dir_all(&log_dir);
+    // Probe each candidate for actual write access (existence is not enough
+    // because an unmounted /Volumes path may pass create_dir_all on some
+    // platforms but reject the subsequent file create).
+    fn dir_writable(dir: &str) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let probe = std::path::Path::new(dir).join(".vdsl-write-probe");
+        std::fs::write(&probe, b"ok")?;
+        std::fs::remove_file(&probe).ok();
+        Ok(())
+    }
 
-    let file_appender = rolling::daily(&log_dir, "vdsl-mcp.log");
+    // Track which tier was selected so we can emit a structured WARN after
+    // tracing is up. We cannot log via tracing here because the subscriber
+    // is not yet installed.
+    let mut fallback_reason: Option<(String, String, String)> = None; // (from, to, error)
+
+    let resolved_log_dir = match dir_writable(&primary) {
+        Ok(()) => primary,
+        Err(e1) => {
+            eprintln!("vdsl-mcp: log dir {primary} not writable: {e1}; trying {local_stable}");
+            if primary != local_stable {
+                match dir_writable(&local_stable) {
+                    Ok(()) => {
+                        fallback_reason =
+                            Some((primary.clone(), local_stable.clone(), e1.to_string()));
+                        local_stable.clone()
+                    }
+                    Err(e2) => {
+                        eprintln!(
+                            "vdsl-mcp: local stable {local_stable} not writable: {e2}; \
+                             falling back to {last_resort}"
+                        );
+                        let _ = dir_writable(&last_resort);
+                        fallback_reason = Some((
+                            primary.clone(),
+                            last_resort.clone(),
+                            format!("{e1}; then {e2}"),
+                        ));
+                        last_resort.clone()
+                    }
+                }
+            } else {
+                let _ = dir_writable(&last_resort);
+                fallback_reason =
+                    Some((primary.clone(), last_resort.clone(), e1.to_string()));
+                last_resort.clone()
+            }
+        }
+    };
+
+    let file_appender = rolling::daily(&resolved_log_dir, "vdsl-mcp.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -38,6 +147,20 @@ fn init_tracing(default_level: &str) -> tracing_appender::non_blocking::WorkerGu
         .with_target(true)
         .with_thread_ids(false)
         .init();
+
+    // Now that tracing is up, surface any fallback that occurred so it lands
+    // in the rolling log file (operators can grep for "log_dir_fallback").
+    if let Some((from, to, reason)) = fallback_reason {
+        tracing::warn!(
+            event = "log_dir_fallback",
+            primary = %from,
+            resolved = %to,
+            reason = %reason,
+            "VDSL_LOG_DIR primary was not writable; logs are being written to the fallback path"
+        );
+    } else {
+        tracing::info!(log_dir = %resolved_log_dir, "tracing initialised");
+    }
 
     guard
 }
@@ -97,6 +220,8 @@ impl From<&SyncdArgs> for SyncdCliOverrides {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    load_env_files();
+
     let cli = Cli::parse();
 
     // config を先にロードして log_level を決定する (init_tracing はグローバル設定のため 1 度のみ呼ぶ)
