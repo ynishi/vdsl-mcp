@@ -79,6 +79,41 @@ pub fn format_volume_list(volumes: &[serde_json::Value]) -> String {
     output
 }
 
+use serde::{Deserialize, Serialize};
+
+/// Route kind for a pod endpoint — how traffic reaches the service.
+///
+/// Serializes to kebab-case JSON strings so downstream agents can compare
+/// without risk of PascalCase / snake_case drift.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RouteKind {
+    /// Traffic is forwarded through an SSH local port-forward tunnel.
+    SshTunnel,
+    /// Traffic is forwarded through the Cloudflare proxy URL provided by RunPod.
+    CloudflareProxy,
+    /// Traffic goes directly to the host (no tunnel, no proxy).
+    Direct,
+}
+
+/// A single resolved endpoint for a running pod service.
+///
+/// Used in `vdsl_pod_list` `endpoints[]` output and `vdsl_tunnel_list` JSON.
+/// The [`route`] field uses [`RouteKind`] so both outputs share the same
+/// serialized representation without string comparison risk.
+#[derive(Debug, Clone, Serialize)]
+pub struct PodEndpoint {
+    /// Service name, e.g. `"comfyui"`, `"vllm"`, `"raw"`.
+    pub service: String,
+    /// Resolved URL: `http://127.0.0.1:{port}` (ssh-tunnel) or
+    /// `https://{pod_id}-{port}.proxy.runpod.net` (cloudflare-proxy).
+    pub url: String,
+    /// Active routing strategy for this endpoint.
+    pub route: RouteKind,
+    /// Local port used when `route == SshTunnel`, otherwise `None`.
+    pub local_port: Option<u16>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +226,56 @@ mod tests {
         assert!(result.contains("A40_001"));
         assert!(result.contains("EU-SE-1"));
         assert!(result.contains("300 GB"));
+    }
+
+    #[test]
+    fn route_kind_serde_kebab_case() {
+        // Serialize
+        assert_eq!(
+            serde_json::to_string(&RouteKind::SshTunnel).unwrap(),
+            "\"ssh-tunnel\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RouteKind::CloudflareProxy).unwrap(),
+            "\"cloudflare-proxy\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RouteKind::Direct).unwrap(),
+            "\"direct\""
+        );
+
+        // Round-trip deserialize
+        let decoded: RouteKind = serde_json::from_str("\"ssh-tunnel\"").unwrap();
+        assert_eq!(decoded, RouteKind::SshTunnel);
+        let decoded: RouteKind = serde_json::from_str("\"cloudflare-proxy\"").unwrap();
+        assert_eq!(decoded, RouteKind::CloudflareProxy);
+        let decoded: RouteKind = serde_json::from_str("\"direct\"").unwrap();
+        assert_eq!(decoded, RouteKind::Direct);
+    }
+
+    #[test]
+    fn pod_endpoint_serialize_shape() {
+        let ep = PodEndpoint {
+            service: "comfyui".to_string(),
+            url: "http://127.0.0.1:7100".to_string(),
+            route: RouteKind::SshTunnel,
+            local_port: Some(7100),
+        };
+        let value: serde_json::Value = serde_json::to_value(&ep).unwrap();
+        assert_eq!(value["service"], "comfyui");
+        assert_eq!(value["url"], "http://127.0.0.1:7100");
+        assert_eq!(value["route"], "ssh-tunnel");
+        assert_eq!(value["local_port"], 7100);
+
+        // local_port absent when None
+        let ep_proxy = PodEndpoint {
+            service: "vllm".to_string(),
+            url: "https://pod1-8000.proxy.runpod.net".to_string(),
+            route: RouteKind::CloudflareProxy,
+            local_port: None,
+        };
+        let value2: serde_json::Value = serde_json::to_value(&ep_proxy).unwrap();
+        assert_eq!(value2["route"], "cloudflare-proxy");
+        assert!(value2["local_port"].is_null());
     }
 }

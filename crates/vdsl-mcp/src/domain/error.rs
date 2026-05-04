@@ -20,4 +20,7 @@ pub enum DomainError {
 
     #[error("unknown model dir key: {0}")]
     ModelTypeParse(String),
+
+    #[error("ssh tunnel: {0}")]
+    SshTunnel(String),
 }
