@@ -192,17 +192,49 @@ pub(crate) fn build_endpoints(
     endpoints
 }
 
+/// Extract SSH connection info directly from a pod JSON value without any I/O.
+///
+/// Reads `desiredStatus`, `publicIp`, and `portMappings["22"]` from the
+/// supplied JSON — all fields are present in the array returned by `list_pods`.
+/// Returns `None` if the pod is not RUNNING, has no public IP, or has no SSH
+/// port mapping.
+fn extract_ssh_info_from_pod_json(
+    pod: &serde_json::Value,
+) -> Option<crate::infra::runpod_cli::PodSshInfo> {
+    if pod["desiredStatus"].as_str().unwrap_or("") != "RUNNING" {
+        return None;
+    }
+    let host = pod["publicIp"].as_str().unwrap_or("");
+    if host.is_empty() {
+        return None;
+    }
+    let port = pod["portMappings"]["22"]
+        .as_u64()
+        .or_else(|| {
+            pod["portMappings"]
+                .as_object()
+                .and_then(|m| m.get("22"))
+                .and_then(|v| v.as_u64())
+        })
+        .unwrap_or(0) as u16;
+    if port == 0 {
+        return None;
+    }
+    Some(crate::infra::runpod_cli::PodSshInfo {
+        host: host.to_string(),
+        port,
+    })
+}
+
 /// Build the `## Endpoints` section appended to `vdsl_pod_list` output.
 ///
-/// For each pod, queries `pod_ssh_info` and cross-references
-/// `tunnel_registry.list()` to determine the active [`RouteKind`]:
+/// Cross-references `tunnel_registry.list()` with SSH info extracted directly
+/// from the supplied `pods` array (no additional I/O) to determine the active
+/// [`RouteKind`] for each pod:
 ///
-/// - If the tunnel registry has an entry for the pod **and** `pod_ssh_info`
-///   returns `Some(_)`, the route is [`RouteKind::SshTunnel`].
-/// - If `pod_ssh_info` returns `None`, route is [`RouteKind::CloudflareProxy`]
-///   (Crux 2 silent fallback).
-/// - If `pod_ssh_info` returns `Err`, route is [`RouteKind::CloudflareProxy`]
-///   and a warning is emitted (observable degradation, §1-2-6).
+/// - If the tunnel registry has an entry for the pod **and** the pod JSON
+///   contains a valid public IP + SSH port, the route is [`RouteKind::SshTunnel`].
+/// - Otherwise route is [`RouteKind::CloudflareProxy`] (Crux 2 silent fallback).
 ///
 /// Returns a markdown code-fence string ready to be appended to the pod list
 /// text. Returns an empty string on serialization failure.
@@ -214,7 +246,6 @@ pub(crate) fn build_endpoints(
 pub async fn format_pod_list_with_endpoints(
     pods: &[serde_json::Value],
     registry: &crate::application::tunnel_registry::TunnelRegistry,
-    cli: &crate::infra::runpod_cli::RunPodCli,
 ) -> String {
     if pods.is_empty() {
         return String::new();
@@ -223,26 +254,9 @@ pub async fn format_pod_list_with_endpoints(
     // Clone the registry snapshot before any .await (§4-1-1 K-4).
     let snapshots = registry.list().await;
 
-    // Resolve ssh_info for each pod sequentially. Lock is NOT held here.
-    let mut ssh_infos: Vec<Option<crate::infra::runpod_cli::PodSshInfo>> =
-        Vec::with_capacity(pods.len());
-    for pod in pods {
-        let pod_id = match pod["id"].as_str() {
-            Some(id) => id,
-            None => {
-                ssh_infos.push(None);
-                continue;
-            }
-        };
-        let info = match cli.pod_ssh_info(pod_id).await {
-            Ok(info) => info,
-            Err(e) => {
-                tracing::warn!("pod_ssh_info failed for {}: {}", pod_id, e);
-                None
-            }
-        };
-        ssh_infos.push(info);
-    }
+    // Extract ssh_info from the already-fetched pods array — no subprocess spawns.
+    let ssh_infos: Vec<Option<crate::infra::runpod_cli::PodSshInfo>> =
+        pods.iter().map(extract_ssh_info_from_pod_json).collect();
 
     let endpoints = build_endpoints(pods, &snapshots, &ssh_infos);
 
@@ -456,6 +470,63 @@ mod tests {
             started_at_ms: 0,
             child,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_ssh_info_from_pod_json unit tests
+    // -----------------------------------------------------------------------
+
+    /// (a) desiredStatus != "RUNNING" → None
+    #[test]
+    fn extract_ssh_info_not_running() {
+        let pod = json!({
+            "desiredStatus": "EXITED",
+            "publicIp": "1.2.3.4",
+            "portMappings": { "22": 37040 }
+        });
+        assert!(extract_ssh_info_from_pod_json(&pod).is_none());
+    }
+
+    /// (b) publicIp empty → None
+    #[test]
+    fn extract_ssh_info_no_public_ip() {
+        let pod = json!({
+            "desiredStatus": "RUNNING",
+            "publicIp": "",
+            "portMappings": { "22": 37040 }
+        });
+        assert!(extract_ssh_info_from_pod_json(&pod).is_none());
+    }
+
+    /// (c) portMappings["22"] == 0 / missing → None
+    #[test]
+    fn extract_ssh_info_missing_ssh_port() {
+        let pod_zero = json!({
+            "desiredStatus": "RUNNING",
+            "publicIp": "1.2.3.4",
+            "portMappings": { "22": 0 }
+        });
+        assert!(extract_ssh_info_from_pod_json(&pod_zero).is_none());
+
+        let pod_missing = json!({
+            "desiredStatus": "RUNNING",
+            "publicIp": "1.2.3.4",
+            "portMappings": {}
+        });
+        assert!(extract_ssh_info_from_pod_json(&pod_missing).is_none());
+    }
+
+    /// (d) full RUNNING pod → Some(PodSshInfo { host, port })
+    #[test]
+    fn extract_ssh_info_running_pod() {
+        let pod = json!({
+            "desiredStatus": "RUNNING",
+            "publicIp": "1.2.3.4",
+            "portMappings": { "22": 37040 }
+        });
+        let info = extract_ssh_info_from_pod_json(&pod).expect("should produce Some");
+        assert_eq!(info.host, "1.2.3.4");
+        assert_eq!(info.port, 37040u16);
     }
 
     /// AC test 1: registry has open entry + ssh_info=Some → route="ssh-tunnel" (Crux 3)

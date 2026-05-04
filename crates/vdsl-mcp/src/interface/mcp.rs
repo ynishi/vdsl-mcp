@@ -2136,13 +2136,10 @@ impl VdslMcpServer {
 
         let mut output = format_pod_list(&pods);
 
-        // Append endpoints section (Crux 3). Degrade silently on API key failure.
-        if let Ok(api_key) = resolve_api_key() {
-            let cli = RunPodCli::new(api_key);
-            let endpoints_section =
-                format_pod_list_with_endpoints(&pods, &self.tunnel_registry, &cli).await;
-            output.push_str(&endpoints_section);
-        }
+        // Append endpoints section (Crux 3). SSH info is extracted from the
+        // already-fetched pods array — no additional subprocess or network I/O.
+        let endpoints_section = format_pod_list_with_endpoints(&pods, &self.tunnel_registry).await;
+        output.push_str(&endpoints_section);
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
