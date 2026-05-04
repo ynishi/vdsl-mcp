@@ -24,7 +24,7 @@
 //!
 //! - `tunnel_open` → `TunnelRegistry::open`
 //! - `tunnel_close` → `TunnelRegistry::close`
-//! - `tunnel_list` → `TunnelRegistry::list` (snapshot read, no async needed)
+//! - `tunnel_list` → `TunnelRegistry::list` (async snapshot read)
 //!
 //! # Concurrency
 //!
@@ -237,8 +237,13 @@ impl TunnelRegistry {
     pub fn insert(&self, handle: TunnelHandle) -> Arc<Mutex<TunnelHandle>> {
         let pod_id = handle.pod_id.clone();
         let entry = Arc::new(Mutex::new(handle));
-        if let Ok(mut map) = self.inner.write() {
-            map.insert(pod_id, entry.clone());
+        match self.inner.write() {
+            Ok(mut map) => {
+                map.insert(pod_id, entry.clone());
+            }
+            Err(e) => {
+                tracing::warn!(pod_id = %pod_id, error = %e, "tunnel_registry: RwLock poisoned on insert, entry not stored");
+            }
         }
         entry
     }
@@ -279,23 +284,28 @@ impl TunnelRegistry {
     /// `TunnelSnapshot` は `Clone + Serialize` で、read lock 解放後に安全に使える値型。
     ///
     /// # Cancel Safety
-    /// Cancel-safe: this function is synchronous (no `.await`).
+    /// Cancel-safe: each `.lock().await` is a single yield point with no
+    /// in-flight state; dropping the future before completion is safe.
     ///
     /// # Panics
     /// Panics しない。
-    pub fn list(&self) -> Vec<TunnelSnapshot> {
+    pub async fn list(&self) -> Vec<TunnelSnapshot> {
         // Clone the Arcs under the read lock, then release the lock.
         // Inner Mutex locks happen outside the read lock scope.
         let entries: Vec<Arc<Mutex<TunnelHandle>>> = match self.inner.read() {
             Ok(map) => map.values().cloned().collect(),
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, "tunnel_registry: RwLock poisoned on list, returning empty");
+                return Vec::new();
+            }
         };
-        // We cannot use blocking lock here; collect what we can via try_lock.
-        // In practice callers are on a tokio runtime but list() is sync.
-        entries
-            .iter()
-            .filter_map(|e| e.try_lock().ok().map(|g| TunnelSnapshot::from_handle(&g)))
-            .collect()
+        // Use .lock().await so concurrent close() calls are not silently skipped.
+        let mut snapshots = Vec::with_capacity(entries.len());
+        for e in &entries {
+            let g = e.lock().await;
+            snapshots.push(TunnelSnapshot::from_handle(&g));
+        }
+        snapshots
     }
 
     /// Remove the tunnel entry for `pod_id` from the registry.
@@ -315,8 +325,13 @@ impl TunnelRegistry {
     ///
     /// None.
     pub fn remove(&self, pod_id: &str) {
-        if let Ok(mut map) = self.inner.write() {
-            map.remove(pod_id);
+        match self.inner.write() {
+            Ok(mut map) => {
+                map.remove(pod_id);
+            }
+            Err(e) => {
+                tracing::warn!(pod_id = %pod_id, error = %e, "tunnel_registry: RwLock poisoned on remove, entry may persist");
+            }
         }
     }
 
@@ -747,7 +762,7 @@ mod tests {
         reg.insert(make_dummy_handle("pod_1", 7101));
         reg.insert(make_dummy_handle("pod_2", 7102));
         reg.insert(make_dummy_handle("pod_3", 7103));
-        let list = reg.list();
+        let list = reg.list().await;
         assert_eq!(list.len(), 3);
         let mut ids: Vec<&str> = list.iter().map(|s| s.pod_id.as_str()).collect();
         ids.sort();
@@ -761,7 +776,7 @@ mod tests {
         assert!(reg.snapshot("pod_xyz").await.is_some());
         reg.remove("pod_xyz");
         assert!(reg.snapshot("pod_xyz").await.is_none());
-        assert!(reg.list().is_empty());
+        assert!(reg.list().await.is_empty());
     }
 
     #[tokio::test]
@@ -845,7 +860,7 @@ mod tests {
             }
         }
         // Registry must remain empty — no entry created for fallback.
-        assert!(reg.list().is_empty());
+        assert!(reg.list().await.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -954,7 +969,7 @@ mod tests {
         }
 
         assert!(
-            reg.list().is_empty(),
+            reg.list().await.is_empty(),
             "all entries must be removed after close"
         );
     }
@@ -982,7 +997,7 @@ mod tests {
                     // We use None here to test the early return from existing-check
                     // combined with the fallback path for a different pod.
                     // For idempotent path: insert first, then check list.
-                    reg.list()
+                    reg.list().await
                 })
             })
             .collect();
@@ -1017,7 +1032,7 @@ mod tests {
         let reader_handles: Vec<_> = (0..8u8)
             .map(|_| {
                 let reg = reg.clone();
-                tokio::spawn(async move { reg.list() })
+                tokio::spawn(async move { reg.list().await })
             })
             .collect();
 
@@ -1098,7 +1113,10 @@ mod tests {
 
         assert!(res1.is_ok(), "close 1 must be Ok: {res1:?}");
         assert!(res2.is_ok(), "close 2 must be Ok: {res2:?}");
-        assert!(reg.list().is_empty(), "entry must be gone after close");
+        assert!(
+            reg.list().await.is_empty(),
+            "entry must be gone after close"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1264,9 +1282,8 @@ mod tests {
         // Either it completed (Ok(Fallback)) or was cancelled (Err(Elapsed)).
         // In either case, the registry must be empty.
         assert!(
-            reg.list().is_empty(),
-            "registry must be empty after cancel or fallback: {:?}",
-            reg.list()
+            reg.list().await.is_empty(),
+            "registry must be empty after cancel or fallback"
         );
 
         match result {

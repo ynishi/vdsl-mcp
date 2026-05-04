@@ -124,8 +124,7 @@ fn init_tracing(default_level: &str) -> tracing_appender::non_blocking::WorkerGu
                 }
             } else {
                 let _ = dir_writable(&last_resort);
-                fallback_reason =
-                    Some((primary.clone(), last_resort.clone(), e1.to_string()));
+                fallback_reason = Some((primary.clone(), last_resort.clone(), e1.to_string()));
                 last_resort.clone()
             }
         }
