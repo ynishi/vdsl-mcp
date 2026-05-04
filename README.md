@@ -34,13 +34,17 @@ RunPod GPU provisioning, ComfyUI orchestration, and model management — all acc
 | `vdsl_node_search` | Search installed ComfyUI custom nodes |
 | `vdsl_catalogs` | Browse VDSL catalog entries (camera, lighting, figure, quality, etc.) |
 | **RunPod Infrastructure** | |
-| `vdsl_pod_list` | List all pods with GPU name and cost |
+| `vdsl_pod_list` | List all pods with GPU name, cost, and `endpoints[]` (route: `ssh-tunnel` / `cloudflare-proxy` / `direct`) |
 | `vdsl_pod_start` | Start a pod |
 | `vdsl_pod_stop` | Stop a pod |
 | `vdsl_pod_create` | Create a new pod |
 | `vdsl_pod_delete` | Delete a pod |
 | `vdsl_pod_setup` | Find or create a pod, wait until ready, connect |
 | `vdsl_volume_list` | List network volumes |
+| **SSH Tunnel** | |
+| `vdsl_tunnel_open` | Open an SSH local-port-forward tunnel to a pod service; falls back silently to Cloudflare proxy when SSH info is unavailable |
+| `vdsl_tunnel_close` | Close the SSH tunnel for a pod (idempotent) |
+| `vdsl_tunnel_list` | List all active tunnels in the in-memory registry (JSON snapshot) |
 | **Remote Operations (SSH)** | |
 | `vdsl_exec` | Execute a shell command on a pod |
 | `vdsl_task_run` | Start a background job on a pod |
@@ -167,6 +171,17 @@ When `script_file` is used, `working_dir` is auto-detected by walking up from th
 3. `vdsl_exec(command="nvidia-smi")` — Run commands on the pod via SSH
 4. `vdsl_task_run(command="...")` — Start long-running background jobs
 5. `vdsl_download(source="hf:...", target="loras")` — Download models to the pod
+
+### SSH Tunnel (bypass Cloudflare proxy)
+
+Open a stable local-port-forward tunnel to a pod to avoid Cloudflare proxy instability:
+
+1. `vdsl_tunnel_open(pod_id="...", service="comfyui", remote_port=8188)` — Open tunnel; returns local port (e.g. `7100`) or falls back silently to the Cloudflare proxy URL if SSH info is unavailable
+2. `vdsl_tunnel_list` — Inspect active tunnels (`route: ssh-tunnel | cloudflare-proxy`)
+3. `vdsl_connect(url="http://127.0.0.1:7100")` — Connect via the tunnel
+4. `vdsl_tunnel_close(pod_id="...")` — Close the tunnel when done
+
+`vdsl_pod_list` reflects the active route for each endpoint in its `endpoints[]` field so you can verify routing at a glance.
 
 ### Cold Storage (B2)
 

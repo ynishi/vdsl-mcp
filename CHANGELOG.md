@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **`vdsl_tunnel_open`** — Open an SSH `-N -L` tunnel to a RunPod pod service; returns active local port on success, or silently falls back to the Cloudflare proxy URL when SSH info is unavailable (`idempotent_hint=true`: same pod re-uses the existing tunnel)
+- **`vdsl_tunnel_close`** — Close the SSH tunnel for a pod; idempotent (no-op if not open); kills the child `ssh` process via `kill_on_drop`
+- **`vdsl_tunnel_list`** — List all active tunnels in the in-memory registry as a JSON snapshot (read-only)
+- **`domain::pod::RouteKind`** — `SshTunnel | CloudflareProxy | Direct` enum with `#[serde(rename_all = "kebab-case")]` for consistent JSON serialisation across `vdsl_tunnel_list` and `vdsl_pod_list` endpoints
+- **`domain::pod::PodEndpoint`** — Structured endpoint type (`service`, `url`, `route: RouteKind`, `local_port`) used in `vdsl_pod_list` output
+- **`application::tunnel_registry::TunnelRegistry`** — In-memory `Arc<RwLock<HashMap<String, Arc<Mutex<TunnelHandle>>>>>` registry tracking active SSH tunnels for the MCP session lifetime
+- **`application::tunnel_registry::TunnelHandle`** — Holds a `tokio::process::Child` with `kill_on_drop(true)` set at spawn time; exposes a snapshot for listing
+- **`domain::error::DomainError::SshTunnel`** — New error variant for SSH spawn failures, missing key, and early-exit detection
+- **`format_pod_list_with_endpoints`** — New `domain::pod` function that extends pod list output with an `endpoints[]` JSON array; existing `format_pod_list` signature is unchanged (backward-compatible)
 - **`vdsl_model_search` — scope parameter** — `scope=remote|archive|pod` selects search target: CivitAI (default), B2 archive bucket, or connected pod
 - **`vdsl_model_search` — type filter** — `model_type` now accepts 8 values: `checkpoint / lora / controlnet / vae / upscale / embedding / clip / unet`
 - **`vdsl_model_search` — base filter** — `base` parameter accepts `sd15 / sdxl / pony / illustrious / noobai / flux / unknown`
@@ -20,11 +29,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **`vdsl_pod_list` output** — Now appends an `endpoints[]` array to each pod entry; each element carries `service`, `url`, `route` (`ssh-tunnel` / `cloudflare-proxy` / `direct`), and `local_port`; route is derived from the live tunnel registry and `pod_ssh_info` result (not a static default)
 - **`domain::models::ModelType`** — moved from `interface::mcp` to `domain::models`, extended from 6 to 8 values (added `Clip` and `Unet`); `to_civitai_type()` now returns `Option<&'static str>` (None for Clip/Unet)
 - **`ModelType::as_dir_key()`** — replaces `MODEL_DIRS` const as single source of truth for ComfyUI directory key mapping
 
 ### Performance
 
+- **`format_pod_list_with_endpoints`** — Eliminated N+1 subprocess round-trips by batching `pod_ssh_info` lookups
 - **`search_archive` sidecar lookup** — O(N²) scan replaced with O(N) `HashSet` pre-index
 
 ## [0.4.0] - 2026-04-12
