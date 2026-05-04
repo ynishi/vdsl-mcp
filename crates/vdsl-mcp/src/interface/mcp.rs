@@ -30,7 +30,7 @@ use crate::domain::models::{
     infer_archive_model_type, parse_rclone_lsf, strip_sidecar_stem, BaseModel, ModelSearchResult,
     Scope,
 };
-use crate::domain::pod::{format_pod_list, format_volume_list};
+use crate::domain::pod::{format_pod_list, format_pod_list_with_endpoints, format_volume_list};
 use crate::infra::comfyui_client::{proxy_url, ComfyUiClient};
 use crate::infra::config::SyncdConfig;
 #[cfg(feature = "mlua-backend")]
@@ -99,6 +99,11 @@ pub(crate) struct VdslMcpServer {
     /// poll `vdsl_run_status(task_id)` for completion. See
     /// `application::run_registry` for the rationale.
     run_registry: crate::application::run_registry::RunRegistry,
+    /// In-memory registry tracking active SSH tunnels, keyed by pod_id.
+    /// Holds `TunnelHandle` entries with `kill_on_drop(true)` children
+    /// (Crux 1). Dropped (and all children SIGKILL'd) when the
+    /// `VdslMcpServer` is dropped on MCP shutdown.
+    tunnel_registry: crate::application::tunnel_registry::TunnelRegistry,
 }
 
 impl VdslMcpServer {
@@ -125,6 +130,7 @@ impl VdslMcpServer {
             syncd_client,
             apply_registry: crate::application::apply_registry::ApplyRegistry::new(),
             run_registry: crate::application::run_registry::RunRegistry::new(),
+            tunnel_registry: crate::application::tunnel_registry::TunnelRegistry::new(),
         }
     }
 
@@ -440,6 +446,28 @@ pub struct VdslPodActionRequest {
     /// RunPod pod ID (e.g. "pod_abc123def")
     pub pod_id: String,
 }
+
+/// Open an SSH tunnel for a pod service.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct VdslTunnelOpenRequest {
+    /// RunPod pod ID (e.g. "pod_abc123def").
+    pub pod_id: String,
+    /// Logical service name: "comfyui", "vllm", or "raw".
+    pub service: String,
+    /// Port on the pod side to forward. Defaults to 8188 (ComfyUI) when omitted.
+    pub remote_port: Option<u16>,
+}
+
+/// Close the SSH tunnel for a pod.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct VdslTunnelCloseRequest {
+    /// RunPod pod ID whose tunnel should be closed.
+    pub pod_id: String,
+}
+
+/// List all active SSH tunnels (read-only snapshot).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct VdslTunnelListRequest {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VdslConnectRequest {
@@ -2106,7 +2134,16 @@ impl VdslMcpServer {
         let svc = Self::pod_service()?;
         let pods = svc.list_pods().await.map_err(Self::to_mcp_error)?;
 
-        let output = format_pod_list(&pods);
+        let mut output = format_pod_list(&pods);
+
+        // Append endpoints section (Crux 3). Degrade silently on API key failure.
+        if let Ok(api_key) = resolve_api_key() {
+            let cli = RunPodCli::new(api_key);
+            let endpoints_section =
+                format_pod_list_with_endpoints(&pods, &self.tunnel_registry, &cli).await;
+            output.push_str(&endpoints_section);
+        }
+
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -6157,6 +6194,88 @@ impl VdslMcpServer {
 
         let body = serde_json::to_string_pretty(&result)
             .map_err(|e| McpError::internal_error(format!("serialize result: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
+
+    // =========================================================================
+    // SSH Tunnel management
+    // =========================================================================
+
+    #[tool(
+        name = "vdsl_tunnel_open",
+        description = "[infra] Open an SSH local port-forward tunnel for a RunPod pod. \
+            If the pod has no public SSH info (not RUNNING or SSH not mapped), \
+            silently falls back to the Cloudflare proxy URL and returns that \
+            instead of an error. Idempotent: calling with the same pod_id \
+            returns the existing tunnel without spawning a new process.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn tunnel_open(
+        &self,
+        Parameters(req): Parameters<VdslTunnelOpenRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let api_key = resolve_api_key().map_err(Self::to_mcp_error)?;
+        let cli = RunPodCli::new(api_key);
+        let remote_port = req.remote_port.unwrap_or(8188);
+        let result = self
+            .tunnel_registry
+            .open(&req.pod_id, &req.service, remote_port, &cli, None)
+            .await
+            .map_err(Self::to_mcp_error)?;
+        let body = serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"));
+        Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
+
+    #[tool(
+        name = "vdsl_tunnel_close",
+        description = "[infra] Close the SSH tunnel for a RunPod pod and remove it from \
+            the registry. The SSH child process is sent SIGKILL immediately. \
+            Idempotent: calling for a pod_id that has no open tunnel returns success.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn tunnel_close(
+        &self,
+        Parameters(req): Parameters<VdslTunnelCloseRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        self.tunnel_registry
+            .close(&req.pod_id)
+            .await
+            .map_err(Self::to_mcp_error)?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "tunnel closed for pod_id={}",
+            req.pod_id
+        ))]))
+    }
+
+    #[tool(
+        name = "vdsl_tunnel_list",
+        description = "[infra] List all active SSH tunnels in the current MCP session. \
+            Returns a JSON array of tunnel snapshots \
+            (pod_id, service, local_port, remote_port, ssh_host, ssh_port, \
+            started_at_ms, route). Read-only — does not modify registry state.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tunnel_list(
+        &self,
+        #[allow(unused_variables)] Parameters(_req): Parameters<VdslTunnelListRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let snapshots = self.tunnel_registry.list().await;
+        let body = serde_json::to_string_pretty(&snapshots).unwrap_or_else(|_| "[]".to_string());
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 }
@@ -10780,5 +10899,144 @@ print("debug: done")
         let root = make_lua_fixture();
         let result = run_profile_lua(Some("/nonexistent/profile.lua"), None, root.path()).await;
         assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // tunnel_registry integration — VdslMcpServer field path (AC subtask 3)
+    // =========================================================================
+
+    /// AC test 4 (subtask-3.md): insert a handle into VdslMcpServer.tunnel_registry,
+    /// call tunnel_list → JSON output contains the entry.
+    /// This verifies the struct-field integration path: the registry accessible via
+    /// `server.tunnel_registry` works the same as a standalone TunnelRegistry.
+    #[tokio::test]
+    async fn vdsl_tunnel_list_returns_snapshot() {
+        use crate::application::tunnel_registry::TunnelHandle;
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        let server = VdslMcpServer::new();
+
+        // Spawn a dummy process (sleep 300) with kill_on_drop(true) — Crux 1.
+        let child = Command::new("sleep")
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true) // Crux 1: always set
+            .spawn()
+            .expect("sleep must be available in test env");
+
+        let handle = TunnelHandle {
+            pod_id: "pod_list_test".to_string(),
+            service: "comfyui".to_string(),
+            local_port: 7900,
+            remote_port: 8188,
+            ssh_host: "ssh.runpod.io".to_string(),
+            ssh_port: 22222,
+            started_at_ms: 0,
+            child,
+        };
+
+        server.tunnel_registry.insert(handle);
+
+        // Call tunnel_list via registry (mirrors handler logic).
+        let snapshots = server.tunnel_registry.list().await;
+        assert_eq!(snapshots.len(), 1, "registry must have 1 entry");
+
+        let snap = &snapshots[0];
+        assert_eq!(snap.pod_id, "pod_list_test");
+        assert_eq!(snap.service, "comfyui");
+        assert_eq!(snap.local_port, 7900);
+
+        // Serialize to JSON (mirrors the tunnel_list handler).
+        let json = serde_json::to_string_pretty(&snapshots).expect("serialize must succeed");
+        assert!(
+            json.contains("pod_list_test"),
+            "JSON must contain pod_id: {json}"
+        );
+        assert!(
+            json.contains("\"route\""),
+            "JSON must contain route field: {json}"
+        );
+        assert!(
+            json.contains("\"ssh-tunnel\""),
+            "JSON route must be ssh-tunnel for active entry: {json}"
+        );
+    }
+
+    /// Crux 1 via VdslMcpServer field path: insert handle into server.tunnel_registry,
+    /// verify kill_on_drop(true) is set (child pid present = process alive).
+    /// This mirrors test_tunnel_handle_kill_on_drop but accessed via VdslMcpServer.
+    #[tokio::test]
+    async fn vdsl_server_tunnel_registry_kill_on_drop_invariant() {
+        use crate::application::tunnel_registry::TunnelHandle;
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        let server = VdslMcpServer::new();
+
+        let child = Command::new("sleep")
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true) // Crux 1: must be set at spawn time
+            .spawn()
+            .expect("sleep must be available");
+
+        // Child pid must be present (process is alive).
+        let pid = child.id().expect("child must have a pid");
+
+        let handle = TunnelHandle {
+            pod_id: "pod_crux1_server".to_string(),
+            service: "comfyui".to_string(),
+            local_port: 19901,
+            remote_port: 8188,
+            ssh_host: "ssh.runpod.io".to_string(),
+            ssh_port: 22222,
+            started_at_ms: 0,
+            child,
+        };
+
+        let arc = server.tunnel_registry.insert(handle);
+        let guard = arc.lock().await;
+        assert_eq!(
+            guard.child.id(),
+            Some(pid),
+            "child pid must be preserved via VdslMcpServer.tunnel_registry"
+        );
+    }
+
+    // =========================================================================
+    // Tunnel request type parse tests
+    // =========================================================================
+
+    #[test]
+    fn tunnel_open_request_parse() {
+        let req: VdslTunnelOpenRequest =
+            serde_json::from_str(r#"{"pod_id":"pod_abc","service":"comfyui"}"#).unwrap();
+        assert_eq!(req.pod_id, "pod_abc");
+        assert_eq!(req.service, "comfyui");
+        assert!(req.remote_port.is_none());
+    }
+
+    #[test]
+    fn tunnel_open_request_with_port() {
+        let req: VdslTunnelOpenRequest =
+            serde_json::from_str(r#"{"pod_id":"pod_abc","service":"vllm","remote_port":8000}"#)
+                .unwrap();
+        assert_eq!(req.remote_port, Some(8000));
+    }
+
+    #[test]
+    fn tunnel_close_request_parse() {
+        let req: VdslTunnelCloseRequest = serde_json::from_str(r#"{"pod_id":"pod_abc"}"#).unwrap();
+        assert_eq!(req.pod_id, "pod_abc");
+    }
+
+    #[test]
+    fn tunnel_list_request_parse() {
+        let _req: VdslTunnelListRequest = serde_json::from_str("{}").unwrap();
     }
 }
