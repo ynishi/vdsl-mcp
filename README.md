@@ -10,6 +10,7 @@ RunPod GPU provisioning, ComfyUI orchestration, and model management — all acc
 - **ComfyUI Integration** — Connect, query models, submit workflows, poll results, download images.
 - **Model Download** — HuggingFace (`hf:`), CivitAI (`cv:`) with automatic token injection, or direct URLs.
 - **B2 Cold Storage** — List, pull, and push models between pods and Backblaze B2 via rclone.
+- **Project Sync** — `$VDSL_WORK_DIR/projects/<name>/` (notes, refs, sweeps, final, etc.) is synced to B2 at `vdsl/projects/` independently from the output location; no pod connection required.
 - **Image Batch Download** — Download all output images from ComfyUI history to a local directory.
 - **Batch Generation** — Submit multiple workflows, poll all jobs, download all outputs.
 - **VDSL Script Execution** — Run Lua scripts that compile into ComfyUI workflows.

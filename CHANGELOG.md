@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **`vdsl_sync` projects location** — `vdsl_sync` now syncs `$VDSL_WORK_DIR/projects/<name>/{notes,refs,sweeps,final,...}` to B2 at prefix `vdsl/projects/`; soft-deletes route to `vdsl/projects-archived/`; no pod connection involved (cloud-only path, independent from the output location)
+- **`LocalLocation::new_with_id`** (`vdsl-sync`) — secondary constructor accepting an explicit `LocationId`; existing `LocalLocation::new()` is unchanged and delegates internally (additive, SemVer-minor)
 - **`vdsl_tunnel_open`** — Open an SSH `-N -L` tunnel to a RunPod pod service; returns active local port on success, or silently falls back to the Cloudflare proxy URL when SSH info is unavailable (`idempotent_hint=true`: same pod re-uses the existing tunnel)
 - **`vdsl_tunnel_close`** — Close the SSH tunnel for a pod; idempotent (no-op if not open); kills the child `ssh` process via `kill_on_drop`
 - **`vdsl_tunnel_list`** — List all active tunnels in the in-memory registry as a JSON snapshot (read-only)
