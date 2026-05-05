@@ -109,12 +109,40 @@ pub struct LocalLocation {
 }
 
 impl LocalLocation {
+    /// Create a `LocalLocation` with the canonical `"local"` [`LocationId`].
+    ///
+    /// # Arguments
+    ///
+    /// * `root` - Local filesystem path used as `file_root` for scan and route resolution.
+    /// * `hasher` - Shared content hasher for change detection.
+    ///
+    /// # Returns
+    ///
+    /// A `LocalLocation` identified as `"local"`.
+    ///
+    /// For multiple `LocalLocation`s with distinct IDs, use [`Self::new_with_id`].
     pub fn new(root: PathBuf, hasher: Arc<dyn ContentHasher>) -> Self {
-        Self {
-            id: LocationId::local(),
-            root,
-            hasher,
-        }
+        Self::new_with_id(LocationId::local(), root, hasher)
+    }
+
+    /// Create a `LocalLocation` with an arbitrary [`LocationId`].
+    ///
+    /// Useful when registering multiple local roots as separate locations
+    /// (e.g. `output` vs `projects`). The caller is responsible for ensuring
+    /// the `LocationId` is unique within a single [`crate::application::sdk_impl::SdkImplBuilder`].
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Location identifier. Must be unique among all locations registered
+    ///   with the same builder. Constructed via [`LocationId::new`].
+    /// * `root` - Local filesystem path used as `file_root` for scan and route resolution.
+    /// * `hasher` - Shared content hasher for change detection.
+    ///
+    /// # Returns
+    ///
+    /// A `LocalLocation` with the provided `id` and `root`.
+    pub fn new_with_id(id: LocationId, root: PathBuf, hasher: Arc<dyn ContentHasher>) -> Self {
+        Self { id, root, hasher }
     }
 }
 
@@ -266,5 +294,57 @@ impl Location for CloudLocation {
         self.backend.ensure().await.map_err(|e| {
             InfraError::Init(format!("cloud location '{}' ensure failed: {e}", self.id))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::domain::location::LocationId;
+    use crate::infra::hasher::Djb2Hasher;
+
+    fn make_hasher() -> Arc<dyn ContentHasher> {
+        Arc::new(Djb2Hasher)
+    }
+
+    // T1: happy path — new_with_id stores the provided LocationId
+    #[test]
+    fn new_with_id_stores_custom_id() {
+        let root = PathBuf::from("/tmp/projects");
+        // SAFETY: "projects" is valid (lowercase alphanum), unwrap cannot panic
+        let id = LocationId::new("projects").unwrap();
+        let loc = LocalLocation::new_with_id(id, root, make_hasher());
+        assert_eq!(loc.id().as_str(), "projects");
+    }
+
+    // T1: happy path — new_with_id produces LocationKind::Local and correct file_root
+    #[test]
+    fn new_with_id_kind_and_file_root() {
+        let root = PathBuf::from("/tmp/projects");
+        // SAFETY: "my-loc" is valid (lowercase alphanum + hyphen), unwrap cannot panic
+        let id = LocationId::new("my-loc").unwrap();
+        let loc = LocalLocation::new_with_id(id, root.clone(), make_hasher());
+        assert_eq!(loc.kind(), LocationKind::Local);
+        assert_eq!(loc.file_root(), root.as_path());
+    }
+
+    // T2: boundary — existing new() still produces "local" id (delegation compatibility)
+    #[test]
+    fn new_delegates_to_local_id() {
+        let root = PathBuf::from("/tmp/output");
+        let loc = LocalLocation::new(root, make_hasher());
+        assert_eq!(loc.id().as_str(), "local");
+        assert_eq!(loc.kind(), LocationKind::Local);
+    }
+
+    // T3: error path — LocationId::new rejects invalid input (uppercase, space)
+    #[test]
+    fn location_id_rejects_invalid_chars() {
+        assert!(LocationId::new("Invalid").is_err());
+        assert!(LocationId::new("has space").is_err());
+        assert!(LocationId::new("").is_err());
     }
 }
