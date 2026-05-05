@@ -6841,6 +6841,23 @@ pub(crate) async fn build_sdk(
     let local_root = work_dir.join("output");
     let hasher: std::sync::Arc<dyn vdsl_sync::ContentHasher> =
         std::sync::Arc::new(vdsl_sync::Djb2Hasher);
+    let projects_local_root = work_dir.join("projects");
+    let projects_id =
+        vdsl_sync::LocationId::new("projects").context("invalid LocationId 'projects'")?;
+    let cloud_projects_id = vdsl_sync::LocationId::new("cloud-projects")
+        .context("invalid LocationId 'cloud-projects'")?;
+    let projects_loc: std::sync::Arc<dyn vdsl_sync::Location> =
+        std::sync::Arc::new(vdsl_sync::LocalLocation::new_with_id(
+            projects_id.clone(),
+            projects_local_root,
+            hasher.clone(),
+        ));
+    let cloud_projects_loc: std::sync::Arc<dyn vdsl_sync::Location> =
+        std::sync::Arc::new(vdsl_sync::CloudLocation::new(
+            cloud_projects_id.clone(),
+            std::path::PathBuf::from("vdsl/projects"),
+            std::sync::Arc::new(RcloneBackend::new(&rclone_remote)),
+        ));
     let local_loc: std::sync::Arc<dyn vdsl_sync::Location> =
         std::sync::Arc::new(vdsl_sync::LocalLocation::new(local_root, hasher));
 
@@ -6860,6 +6877,8 @@ pub(crate) async fn build_sdk(
     )
     .location(local_loc)
     .location(cloud_loc)
+    .location(projects_loc)
+    .location(cloud_projects_loc)
     .exclude(".git")
     .exclude(".git/**")
     .exclude(".vdsl")
@@ -6870,7 +6889,11 @@ pub(crate) async fn build_sdk(
     // Archive-on-delete: cloud (B2) は hard delete ではなく
     // vdsl/archived/{ISO8601_ts}/{relative_path} へ moveto する。
     // local/pod への Delete は通常通り hard delete。
-    .archive_route_to(&cloud_id, std::path::PathBuf::from("vdsl/archived"));
+    .archive_route_to(&cloud_id, std::path::PathBuf::from("vdsl/archived"))
+    .archive_route_to(
+        &cloud_projects_id,
+        std::path::PathBuf::from("vdsl/projects-archived"),
+    );
 
     // =========================================================================
     // Route 接続 — Local ↔ Cloud（常時）
@@ -6889,6 +6912,18 @@ pub(crate) async fn build_sdk(
         Box::new(RcloneBackend::new(&rclone_remote)),
     );
 
+    builder = builder.connect(
+        &projects_id,
+        &cloud_projects_id,
+        Box::new(RcloneBackend::new(&rclone_remote)),
+    );
+
+    builder = builder.connect_pull(
+        &cloud_projects_id,
+        &projects_id,
+        Box::new(RcloneBackend::new(&rclone_remote)),
+    );
+
     // =========================================================================
     // Route 接続 — Pod ↔ Cloud / Local → Pod（Pod利用時）
     // コストは LocationKind の組み合わせから自動推定:
@@ -6896,7 +6931,7 @@ pub(crate) async fn build_sdk(
     // → optimal_tree が自動的に Local→Pod→Cloud チェーンを選択する。
     // =========================================================================
 
-    let mut route_desc = "local↔cloud";
+    let mut route_desc = "local↔cloud+projects↔cloud-projects";
 
     if let (Some(pid), Some(ref ak)) = (pod_id, &api_key) {
         if let Ok(pod_loc_id) = vdsl_sync::LocationId::new(format!("pod-{pid}")) {
