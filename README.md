@@ -26,7 +26,8 @@ RunPod GPU provisioning, ComfyUI orchestration, and model management — all acc
 | **Generation** | |
 | `vdsl_generate` | Queue a workflow JSON and wait for completion |
 | `vdsl_batch_generate` | Submit multiple workflows, poll all, download outputs |
-| `vdsl_run` | Compile Lua script → ComfyUI workflow → generate (supports pipelines, judge gates) |
+| `vdsl_run` | Compile Lua script → ComfyUI workflow → generate (supports pipelines, judge gates); runs in background by default |
+| `vdsl_run_status` | Poll the status of a background `vdsl_run` job |
 | `vdsl_run_script` | Run a Lua script (no generation — script-only execution) |
 | `vdsl_interrupt` | Cancel running or pending ComfyUI jobs |
 | **Models & Catalogs** | |
@@ -34,6 +35,12 @@ RunPod GPU provisioning, ComfyUI orchestration, and model management — all acc
 | `vdsl_model_search` | Search models by scope (`remote`=CivitAI, `archive`=B2 bucket, `pod`=connected pod), type, and base; returns structured JSON with obtain hint |
 | `vdsl_node_search` | Search installed ComfyUI custom nodes |
 | `vdsl_catalogs` | Browse VDSL catalog entries (camera, lighting, figure, quality, etc.) |
+| **Profile & Project** | |
+| `vdsl_profile_apply` | Apply a ProfileManifest (YAML/Lua) to configure a pod environment; supports streaming progress and inline Profile.lua |
+| `vdsl_profile_apply_status` | Poll the status of an async `vdsl_profile_apply` job |
+| `vdsl_project_init` | Scaffold a new VDSL project directory under `$VDSL_WORK_DIR/projects/` from a template |
+| **Batch Orchestration** | |
+| `vdsl_batch_tools` | Submit and manage multi-job batch orchestration via BatchService |
 | **RunPod Infrastructure** | |
 | `vdsl_pod_list` | List all pods with GPU name, cost, and `endpoints[]` (route: `ssh-tunnel` / `cloudflare-proxy` / `direct`) |
 | `vdsl_pod_start` | Start a pod |
@@ -62,6 +69,18 @@ RunPod GPU provisioning, ComfyUI orchestration, and model management — all acc
 | `vdsl_storage_pull` | Pull models from B2 to pod |
 | `vdsl_storage_push` | Push models from pod to B2 |
 | `vdsl_storage_archive` | Archive: push → verify → delete from pod |
+| **File Sync (vdsl-sync)** | |
+| `vdsl_sync` | Sync `$VDSL_WORK_DIR/projects/<name>/` to B2 at `vdsl/projects/` (cloud-only; no pod connection required) |
+| `vdsl_sync_route` | Configure or display sync route (source ↔ destination URL-scheme) |
+| `vdsl_sync_status` | Get current sync status for a location or route |
+| `vdsl_sync_list` | List all tracked sync locations and routes |
+| `vdsl_sync_get` | Get details for a specific tracked file or sync record |
+| `vdsl_sync_delete` | Delete (soft-delete) a tracked file from a location |
+| `vdsl_sync_restore` | Restore a soft-deleted file from archive |
+| `vdsl_sync_errors` | List sync errors for a location or route |
+| `vdsl_sync_poll` | Poll for pending sync operations and flush queue |
+| `vdsl_sync_cancel` | Cancel an in-progress or queued sync operation |
+| `vdsl_sync_logs` | View sync operation logs |
 | **Low-Level** | |
 | `vdsl_queue_status` | Query ComfyUI queue and history |
 | `vdsl_comfy_api` | Generic ComfyUI REST API call |
