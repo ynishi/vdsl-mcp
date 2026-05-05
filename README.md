@@ -39,6 +39,7 @@ RunPod GPU provisioning, ComfyUI orchestration, and model management — all acc
 | `vdsl_profile_apply` | Apply a ProfileManifest (YAML/Lua) to configure a pod environment; supports streaming progress and inline Profile.lua |
 | `vdsl_profile_apply_status` | Poll the status of an async `vdsl_profile_apply` job |
 | `vdsl_project_init` | Scaffold a new VDSL project directory under `$VDSL_WORK_DIR/projects/` from a template |
+| `vdsl_profile_init` | Scaffold a new Profile Lua DSL file at `<root>/profiles/<name>.lua`; shares root resolution with `vdsl_project_init`; `overwrite=false` default refuses to replace existing files |
 | **Batch Orchestration** | |
 | `vdsl_batch_tools` | Submit and manage multi-job batch orchestration via BatchService |
 | **RunPod Infrastructure** | |
