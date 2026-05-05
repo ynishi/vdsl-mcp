@@ -2112,6 +2112,24 @@ pub struct VdslProjectInitRequest {
     pub overwrite: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct VdslProfileInitRequest {
+    /// Profile name slug (kebab/snake case, e.g. "gravure_2606", "bust_kawaii_run").
+    /// Must match `^[a-zA-Z0-9_\-]+$`.
+    pub name: String,
+
+    /// Profiles root directory. Defaults to `$VDSL_WORK_DIR/projects` or
+    /// `~/projects/vdsl-work/vdsl/projects`. The profile file is written to
+    /// `<root>/profiles/<name>.lua`.
+    #[serde(default)]
+    pub root: Option<String>,
+
+    /// Allow overwriting an existing `<root>/profiles/<name>.lua` file. Default: false.
+    /// When false (default), the tool refuses to overwrite and returns an error.
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
 // =============================================================================
 // Tool implementations
 // =============================================================================
@@ -6188,6 +6206,55 @@ impl VdslMcpServer {
                     McpError::internal_error("home directory not found", None)
                 }
             })?;
+
+        let body = serde_json::to_string_pretty(&result)
+            .map_err(|e| McpError::internal_error(format!("serialize result: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
+
+    // =========================================================================
+    // Profile scaffold
+    // =========================================================================
+
+    #[tool(
+        name = "vdsl_profile_init",
+        description = "[repo] Scaffold a new Profile Lua DSL file at `<root>/profiles/<name>.lua` \
+            with the standing-prohibitions header (SECRETS / NO DSL-BYPASS) pre-baked. \
+            Root is resolved from: 1) explicit 'root' param, \
+            2) $VDSL_WORK_DIR/projects/profiles, \
+            3) ~/projects/vdsl-work/vdsl/projects/profiles. \
+            Output path: `<root>/profiles/<name>.lua`. \
+            When overwrite=false (default), refuses to overwrite an existing file and returns an error. \
+            Returns profile_path (absolute path of created file) and file_created (true=new, false=overwritten).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn profile_init(
+        &self,
+        Parameters(req): Parameters<VdslProfileInitRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::domain::profile::{scaffold_profile, ProfileScaffoldError};
+        use crate::domain::project::{resolve_projects_root, ScaffoldError};
+
+        let root = resolve_projects_root(req.root.as_deref()).map_err(|e| match e {
+            ScaffoldError::NoHomeDir => McpError::internal_error("home directory not found", None),
+            other => McpError::internal_error(format!("{other}"), None),
+        })?;
+
+        let result = scaffold_profile(&req.name, &root, req.overwrite).map_err(|e| match e {
+            ProfileScaffoldError::InvalidName(_) | ProfileScaffoldError::AlreadyExists(_) => {
+                McpError::invalid_params(format!("{e}"), None)
+            }
+            ProfileScaffoldError::Io(io_err) => {
+                McpError::internal_error(format!("I/O error: {io_err}"), None)
+            }
+            ProfileScaffoldError::NoHomeDir => {
+                McpError::internal_error("home directory not found", None)
+            }
+        })?;
 
         let body = serde_json::to_string_pretty(&result)
             .map_err(|e| McpError::internal_error(format!("serialize result: {e}"), None))?;
