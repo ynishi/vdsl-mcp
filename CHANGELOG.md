@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-06
+
+### Highlights
+
+`vdsl_profile_init` Profile DSL scaffolding tool.
+
 ### Added
 
 - **`vdsl_profile_init`** — Scaffold a new Profile Lua DSL file at `<root>/profiles/<name>.lua` with the standing-prohibitions header (SECRETS / NO DSL-BYPASS) pre-baked. Root resolution shares `resolve_projects_root` with `vdsl_project_init` (3-tier fallback: explicit → `$VDSL_WORK_DIR/projects` → `~/projects/vdsl-work/vdsl/projects`). `overwrite=false` default refuses to replace existing files.
