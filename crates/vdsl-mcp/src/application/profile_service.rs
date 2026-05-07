@@ -1318,7 +1318,7 @@ fn build_model_step(
 }
 
 /// Build a Phase 7b llm_model step. Currently only `hf://<org>/<repo>`
-/// is supported — pulled with `huggingface-cli download` into
+/// is supported — pulled with `hf download` into
 /// `dst_dir`. HF_TOKEN is injected when the host env has it (required
 /// only for private repos; public pulls work anonymously).
 fn build_llm_model_step(
@@ -1343,11 +1343,18 @@ fn build_llm_model_step(
         .as_deref()
         .map(|r| format!(" --revision \"{r}\""))
         .unwrap_or_default();
+    // Use the new `hf` CLI (huggingface_hub >= 0.27). The old
+    // `huggingface-cli` binary is a deprecated shim that hard-fails with
+    // "Warning: `huggingface-cli` is deprecated and no longer works.
+    // Use `hf` instead." on recent runtimes (e.g. RunPod pytorch images
+    // shipping huggingface_hub 1.14+). Both binaries co-exist when
+    // huggingface_hub is installed; `hf` is the only one that actually
+    // performs the download.
     let script = format!(
         "set -e\n\
          mkdir -p \"{dst_dir}\"\n\
          python3 -c 'import huggingface_hub' 2>/dev/null || pip install -q huggingface_hub\n\
-         HF_TOKEN=\"${{HF_TOKEN:-}}\" huggingface-cli download \"{repo}\" --local-dir \"{dst_dir}\"{revision_arg}\n",
+         HF_TOKEN=\"${{HF_TOKEN:-}}\" hf download \"{repo}\" --local-dir \"{dst_dir}\"{revision_arg}\n",
         dst_dir = lm.dst_dir,
         repo = repo,
         revision_arg = revision_arg,
