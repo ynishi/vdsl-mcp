@@ -290,6 +290,65 @@ fn resolve_secrets_collects_all_missing() {
     }
 }
 
+#[test]
+fn resolve_secrets_picks_up_hf_token_for_llm_models_only_manifest() {
+    // Regression: `models[]` empty + `llm_models[]` with hf:// must still
+    // pull HF_TOKEN from host env. `merge_hf_env` emits `__secret:HF_TOKEN`
+    // for the llm_models path, so resolver omitting the union leaves the
+    // batch dispatch failing with "unresolved secret: HF_TOKEN" on gated
+    // repos (Gemma 4 / Llama / Mistral).
+    use crate::domain::profile::LlmModel;
+
+    let var = "HF_TOKEN";
+    // Save+restore so we don't wipe the developer's real HF_TOKEN after
+    // this #[test] fn returns (HF_TOKEN is a globally meaningful name,
+    // unlike the unique VDSL_MCP_TEST_* names elsewhere in this file).
+    let prev = std::env::var(var).ok();
+    // SAFETY: test-only; single-threaded within this #[test] fn.
+    unsafe {
+        std::env::set_var(var, "hf_test_token");
+    }
+
+    let manifest = ProfileManifest {
+        schema: PROFILE_SCHEMA.to_string(),
+        name: "llm-only".to_string(),
+        comfyui: Some(ComfyUiConfig {
+            ref_: "x".to_string(),
+            repo: None,
+            args: None,
+            port: None,
+        }),
+        system: None,
+        python: None,
+        custom_nodes: vec![],
+        sync: None,
+        staging: None,
+        models: vec![],
+        llm_models: vec![LlmModel {
+            src: "hf://google/gemma-3-4b-it".to_string(),
+            dst_dir: "/root/models/gemma".to_string(),
+            revision: None,
+        }],
+        services: vec![],
+        env: HashMap::new(),
+        hooks: None,
+    };
+
+    let resolved = resolve_secrets(&manifest).expect("resolve ok");
+    assert_eq!(
+        resolved.get("HF_TOKEN").map(|s| s.as_str()),
+        Some("hf_test_token"),
+        "HF_TOKEN must be picked up from env when llm_models[] uses hf://"
+    );
+
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+    }
+}
+
 // ----- expand_phases -----
 
 fn leaf_ids(plan: &BatchPlan) -> Vec<String> {

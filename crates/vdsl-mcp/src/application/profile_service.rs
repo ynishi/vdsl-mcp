@@ -364,7 +364,17 @@ pub fn resolve_secrets(
 
     // HF_TOKEN is optional: public repos work without it. We pick it up
     // if present so private repos work, but missing is not a hard error.
-    let needs_hf = manifest.models.iter().any(|m| m.src.starts_with("hf://"));
+    // Both `models[]` (ComfyUI) and `llm_models[]` (raw LLM weight staging
+    // for vLLM/Ollama) can use the hf:// scheme — `merge_hf_env` emits the
+    // `__secret:HF_TOKEN` placeholder for either path when host env has
+    // the token, so this resolver must mirror the same union or the
+    // batch dispatch fails with "unresolved secret: HF_TOKEN" on the
+    // llm_models-only path (Gemma 4, Llama, Mistral on gated repos).
+    let needs_hf = manifest.models.iter().any(|m| m.src.starts_with("hf://"))
+        || manifest
+            .llm_models
+            .iter()
+            .any(|m| m.src.starts_with("hf://"));
     if needs_hf {
         for name in HF_PULL_SECRET_NAMES {
             if resolved.contains_key(*name) {
