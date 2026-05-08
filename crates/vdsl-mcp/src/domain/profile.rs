@@ -255,6 +255,32 @@ pub enum ServicePlatform {
         #[serde(default)]
         models: Vec<String>,
     },
+    /// llama.cpp server (OpenAI-compatible).
+    /// `<binary> -m "<model>" --host 0.0.0.0 --port <port> [--alias "<alias>"] [extra_args...]`
+    ///
+    /// vLLM と異なり binary は実行ファイル絶対パスを直に指定する。Profile
+    /// 適用時に `system.apt` / `hooks.post_install` / pre-built binary
+    /// download 等で operator が事前配置する前提。`binary` 省略時は
+    /// `llama-server` (PATH 解決) を試行。
+    ///
+    /// `model` は `.gguf` 単体ファイルの絶対パス。`llm_models[]` で
+    /// `hf://<repo>` から download した dst_dir 配下を指す運用が default。
+    Llamacpp {
+        /// Path to a `.gguf` file (e.g. `/root/models/gemma-4-E4B-gguf/X.gguf`).
+        model: String,
+        port: u16,
+        /// llama-server binary path. None → assume `llama-server` in PATH.
+        #[serde(default)]
+        binary: Option<String>,
+        /// `--alias` value (model id reported on `/v1/models`). None → no flag.
+        #[serde(default)]
+        alias: Option<String>,
+        /// Free-form extra flags (single-token each, validated with
+        /// `is_shell_safe_with_spaces`). Typical entries: `-ngl 999`,
+        /// `--jinja`, `-c 32768`, `-np 1`.
+        #[serde(default)]
+        extra_args: Vec<String>,
+    },
 }
 
 /// HTTP readiness probe. `curl -sf <http>` is polled every second up

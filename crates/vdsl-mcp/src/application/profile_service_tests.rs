@@ -1233,6 +1233,70 @@ fn expand_phases_ollama_service_launch_command() {
 }
 
 #[test]
+fn expand_phases_llamacpp_service_launch_command() {
+    use crate::domain::profile::{HttpReadyCheck, ServiceConfig, ServicePlatform};
+    let mut m = full_manifest();
+    m.services.push(ServiceConfig {
+        name: "llamacpp".to_string(),
+        platform: ServicePlatform::Llamacpp {
+            model: "/root/models/gemma-4-E4B-gguf/gemma-4-E4B-it-Q4_K_M.gguf".to_string(),
+            port: 8188,
+            binary: Some("/root/llama.cpp/build/bin/llama-server".to_string()),
+            alias: Some("gemma".to_string()),
+            extra_args: vec![
+                "-ngl 999".to_string(),
+                "--jinja".to_string(),
+                "-c 32768".to_string(),
+                "-np 1".to_string(),
+            ],
+        },
+        ready_check: Some(HttpReadyCheck {
+            http: "http://localhost:8188/v1/models".to_string(),
+            timeout_sec: Some(120),
+        }),
+    });
+    let plan = expand_phases(&m, "abc", false).expect("ok");
+    let s = find_script(&plan, "11_service_0_start").expect("llamacpp start present");
+    assert!(s.contains(
+        "nohup /root/llama.cpp/build/bin/llama-server \
+         -m \"/root/models/gemma-4-E4B-gguf/gemma-4-E4B-it-Q4_K_M.gguf\" \
+         --host 0.0.0.0 --port 8188 --alias \"gemma\" -ngl 999 --jinja -c 32768 -np 1"
+    ));
+    // pid + log path uses service name.
+    assert!(s.contains("/workspace/.vdsl/service_llamacpp.log"));
+    assert!(s.contains("/workspace/.vdsl/service_llamacpp.pid"));
+
+    let r = find_script(&plan, "11_service_0_ready").expect("llamacpp ready present");
+    assert!(r.contains("until curl -sf http://localhost:8188/v1/models >/dev/null; do"));
+    assert!(r.contains("if [ $i -ge 120 ]; then"));
+}
+
+#[test]
+fn expand_phases_llamacpp_default_binary_in_path() {
+    use crate::domain::profile::{ServiceConfig, ServicePlatform};
+    let mut m = full_manifest();
+    m.services.push(ServiceConfig {
+        name: "llamacpp".to_string(),
+        platform: ServicePlatform::Llamacpp {
+            model: "/root/m.gguf".to_string(),
+            port: 8188,
+            binary: None,
+            alias: None,
+            extra_args: vec![],
+        },
+        ready_check: None,
+    });
+    let plan = expand_phases(&m, "abc", false).expect("ok");
+    let s = find_script(&plan, "11_service_0_start").expect("llamacpp start present");
+    assert!(
+        s.contains("nohup llama-server -m \"/root/m.gguf\" --host 0.0.0.0 --port 8188"),
+        "default binary should be `llama-server` (PATH); got: {s}"
+    );
+    // No --alias when alias=None.
+    assert!(!s.contains("--alias"));
+}
+
+#[test]
 fn expand_phases_rejects_duplicate_service_names() {
     use crate::domain::profile::{ServiceConfig, ServicePlatform};
     let mut m = full_manifest();

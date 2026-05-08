@@ -1410,6 +1410,36 @@ fn build_service_launch_cmd(platform: &ServicePlatform) -> Result<String, Profil
             // or a follow-up tool call after readiness).
             Ok(format!("OLLAMA_HOST=0.0.0.0:{port} ollama serve"))
         }
+        ServicePlatform::Llamacpp {
+            model,
+            port,
+            binary,
+            alias,
+            extra_args,
+        } => {
+            assert_shell_safe(model, "services[].llamacpp.model")?;
+            let bin = binary.as_deref().unwrap_or("llama-server");
+            assert_shell_safe(bin, "services[].llamacpp.binary")?;
+            if let Some(a) = alias {
+                assert_shell_safe(a, "services[].llamacpp.alias")?;
+            }
+            for a in extra_args {
+                if !is_shell_safe_with_spaces(a) {
+                    return Err(ProfileError::InvalidManifest(format!(
+                        "services[].llamacpp.extra_args contains unsafe token: {a:?}"
+                    )));
+                }
+            }
+            let mut cmd = format!("{bin} -m \"{model}\" --host 0.0.0.0 --port {port}");
+            if let Some(a) = alias {
+                cmd.push_str(&format!(" --alias \"{a}\""));
+            }
+            for a in extra_args {
+                cmd.push(' ');
+                cmd.push_str(a);
+            }
+            Ok(cmd)
+        }
     }
 }
 
