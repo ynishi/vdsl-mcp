@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- **`vdsl_generate` — `n` / `seed_sweep` multi-shot generation** — `n: Option<u32>` queues the same workflow N times; `seed_sweep: Option<Vec<i64>>` sweeps through an explicit seed list, overwriting all KSampler-class nodes' `inputs.seed` in the workflow JSON. Both parameters are mutually exclusive (specifying both yields `McpError::invalid_params`). Returns a flat `saved_paths` section in the response for easy extraction by caller SubAgents. Default behaviour (both omitted) is unchanged (single generation). Use `seed_sweep` for same-workflow seed variations; use `vdsl_batch_generate` for multiple distinct workflows.
+- **`vdsl_batch_generate` — `n` / `seed_sweep` per-workflow** — Same parameters applied as a cartesian product (`workflows × seed_sweep`). Each workflow in the batch is submitted for every seed in `seed_sweep` (or N times for `n`).
+- **`apply_seed_to_workflow` internal helper** — Writes a given seed value into all KSampler-class nodes' `inputs.seed` in a workflow JSON value. Returns `true` if at least one node was updated; emits a warning log line when no KSampler node is found.
+- **auto-mkdir in `download_images_to_dir` / `download_batch_images_labeled`** — `save_dir` is now created automatically via `tokio::fs::create_dir_all` inside both download helpers; callers no longer need a prior `mkdir` step. On permission failure the helper returns an empty `DownloadResult` with a `FAILED to create save_dir` log entry instead of panicking.
+
 ## [0.6.0] - 2026-05-06
 
 ### Highlights
