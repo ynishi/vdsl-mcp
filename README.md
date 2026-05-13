@@ -41,6 +41,7 @@ RunPod GPU provisioning, ComfyUI orchestration, and model management — all acc
 | `vdsl_profile_apply_status` | Poll the status of an async `vdsl_profile_apply` job |
 | `vdsl_project_init` | Scaffold a new VDSL project directory under `$VDSL_WORK_DIR/projects/` from a template |
 | `vdsl_profile_init` | Scaffold a new Profile Lua DSL file at `<root>/profiles/<name>.lua`; shares root resolution with `vdsl_project_init`; `overwrite=false` default refuses to replace existing files |
+| `vdsl_cam_lua_init` | Scaffold a persona-aware cam Lua script at `<root>/<persona_id>_cam_<topic>.lua`; resolves a persona-specific base snippet via 3-tier fallback; auto-creates the target directory; returns the absolute `script_file` path |
 | **Batch Orchestration** | |
 | `vdsl_batch_tools` | Submit and manage multi-job batch orchestration via BatchService |
 | **RunPod Infrastructure** | |
