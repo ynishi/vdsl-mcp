@@ -2155,6 +2155,63 @@ pub struct VdslProfileInitRequest {
     pub overwrite: bool,
 }
 
+/// A single shot specification for a cam Lua sequence.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct VdslCamShotSpec {
+    /// Shot name slug (filename-safe: `[a-zA-Z0-9_-]` only).
+    /// Example: `"persona_a-202506-V1-kitchen"`.
+    pub name: String,
+
+    /// RNG seed for this shot. Controls image reproducibility.
+    pub seed: i64,
+
+    /// Trait DSL expression appended to the base subject for this shot.
+    /// Example: `"C.figure.clothing.t_shirt"`. May be empty string.
+    pub trait_dsl: String,
+}
+
+impl From<VdslCamShotSpec> for crate::domain::cam::CamShotSpec {
+    fn from(s: VdslCamShotSpec) -> Self {
+        crate::domain::cam::CamShotSpec {
+            name: s.name,
+            seed: s.seed,
+            trait_dsl: s.trait_dsl,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct VdslCamLuaInitRequest {
+    /// Persona ID slug (e.g. `"persona_a"`, `"alice"`). Must match `^[a-zA-Z0-9_-]+$`.
+    /// Used to resolve the persona-specific base subject via cam-vdsl base files.
+    pub persona_id: String,
+
+    /// Scene description string (single line, no newlines).
+    /// Example: `"morning kitchen"`.
+    pub scene: String,
+
+    /// Shot specifications. If omitted, a single default shot is generated with
+    /// `name="<persona_id>-<YYYYMM>-V1-<topic>"`, `seed=1234`, and empty `trait_dsl`.
+    #[serde(default)]
+    pub shots: Option<Vec<VdslCamShotSpec>>,
+
+    /// Topic slug appended to the filename (`<persona_id>_cam_<topic>.lua`).
+    /// Must match `^[a-zA-Z0-9_-]+$`. Defaults to `snap_YYMMDD` when omitted.
+    #[serde(default)]
+    pub topic: Option<String>,
+
+    /// Projects root directory. Defaults to `$VDSL_WORK_DIR/projects` or
+    /// `~/projects/vdsl-work/vdsl/projects`. The script is written to
+    /// `<root>/<persona_id>_cam_<topic>.lua`.
+    #[serde(default)]
+    pub root: Option<String>,
+
+    /// Allow overwriting an existing script file. Default: false.
+    /// When false (default), the tool refuses to overwrite and returns an error.
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
 // =============================================================================
 // Tool implementations
 // =============================================================================
@@ -6396,6 +6453,88 @@ impl VdslMcpServer {
                 McpError::internal_error(format!("I/O error: {io_err}"), None)
             }
             ProfileScaffoldError::NoHomeDir => {
+                McpError::internal_error("home directory not found", None)
+            }
+        })?;
+
+        let body = serde_json::to_string_pretty(&result)
+            .map_err(|e| McpError::internal_error(format!("serialize result: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
+
+    // =========================================================================
+    // Cam Lua scaffold
+    // =========================================================================
+
+    #[tool(
+        name = "vdsl_cam_lua_init",
+        description = "[repo] Scaffold a new cam Lua script at `<root>/<persona_id>_cam_<topic>.lua`. \
+            Resolves the persona-specific base subject via a 3-stage fallback: \
+            1) `~/.claude/skills/cam-vdsl/bases/<persona_id>.lua`, \
+            2) `~/.claude/skills/snap-<persona_id>/<persona_id>_base.lua` (legacy), \
+            3) thin default base. \
+            Root is resolved from: 1) explicit 'root' param, \
+            2) $VDSL_WORK_DIR/projects, \
+            3) ~/projects/vdsl-work/vdsl/projects. \
+            Creates the directory if it does not exist (auto-mkdir). \
+            Returns script_file (absolute path), file_created, and base_source. \
+            When overwrite=false (default), refuses to overwrite an existing file and returns an error.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn cam_lua_init(
+        &self,
+        Parameters(req): Parameters<VdslCamLuaInitRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::domain::cam::{scaffold_cam_lua, CamLuaScaffoldError};
+        use crate::domain::project::{resolve_projects_root, ScaffoldError};
+
+        let root = resolve_projects_root(req.root.as_deref()).map_err(|e| match e {
+            ScaffoldError::NoHomeDir => {
+                tracing::warn!(
+                    error = "NoHomeDir",
+                    "cam_lua_init: home directory not found"
+                );
+                McpError::internal_error("home directory not found", None)
+            }
+            other => {
+                tracing::warn!(error = %other, "cam_lua_init: resolve_projects_root failed");
+                McpError::internal_error(format!("{other}"), None)
+            }
+        })?;
+
+        let shots_owned: Option<Vec<crate::domain::cam::CamShotSpec>> = req
+            .shots
+            .map(|v| v.into_iter().map(Into::into).collect::<Vec<_>>());
+
+        let result = scaffold_cam_lua(
+            &req.persona_id,
+            &req.scene,
+            shots_owned.as_deref(),
+            req.topic.as_deref(),
+            &root,
+            req.overwrite,
+        )
+        .map_err(|e| match e {
+            CamLuaScaffoldError::InvalidPersonaId(_)
+            | CamLuaScaffoldError::InvalidTopic(_)
+            | CamLuaScaffoldError::InvalidShotName(_)
+            | CamLuaScaffoldError::AlreadyExists(_) => {
+                tracing::warn!(error = %e, "cam_lua_init: invalid params");
+                McpError::invalid_params(format!("{e}"), None)
+            }
+            CamLuaScaffoldError::Io(ref io_err) => {
+                tracing::warn!(error = %io_err, "cam_lua_init: I/O error");
+                McpError::internal_error(format!("I/O error: {io_err}"), None)
+            }
+            CamLuaScaffoldError::NoHomeDir => {
+                tracing::warn!(
+                    error = "NoHomeDir",
+                    "cam_lua_init: home directory not found"
+                );
                 McpError::internal_error("home directory not found", None)
             }
         })?;
@@ -11455,5 +11594,60 @@ print("debug: done")
         );
         assert!(result.saved_paths.is_empty());
         assert!(result.labeled_paths.is_empty());
+    }
+
+    // --- vdsl_cam_lua_init handler tests ---
+
+    #[tokio::test]
+    async fn test_cam_lua_init_handler_happy_path() {
+        use rmcp::handler::server::wrapper::Parameters;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+
+        let server = VdslMcpServer::new();
+        let req = VdslCamLuaInitRequest {
+            persona_id: "persona_a".to_string(),
+            scene: "morning kitchen".to_string(),
+            shots: None,
+            topic: Some("kitchen_test".to_string()),
+            root: Some(root.clone()),
+            overwrite: false,
+        };
+
+        let result = server.cam_lua_init(Parameters(req)).await;
+        assert!(result.is_ok(), "cam_lua_init should succeed: {result:?}");
+
+        let tool_result = result.unwrap();
+        assert!(!tool_result.content.is_empty());
+
+        let text = match &*tool_result.content[0] {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+
+        // Response JSON must contain script_file pointing to an absolute path
+        let json: serde_json::Value =
+            serde_json::from_str(&text).expect("response must be valid JSON");
+        let script_file = json["script_file"]
+            .as_str()
+            .expect("script_file must be a string");
+
+        // Must be absolute
+        assert!(
+            script_file.starts_with('/'),
+            "script_file must be absolute, got: {script_file}"
+        );
+        // Must contain expected filename parts
+        assert!(
+            script_file.contains("persona_a_cam_kitchen_test.lua"),
+            "script_file must contain persona_a_cam_kitchen_test.lua, got: {script_file}"
+        );
+        // File must actually exist on disk
+        assert!(
+            std::path::Path::new(script_file).exists(),
+            "script file must exist on disk: {script_file}"
+        );
     }
 }
