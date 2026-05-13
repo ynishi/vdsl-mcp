@@ -12,7 +12,8 @@ RunPod GPU provisioning, ComfyUI orchestration, and model management — all acc
 - **B2 Cold Storage** — List, pull, and push models between pods and Backblaze B2 via rclone.
 - **Project Sync** — `$VDSL_WORK_DIR/projects/<name>/` (notes, refs, sweeps, final, etc.) is synced to B2 at `vdsl/projects/` independently from the output location; no pod connection required.
 - **Image Batch Download** — Download all output images from ComfyUI history to a local directory.
-- **Batch Generation** — Submit multiple workflows, poll all jobs, download all outputs.
+- **Multi-shot Generation** — `vdsl_generate` accepts `n` (repeat count) or `seed_sweep` (seed list) to produce N images in a single call; returns a flat `saved_paths` list for easy SubAgent consumption. `save_dir` is auto-created if it does not exist.
+- **Batch Generation** — Submit multiple workflows, poll all jobs, download all outputs. Supports `n` / `seed_sweep` as a cartesian product per workflow.
 - **VDSL Script Execution** — Run Lua scripts that compile into ComfyUI workflows.
 - **RunPod CLI Passthrough** — Execute any `runpod-cli` command with auto API key injection.
 - **ComfyUI API** — Generic REST API access with automatic authentication.
@@ -24,8 +25,8 @@ RunPod GPU provisioning, ComfyUI orchestration, and model management — all acc
 | **Connection** | |
 | `vdsl_connect` | Connect to ComfyUI (local URL or RunPod pod ID) |
 | **Generation** | |
-| `vdsl_generate` | Queue a workflow JSON and wait for completion |
-| `vdsl_batch_generate` | Submit multiple workflows, poll all, download outputs |
+| `vdsl_generate` | Queue a workflow JSON and wait for completion; supports `n` (repeat N times) and `seed_sweep` (seed list) for multi-shot generation — returns a flat `saved_paths` list; `save_dir` is auto-created if missing |
+| `vdsl_batch_generate` | Submit multiple workflows, poll all, download outputs; supports `n` and `seed_sweep` applied as a cartesian product per workflow; `save_dir` is auto-created if missing |
 | `vdsl_run` | Compile Lua script → ComfyUI workflow → generate (supports pipelines, judge gates); runs in background by default |
 | `vdsl_run_status` | Poll the status of a background `vdsl_run` job |
 | `vdsl_run_script` | Run a Lua script (no generation — script-only execution) |
