@@ -1179,9 +1179,7 @@ fn expand_phases_llm_models_and_vllm_service() {
 
     // LLM model step (Phase 7b).
     let script = find_script(&plan, "7b_llm_model_0").expect("llm model step present");
-    assert!(
-        script.contains("hf download \"org/repo\" --local-dir \"/root/models/llama\"")
-    );
+    assert!(script.contains("hf download \"org/repo\" --local-dir \"/root/models/llama\""));
     assert!(script.contains("import huggingface_hub"));
     assert!(script.contains("${HF_TOKEN:-}"));
 
