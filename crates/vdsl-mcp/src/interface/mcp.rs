@@ -1597,6 +1597,18 @@ pub struct VdslGenerateRequest {
     /// Local directory to save output images. When specified, all generated images
     /// are downloaded from the ComfyUI server to this directory after completion.
     pub save_dir: Option<String>,
+
+    /// Number of generations to run (1-N). Each generation queues the same workflow.
+    /// Mutually exclusive with seed_sweep; specifying both yields runtime
+    /// McpError::invalid_params. Default: 1.
+    pub n: Option<u32>,
+
+    /// List of seeds to sweep through. Each seed produces one image, overwriting
+    /// all KSampler-class nodes' inputs.seed in the workflow.
+    /// Mutually exclusive with `n` (priority: when both are Some, request is
+    /// rejected at runtime with McpError::invalid_params; when only one is Some,
+    /// that one is honored).
+    pub seed_sweep: Option<Vec<i64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1624,6 +1636,19 @@ pub struct VdslBatchGenerateRequest {
 
     /// Timeout in seconds for the entire batch (default: 300).
     pub timeout: Option<u64>,
+
+    /// Number of generations to run per workflow (1-N). Applied as a cartesian product
+    /// (workflows × n). Mutually exclusive with seed_sweep; specifying both yields
+    /// runtime McpError::invalid_params. Default: 1.
+    pub n: Option<u32>,
+
+    /// List of seeds to sweep through per workflow. Applied as a cartesian product
+    /// (workflows × seed_sweep). Each seed produces one image per workflow, overwriting
+    /// all KSampler-class nodes' inputs.seed in the workflow.
+    /// Mutually exclusive with `n` (priority: when both are Some, request is
+    /// rejected at runtime with McpError::invalid_params; when only one is Some,
+    /// that one is honored). Applied per-workflow as a cartesian product (workflows × seed_sweep).
+    pub seed_sweep: Option<Vec<i64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3066,7 +3091,12 @@ impl VdslMcpServer {
             Accepts workflow JSON inline (workflow) or as a file path (workflow_file). \
             Polls /history until done, returns prompt_id and output images. \
             Timeout: 5 minutes (configurable). \
-            If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
+            If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session. \
+            Supports n (count) and seed_sweep (seed list) for multi-shot generation; returns a flat list of saved image paths. \
+            `n` and `seed_sweep` are mutually exclusive — specifying both yields McpError::invalid_params. \
+            Use `seed_sweep` here for same-workflow seed variations (one workflow × multiple seeds). \
+            For multiple different workflows in one call, use `vdsl_batch_generate` instead. \
+            save_dir is auto-created if missing.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3111,64 +3141,101 @@ impl VdslMcpServer {
             }
         };
 
-        // --- 2. Queue ---
-        let resp = client
-            .post_prompt(&workflow)
-            .await
-            .map_err(Self::to_mcp_error)?;
+        // --- 1b. Resolve n / seed_sweep (mutually exclusive) ---
+        let seeds: Vec<Option<i64>> = match (req.n, &req.seed_sweep) {
+            (Some(_), Some(_)) => {
+                return Err(McpError::invalid_params(
+                    "specify either 'n' or 'seed_sweep', not both",
+                    None,
+                ))
+            }
+            (None, None) => vec![None],
+            (Some(n), None) => (0..n).map(|_| None).collect(),
+            (None, Some(ss)) => ss.iter().map(|s| Some(*s)).collect(),
+        };
 
-        let prompt_id = resp["prompt_id"]
-            .as_str()
-            .ok_or_else(|| {
-                McpError::internal_error(format!("no prompt_id in response: {resp}"), None)
-            })?
-            .to_string();
-
-        // --- 3. Poll for completion ---
         let timeout = req.timeout.unwrap_or(GENERATE_TIMEOUT_SECS);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
         let interval = std::time::Duration::from_secs(GENERATE_POLL_INTERVAL_SECS);
 
-        let entry = loop {
-            let history = client
-                .history(&prompt_id)
-                .await
-                .map_err(Self::to_mcp_error)?;
+        let mut all_images: Vec<serde_json::Value> = Vec::new();
+        let mut prompt_ids: Vec<String> = Vec::new();
+        let mut iter_log: Vec<String> = Vec::new();
 
-            if let Some(entry) = history.get(&prompt_id) {
-                if let Some(status) = entry.get("status") {
-                    let completed = status["completed"].as_bool().unwrap_or(false);
-                    if completed {
-                        if let Some(err_msg) = check_execution_error(status) {
-                            return Err(McpError::internal_error(err_msg, None));
-                        }
-                        break entry.clone();
-                    }
+        for (i, seed_opt) in seeds.iter().enumerate() {
+            let mut wf_iter = workflow.clone();
+            if let Some(seed) = seed_opt {
+                let applied = apply_seed_to_workflow(&mut wf_iter, *seed);
+                if !applied {
+                    iter_log.push(format!(
+                        "  warn: iter {}: no KSampler node to apply seed={seed}",
+                        i + 1
+                    ));
                 }
             }
 
-            if std::time::Instant::now() >= deadline {
-                return Err(McpError::internal_error(
-                    format!("timeout after {timeout}s waiting for prompt {prompt_id}"),
-                    None,
-                ));
-            }
+            // --- 2. Queue ---
+            let resp = client
+                .post_prompt(&wf_iter)
+                .await
+                .map_err(Self::to_mcp_error)?;
 
-            tokio::time::sleep(interval).await;
-        };
+            let prompt_id = resp["prompt_id"]
+                .as_str()
+                .ok_or_else(|| {
+                    McpError::internal_error(format!("no prompt_id in response: {resp}"), None)
+                })?
+                .to_string();
 
-        // --- 4. Collect output images ---
-        let images = collect_output_images(&entry);
+            // --- 3. Poll for completion ---
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+
+            let entry = loop {
+                let history = client
+                    .history(&prompt_id)
+                    .await
+                    .map_err(Self::to_mcp_error)?;
+
+                if let Some(entry) = history.get(&prompt_id) {
+                    if let Some(status) = entry.get("status") {
+                        let completed = status["completed"].as_bool().unwrap_or(false);
+                        if completed {
+                            if let Some(err_msg) = check_execution_error(status) {
+                                return Err(McpError::internal_error(err_msg, None));
+                            }
+                            break entry.clone();
+                        }
+                    }
+                }
+
+                if std::time::Instant::now() >= deadline {
+                    return Err(McpError::internal_error(
+                        format!("timeout after {timeout}s waiting for prompt {prompt_id}"),
+                        None,
+                    ));
+                }
+
+                tokio::time::sleep(interval).await;
+            };
+
+            // --- 4. Collect output images ---
+            let images = collect_output_images(&entry);
+            all_images.extend(images);
+            prompt_ids.push(prompt_id);
+        }
 
         // --- 5. Download images locally (if save_dir specified) ---
-        let download_log = if let Some(ref dir) = req.save_dir {
-            let dl = download_images_to_dir(&client, &images, std::path::Path::new(dir)).await;
-            dl.log
+        let dl_result = if let Some(ref dir) = req.save_dir {
+            Some(download_images_to_dir(&client, &all_images, std::path::Path::new(dir)).await)
         } else {
-            Vec::new()
+            None
         };
+        let download_log = dl_result.as_ref().map(|d| &d.log[..]).unwrap_or(&[]);
+        let saved_paths = dl_result
+            .as_ref()
+            .map(|d| d.saved_paths.clone())
+            .unwrap_or_default();
 
-        let image_summary: Vec<String> = images
+        let image_summary: Vec<String> = all_images
             .iter()
             .enumerate()
             .map(|(i, img)| {
@@ -3182,11 +3249,21 @@ impl VdslMcpServer {
             })
             .collect();
 
+        let prompt_header = if prompt_ids.len() == 1 {
+            format!("prompt_id: {}", prompt_ids[0])
+        } else {
+            format!("prompt_ids: [{}]", prompt_ids.join(", "))
+        };
+
         let mut output = format!(
-            "prompt_id: {prompt_id}\nserver: {url}\nimages: {}\n{}",
-            images.len(),
+            "{prompt_header}\nserver: {url}\nimages: {}\n{}",
+            all_images.len(),
             image_summary.join("\n"),
         );
+
+        if !iter_log.is_empty() {
+            output.push_str(&format!("\n\n{}", iter_log.join("\n")));
+        }
 
         if !download_log.is_empty() {
             output.push_str(&format!("\n\ndownloads:\n{}", download_log.join("\n")));
@@ -3197,9 +3274,17 @@ impl VdslMcpServer {
             );
         }
 
+        if !saved_paths.is_empty() {
+            let paths_text: Vec<String> = saved_paths
+                .iter()
+                .map(|p| format!("  {}", p.display()))
+                .collect();
+            output.push_str(&format!("\n\nsaved_paths:\n{}", paths_text.join("\n")));
+        }
+
         output.push_str(&format!(
             "\n\n{}",
-            serde_json::to_string_pretty(&images).unwrap_or_else(|_| format!("{images:?}"))
+            serde_json::to_string_pretty(&all_images).unwrap_or_else(|_| format!("{all_images:?}"))
         ));
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
@@ -3213,7 +3298,11 @@ impl VdslMcpServer {
             All workflows are submitted to the queue, then polled until every job finishes. \
             Results and output images are collected per-workflow. \
             Use save_dir to download all generated images locally. \
-            If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session.",
+            If pod_id/url are omitted, reuses the last vdsl_connect or vdsl_pod_setup session. \
+            Supports n (count) and seed_sweep (seed list); both apply per-workflow as a cartesian product (workflows × seed_sweep). \
+            `n` and `seed_sweep` are mutually exclusive — specifying both yields McpError::invalid_params. \
+            For single-workflow seed variations only, prefer `vdsl_generate` with `seed_sweep` for lower overhead. \
+            save_dir is auto-created if missing.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3247,6 +3336,19 @@ impl VdslMcpServer {
             ));
         }
 
+        // --- 1b. Resolve n / seed_sweep (mutually exclusive) ---
+        let batch_seeds: Vec<Option<i64>> = match (req.n, &req.seed_sweep) {
+            (Some(_), Some(_)) => {
+                return Err(McpError::invalid_params(
+                    "specify either 'n' or 'seed_sweep', not both",
+                    None,
+                ))
+            }
+            (None, None) => vec![None],
+            (Some(n), None) => (0..n).map(|_| None).collect(),
+            (None, Some(ss)) => ss.iter().map(|s| Some(*s)).collect(),
+        };
+
         let mut tagged: Vec<TaggedWorkflow> = if let Some(wfs) = req.workflows {
             wfs.into_iter()
                 .enumerate()
@@ -3278,9 +3380,39 @@ impl VdslMcpServer {
             return Err(McpError::invalid_params("no workflow source", None));
         };
 
+        // --- 1c. Expand tagged by cartesian product with seeds ---
+        let mut seed_warn_log: Vec<String> = Vec::new();
+        if batch_seeds.len() > 1 || batch_seeds[0].is_some() {
+            let base_tagged = tagged;
+            tagged = Vec::with_capacity(base_tagged.len() * batch_seeds.len());
+            for tw in &base_tagged {
+                for (si, seed_opt) in batch_seeds.iter().enumerate() {
+                    let mut wf = tw.workflow.clone();
+                    let label = if let Some(seed) = seed_opt {
+                        let applied = apply_seed_to_workflow(&mut wf, *seed);
+                        if !applied {
+                            seed_warn_log.push(format!(
+                                "  warn: workflow '{}' seed_iter {}: no KSampler node to apply seed={seed}",
+                                tw.label,
+                                si + 1
+                            ));
+                        }
+                        format!("{}_{}", tw.label, seed)
+                    } else {
+                        format!("{}_{}", tw.label, si + 1)
+                    };
+                    tagged.push(TaggedWorkflow {
+                        label,
+                        workflow: wf,
+                    });
+                }
+            }
+        }
+
         let total = tagged.len();
         let mut log = Vec::<String>::new();
         log.push(format!("Batch: {total} workflow(s) on {url}"));
+        log.extend(seed_warn_log);
 
         // --- 2. Sort by checkpoint to minimize model loading ---
         sort_workflows_by_checkpoint(&mut tagged);
@@ -3303,7 +3435,7 @@ impl VdslMcpServer {
             ));
         }
 
-        // --- 3. Poll until all complete ---
+        // --- 4. Poll until all complete ---
         let timeout = req.timeout.unwrap_or(GENERATE_TIMEOUT_SECS);
         let results = poll_jobs(
             &client,
@@ -3315,17 +3447,21 @@ impl VdslMcpServer {
         )
         .await;
 
-        // --- 4. Download images (if save_dir specified) ---
+        // --- 5. Download images (if save_dir specified) ---
         let all_images: Vec<&serde_json::Value> = collect_batch_images(&results);
-        let download_log = if let Some(ref dir) = req.save_dir {
+        let dl_result = if let Some(ref dir) = req.save_dir {
             let owned: Vec<serde_json::Value> = all_images.iter().map(|v| (*v).clone()).collect();
-            let dl = download_images_to_dir(&client, &owned, std::path::Path::new(dir)).await;
-            dl.log
+            Some(download_images_to_dir(&client, &owned, std::path::Path::new(dir)).await)
         } else {
-            Vec::new()
+            None
         };
+        let download_log = dl_result.as_ref().map(|d| &d.log[..]).unwrap_or(&[]);
+        let saved_paths = dl_result
+            .as_ref()
+            .map(|d| d.saved_paths.clone())
+            .unwrap_or_default();
 
-        // --- 5. Build summary ---
+        // --- 6. Build summary ---
         format_batch_summary(&results, &mut log);
 
         let mut output = log.join("\n");
@@ -3336,6 +3472,14 @@ impl VdslMcpServer {
                 "\n\n⚠ Ephemeral pod — images exist only on the pod and will be lost on deletion.\n\
                  Specify save_dir to download images locally.",
             );
+        }
+
+        if !saved_paths.is_empty() {
+            let paths_text: Vec<String> = saved_paths
+                .iter()
+                .map(|p| format!("  {}", p.display()))
+                .collect();
+            output.push_str(&format!("\n\nsaved_paths:\n{}", paths_text.join("\n")));
         }
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
@@ -7231,6 +7375,18 @@ async fn download_images_to_dir(
     save_dir: &std::path::Path,
 ) -> DownloadResult {
     let mut log = Vec::new();
+    if let Err(e) = tokio::fs::create_dir_all(save_dir).await {
+        tracing::warn!(path = %save_dir.display(), error = %e, "download_images_to_dir: failed to create save_dir");
+        log.push(format!(
+            "FAILED to create save_dir {}: {e}",
+            save_dir.display()
+        ));
+        return DownloadResult {
+            log,
+            saved_paths: vec![],
+            labeled_paths: vec![],
+        };
+    }
     let mut saved_paths = Vec::new();
     for img in images {
         let filename = match img["filename"].as_str() {
@@ -7261,6 +7417,18 @@ async fn download_batch_images_labeled(
     save_dir: &std::path::Path,
 ) -> DownloadResult {
     let mut log = Vec::new();
+    if let Err(e) = tokio::fs::create_dir_all(save_dir).await {
+        tracing::warn!(path = %save_dir.display(), error = %e, "download_batch_images_labeled: failed to create save_dir");
+        log.push(format!(
+            "FAILED to create save_dir {}: {e}",
+            save_dir.display()
+        ));
+        return DownloadResult {
+            log,
+            saved_paths: vec![],
+            labeled_paths: vec![],
+        };
+    }
     let mut saved_paths = Vec::new();
     let mut labeled_paths = Vec::new();
     for job in results {
@@ -7949,6 +8117,28 @@ fn extract_seed_from_workflow(wf: &serde_json::Value) -> Option<i64> {
         }
     }
     None
+}
+
+/// Apply `seed` to all KSampler-class nodes' inputs.seed in a ComfyUI workflow JSON.
+/// Returns `true` if at least one node was updated.
+fn apply_seed_to_workflow(wf: &mut serde_json::Value, seed: i64) -> bool {
+    let mut applied = false;
+    if let Some(obj) = wf.as_object_mut() {
+        for (_node_id, node) in obj.iter_mut() {
+            if node
+                .get("class_type")
+                .and_then(|v| v.as_str())
+                .map(|s| s.contains("KSampler"))
+                .unwrap_or(false)
+            {
+                if let Some(inputs) = node.get_mut("inputs").and_then(|v| v.as_object_mut()) {
+                    inputs.insert("seed".to_string(), serde_json::Value::from(seed));
+                    applied = true;
+                }
+            }
+        }
+    }
+    applied
 }
 
 /// Load recipe JSON from VDSL_OUT_DIR sidecar file.
@@ -11137,5 +11327,133 @@ print("debug: done")
     #[test]
     fn tunnel_list_request_parse() {
         let _req: VdslTunnelListRequest = serde_json::from_str("{}").unwrap();
+    }
+
+    // =========================================================================
+    // n / seed_sweep request deserialization tests
+    // =========================================================================
+
+    #[test]
+    fn generate_request_with_n() {
+        let req: VdslGenerateRequest = serde_json::from_str(r#"{"workflow":{},"n":3}"#).unwrap();
+        assert_eq!(req.n, Some(3));
+        assert!(req.seed_sweep.is_none());
+    }
+
+    #[test]
+    fn generate_request_with_seed_sweep() {
+        let req: VdslGenerateRequest =
+            serde_json::from_str(r#"{"workflow":{},"seed_sweep":[1,2,3]}"#).unwrap();
+        assert!(req.n.is_none());
+        assert_eq!(req.seed_sweep.as_deref(), Some(&[1i64, 2, 3][..]));
+    }
+
+    #[test]
+    fn generate_request_n_and_seed_sweep_both_deser_ok() {
+        // Both Some is valid JSON (runtime validation rejects it, not deserialization)
+        let req: VdslGenerateRequest =
+            serde_json::from_str(r#"{"workflow":{},"n":2,"seed_sweep":[10,20]}"#).unwrap();
+        assert_eq!(req.n, Some(2));
+        assert!(req.seed_sweep.is_some());
+    }
+
+    #[test]
+    fn batch_request_with_n() {
+        let req: VdslBatchGenerateRequest =
+            serde_json::from_str(r#"{"workflows":[{}],"n":4}"#).unwrap();
+        assert_eq!(req.n, Some(4));
+        assert!(req.seed_sweep.is_none());
+    }
+
+    #[test]
+    fn batch_request_with_seed_sweep() {
+        let req: VdslBatchGenerateRequest =
+            serde_json::from_str(r#"{"workflows":[{}],"seed_sweep":[100,200]}"#).unwrap();
+        assert!(req.n.is_none());
+        assert_eq!(req.seed_sweep.as_deref(), Some(&[100i64, 200][..]));
+    }
+
+    // =========================================================================
+    // apply_seed_to_workflow tests
+    // =========================================================================
+
+    #[test]
+    fn apply_seed_to_workflow_updates_ksampler() {
+        let mut wf = serde_json::json!({
+            "3": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "seed": 12345,
+                    "steps": 20
+                }
+            }
+        });
+        let applied = apply_seed_to_workflow(&mut wf, 99999);
+        assert!(applied);
+        // Round-trip via extract_seed_from_workflow
+        assert_eq!(extract_seed_from_workflow(&wf), Some(99999));
+    }
+
+    #[test]
+    fn apply_seed_to_workflow_no_ksampler_returns_false() {
+        let mut wf = serde_json::json!({
+            "1": {
+                "class_type": "CLIPTextEncode",
+                "inputs": { "text": "hello" }
+            }
+        });
+        let original = wf.clone();
+        let applied = apply_seed_to_workflow(&mut wf, 42);
+        assert!(!applied);
+        assert_eq!(wf, original);
+    }
+
+    #[test]
+    fn apply_seed_to_workflow_multiple_ksampler_all_updated() {
+        let mut wf = serde_json::json!({
+            "3": {
+                "class_type": "KSampler",
+                "inputs": { "seed": 1, "steps": 20 }
+            },
+            "7": {
+                "class_type": "KSamplerAdvanced",
+                "inputs": { "seed": 2, "steps": 30 }
+            }
+        });
+        let applied = apply_seed_to_workflow(&mut wf, 777);
+        assert!(applied);
+        // Both KSampler nodes should have seed=777
+        assert_eq!(wf["3"]["inputs"]["seed"].as_i64(), Some(777));
+        assert_eq!(wf["7"]["inputs"]["seed"].as_i64(), Some(777));
+    }
+
+    // =========================================================================
+    // download_images_to_dir creates missing save_dir
+    // =========================================================================
+
+    #[tokio::test]
+    async fn download_images_to_dir_creates_missing_dir() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let save_dir = tmp.path().join("nonexistent_subdir");
+        // Directory must not exist yet
+        assert!(!save_dir.exists());
+
+        // Pass empty images vec — no HTTP calls needed, only mkdir is exercised
+        // We construct a minimal ComfyUiClient pointing at a bogus URL.
+        // The empty images slice means the download loop is never entered.
+        let client = ComfyUiClient::new("http://127.0.0.1:1".to_string(), None).unwrap();
+        let result = download_images_to_dir(&client, &[], &save_dir).await;
+
+        // create_dir_all should have succeeded
+        assert!(save_dir.exists(), "save_dir must have been created");
+        // No errors logged (empty images, no failed downloads)
+        assert!(
+            result.log.is_empty(),
+            "expected empty log, got: {:?}",
+            result.log
+        );
+        assert!(result.saved_paths.is_empty());
+        assert!(result.labeled_paths.is_empty());
     }
 }
