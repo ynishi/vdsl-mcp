@@ -7755,12 +7755,12 @@ async fn scan_json_dir(dir: &str) -> Result<Vec<String>, McpError> {
     {
         let p = entry.path();
         if p.extension().and_then(|s| s.to_str()) == Some("json") {
-            // Skip recipe sidecar files (_recipe_*.json)
-            let is_recipe = p
+            // Skip sidecar files (_recipe_*.json / _anchor_*.json)
+            let is_sidecar = p
                 .file_name()
                 .and_then(|f| f.to_str())
-                .is_some_and(|f| f.starts_with("_recipe_"));
-            if !is_recipe {
+                .is_some_and(|f| f.starts_with("_recipe_") || f.starts_with("_anchor_"));
+            if !is_sidecar {
                 if let Some(s) = p.to_str() {
                     entries.push(s.to_string());
                 }
