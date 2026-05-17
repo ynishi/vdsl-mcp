@@ -1295,6 +1295,64 @@ fn expand_phases_llamacpp_default_binary_in_path() {
 }
 
 #[test]
+fn expand_phases_sbv2_service_launch_command() {
+    use crate::domain::profile::{HttpReadyCheck, ServiceConfig, ServicePlatform};
+    let mut m = full_manifest();
+    m.services.push(ServiceConfig {
+        name: "sbv2".to_string(),
+        platform: ServicePlatform::Sbv2 {
+            port: 5000,
+            repo_dir: "/root/Style-Bert-VITS2".to_string(),
+            python: Some("/root/venv/bin/python".to_string()),
+            extra_args: vec!["--host 0.0.0.0".to_string()],
+        },
+        ready_check: Some(HttpReadyCheck {
+            http: "http://localhost:5000/status".to_string(),
+            timeout_sec: Some(120),
+        }),
+    });
+    let plan = expand_phases(&m, "abc", false).expect("ok");
+    let s = find_script(&plan, "11_service_0_start").expect("sbv2 start present");
+    assert!(
+        s.contains(
+            "(cd \"/root/Style-Bert-VITS2\" && \"/root/venv/bin/python\" \
+             server_fastapi.py --port 5000 --host 0.0.0.0)"
+        ),
+        "sbv2 launch cmd shape mismatch; got: {s}"
+    );
+    assert!(s.contains("/workspace/.vdsl/service_sbv2.log"));
+    assert!(s.contains("/workspace/.vdsl/service_sbv2.pid"));
+
+    let r = find_script(&plan, "11_service_0_ready").expect("sbv2 ready present");
+    assert!(r.contains("until curl -sf http://localhost:5000/status >/dev/null; do"));
+}
+
+#[test]
+fn expand_phases_sbv2_default_python_in_path() {
+    use crate::domain::profile::{ServiceConfig, ServicePlatform};
+    let mut m = full_manifest();
+    m.services.push(ServiceConfig {
+        name: "sbv2".to_string(),
+        platform: ServicePlatform::Sbv2 {
+            port: 5000,
+            repo_dir: "/root/Style-Bert-VITS2".to_string(),
+            python: None,
+            extra_args: vec![],
+        },
+        ready_check: None,
+    });
+    let plan = expand_phases(&m, "abc", false).expect("ok");
+    let s = find_script(&plan, "11_service_0_start").expect("sbv2 start present");
+    assert!(
+        s.contains(
+            "(cd \"/root/Style-Bert-VITS2\" && \"python3\" \
+             server_fastapi.py --port 5000)"
+        ),
+        "default python should be `python3` (PATH); got: {s}"
+    );
+}
+
+#[test]
 fn expand_phases_rejects_duplicate_service_names() {
     use crate::domain::profile::{ServiceConfig, ServicePlatform};
     let mut m = full_manifest();

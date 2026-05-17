@@ -1440,6 +1440,32 @@ fn build_service_launch_cmd(platform: &ServicePlatform) -> Result<String, Profil
             }
             Ok(cmd)
         }
+        ServicePlatform::Sbv2 {
+            port,
+            repo_dir,
+            python,
+            extra_args,
+        } => {
+            assert_shell_safe(repo_dir, "services[].sbv2.repo_dir")?;
+            let py = python.as_deref().unwrap_or("python3");
+            assert_shell_safe(py, "services[].sbv2.python")?;
+            for a in extra_args {
+                if !is_shell_safe_with_spaces(a) {
+                    return Err(ProfileError::InvalidManifest(format!(
+                        "services[].sbv2.extra_args contains unsafe token: {a:?}"
+                    )));
+                }
+            }
+            let mut cmd = format!(
+                "(cd \"{repo_dir}\" && \"{py}\" server_fastapi.py --port {port}"
+            );
+            for a in extra_args {
+                cmd.push(' ');
+                cmd.push_str(a);
+            }
+            cmd.push(')');
+            Ok(cmd)
+        }
     }
 }
 

@@ -281,6 +281,28 @@ pub enum ServicePlatform {
         #[serde(default)]
         extra_args: Vec<String>,
     },
+    /// Style-Bert-VITS2 FastAPI server.
+    /// `(cd "<repo_dir>" && "<python>" server_fastapi.py --port <port> [extra_args...])`
+    ///
+    /// SBV2 (https://github.com/litagin02/Style-Bert-VITS2) は FastAPI server
+    /// (`server_fastapi.py`) を repo cwd から起動する形なので、`repo_dir` は必須
+    /// (binary 1 ファイルでは完結しないため llamacpp 風の `binary` 抽象ではなく
+    /// `repo_dir` を持つ)。Operator が `git clone` + `pip install` 等で事前に
+    /// 配置する前提。`model_assets/` layout や speaker 選択は server 側の責務。
+    Sbv2 {
+        /// Listen port (FastAPI default: 5000).
+        port: u16,
+        /// Absolute path to the Style-Bert-VITS2 repo (must contain
+        /// `server_fastapi.py`).
+        repo_dir: String,
+        /// Python interpreter. None → assume `python3` in PATH.
+        #[serde(default)]
+        python: Option<String>,
+        /// Free-form extra flags (single-token each, validated with
+        /// `is_shell_safe_with_spaces`). Typical entries: `--host 0.0.0.0`.
+        #[serde(default)]
+        extra_args: Vec<String>,
+    },
 }
 
 /// HTTP readiness probe. `curl -sf <http>` is polled every second up
