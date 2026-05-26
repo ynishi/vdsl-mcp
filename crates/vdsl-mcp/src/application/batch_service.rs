@@ -390,11 +390,45 @@ async fn dispatch_exec_bg(
             pod_id: pod_id_hint.clone(),
             ssh_key: ssh_key_hint.clone(),
         };
-        let status_result = server
-            .task_status(Parameters(status_req))
-            .await
-            .map_err(|e| e.to_string())?;
-        let status_text = extract_result(status_result)?;
+        // Retry transient SSH failures (poll opens a brief SSH session
+        // each time; RunPod proxy can drop individual connections).
+        const MAX_POLL_RETRIES: u32 = 3;
+        let mut poll_err = None;
+        let mut status_text = String::new();
+        for attempt in 0..=MAX_POLL_RETRIES {
+            match server
+                .task_status(Parameters(status_req.clone()))
+                .await
+            {
+                Ok(result) => match extract_result(result) {
+                    Ok(text) => {
+                        status_text = text;
+                        poll_err = None;
+                        break;
+                    }
+                    Err(e) => {
+                        poll_err = Some(e);
+                    }
+                },
+                Err(e) => {
+                    poll_err = Some(e.to_string());
+                }
+            }
+            if attempt < MAX_POLL_RETRIES {
+                tracing::warn!(
+                    job_id = %job_id,
+                    attempt = attempt + 1,
+                    "exec_bg: task_status poll failed, retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+        if let Some(e) = poll_err {
+            return Err(format!(
+                "exec_bg: task_status poll failed after {} retries: {e}",
+                MAX_POLL_RETRIES
+            ));
+        }
 
         // mcp::task_status emits `serde_json::to_string_pretty(..)`;
         // re-parse to inspect the `state` / `exit_code` / `log` fields.
