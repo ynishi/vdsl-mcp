@@ -2180,6 +2180,51 @@ impl From<VdslCamShotSpec> for crate::domain::cam::CamShotSpec {
     }
 }
 
+/// Persona identity spec — a fixed Subject (base text + traits) plus optional
+/// negative traits. cam emits it as a `vdsl.subject(...)` chain.
+/// When supplied to `vdsl_cam_lua_init`, replaces the 3-stage base file lookup.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct VdslCamIdentitySpec {
+    /// Base subject text (e.g. `"1girl, solo, 20 years old"`).
+    pub base_text: String,
+    /// Trait list applied on top of base_text via Subject:with.
+    #[serde(default)]
+    pub traits: Vec<VdslCamIdentityTrait>,
+    /// Optional negative-side traits — text fragments merged into the negative
+    /// prompt as `vdsl.trait("a, b, c")`. Use to suppress class-style
+    /// hallucinations (e.g. `["cat ears", "animal ears", "fox ears"]` to
+    /// suppress catgirl drift on Illustrious SDXL when the positive trait
+    /// list contains `multiple ear piercings`).
+    #[serde(default)]
+    pub negative_traits: Vec<VdslCamIdentityTrait>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct VdslCamIdentityTrait {
+    pub text: String,
+    #[serde(default)]
+    pub weight: Option<f64>,
+}
+
+impl From<VdslCamIdentitySpec> for crate::domain::cam::CamIdentitySpec {
+    fn from(s: VdslCamIdentitySpec) -> Self {
+        crate::domain::cam::CamIdentitySpec {
+            base_text: s.base_text,
+            traits: s.traits.into_iter().map(Into::into).collect(),
+            negative_traits: s.negative_traits.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<VdslCamIdentityTrait> for crate::domain::cam::CamIdentityTrait {
+    fn from(t: VdslCamIdentityTrait) -> Self {
+        crate::domain::cam::CamIdentityTrait {
+            text: t.text,
+            weight: t.weight,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct VdslCamLuaInitRequest {
     /// Persona ID slug (e.g. `"persona_a"`, `"alice"`). Must match `^[a-zA-Z0-9_-]+$`.
@@ -2210,6 +2255,13 @@ pub struct VdslCamLuaInitRequest {
     /// When false (default), the tool refuses to overwrite and returns an error.
     #[serde(default)]
     pub overwrite: bool,
+
+    /// Optional persona identity spec (Subject + Trait fixation).
+    /// When supplied, the base subject snippet is built by emitting the identity
+    /// as a `vdsl.subject(...)` chain instead of being resolved via the 3-stage
+    /// base file fallback. `base_source` in the response becomes `"identity"`.
+    #[serde(default)]
+    pub identity: Option<VdslCamIdentitySpec>,
 }
 
 // =============================================================================
@@ -6510,6 +6562,9 @@ impl VdslMcpServer {
             .shots
             .map(|v| v.into_iter().map(Into::into).collect::<Vec<_>>());
 
+        let identity_owned: Option<crate::domain::cam::CamIdentitySpec> =
+            req.identity.map(Into::into);
+
         let result = scaffold_cam_lua(
             &req.persona_id,
             &req.scene,
@@ -6517,6 +6572,7 @@ impl VdslMcpServer {
             req.topic.as_deref(),
             &root,
             req.overwrite,
+            identity_owned.as_ref(),
         )
         .map_err(|e| match e {
             CamLuaScaffoldError::InvalidPersonaId(_)
@@ -11614,6 +11670,7 @@ print("debug: done")
             topic: Some("kitchen_test".to_string()),
             root: Some(root.clone()),
             overwrite: false,
+            identity: None,
         };
 
         let result = server.cam_lua_init(Parameters(req)).await;
