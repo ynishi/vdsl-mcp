@@ -858,7 +858,8 @@ async fn precheck_disk_avail(
     Ok(())
 }
 
-/// Resolve ComfyUI install base path for a per-call storage operation.
+/// Resolve the ComfyUI install base path for a per-call pod operation
+/// (storage push/pull/archive and model download).
 ///
 /// Resolution order:
 /// 1. `explicit` parameter (caller-supplied, highest priority).
@@ -867,11 +868,13 @@ async fn precheck_disk_avail(
 /// 3. Fresh SSH-based detection via `detect_comfyui_base` (original fallback).
 ///
 /// The global shortcut avoids a redundant SSH round-trip for users who ran
-/// `vdsl_connect` before `vdsl_storage_pull` in the same session.
-async fn resolve_storage_comfy_base(
-    explicit: Option<&str>,
-    pod_id: &str,
-) -> Result<String, McpError> {
+/// `vdsl_connect` before the operation in the same session.
+///
+/// Every caller here has a `pod_id`, so the live pod's actual install path is
+/// always reachable — operations never blindly trust `DEFAULT_COMFYUI_BASE`
+/// (which targets the official `runpod/comfyui` image's `runpod-slim` tree and
+/// is wrong for Profile-installed pods under `/workspace/ComfyUI`).
+async fn resolve_comfy_base(explicit: Option<&str>, pod_id: &str) -> Result<String, McpError> {
     if let Some(p) = explicit {
         if !p.is_empty() {
             return Ok(p.to_string());
@@ -920,6 +923,12 @@ pub struct VdslDownloadRequest {
 
     /// SSH key path. Falls back to VDSL_SSH_KEY env, then ~/.ssh/id_ed25519.
     pub ssh_key: Option<String>,
+
+    /// ComfyUI install base on the pod (e.g. "/workspace/ComfyUI"). When omitted
+    /// the base is resolved like storage ops: cached `vdsl_connect` value, then
+    /// fresh SSH detection of the live pod's actual install path. Pass this only
+    /// to override detection.
+    pub comfy_base: Option<String>,
 }
 
 /// Resolved download info: URL + filename.
@@ -3083,6 +3092,9 @@ impl VdslMcpServer {
             Sources: hf:user/repo/file (HuggingFace), cv:VERSION_ID (CivitAI), \
             https://... (direct URL), or bare user/repo/file (defaults to HuggingFace). \
             CivitAI token is auto-injected from VDSL_CIVITAI_TOKEN env. \
+            The destination ComfyUI base is resolved from the live pod (cached \
+            vdsl_connect value, else SSH auto-detection), so models land in the \
+            running ComfyUI's tree; pass comfy_base to override. \
             Downloads run in background on the pod via SSH; polls until complete. \
             Timeout: 10 minutes.",
         annotations(
@@ -3106,12 +3118,12 @@ impl VdslMcpServer {
         let dir_name =
             resolve_model_dir(&req.target).map_err(|e| McpError::invalid_params(e, None))?;
 
-        let dest = format!(
-            "{}/{}/{}",
-            comfyui_models_base(),
-            dir_name,
-            dl_info.filename
-        );
+        // Resolve the ComfyUI base from the LIVE pod (explicit > cached connect >
+        // SSH detection), the same way storage ops do — never trust the static
+        // default, which would land models in the wrong ComfyUI tree on
+        // Profile-installed pods (/workspace/ComfyUI vs the default runpod-slim).
+        let comfy_base = resolve_comfy_base(req.comfy_base.as_deref(), &req.pod_id).await?;
+        let dest = format!("{comfy_base}/models/{dir_name}/{}", dl_info.filename);
 
         let mut log = Vec::<String>::new();
         log.push(format!(
@@ -4594,7 +4606,7 @@ impl VdslMcpServer {
 
         precheck_disk_avail(&svc, &req.pod_id, &ssh_key).await?;
 
-        let comfy_base = resolve_storage_comfy_base(req.comfy_base.as_deref(), &req.pod_id).await?;
+        let comfy_base = resolve_comfy_base(req.comfy_base.as_deref(), &req.pod_id).await?;
         let dest = format!("{comfy_base}/models/{dir_name}/");
 
         StorageService::new(&svc)
@@ -4654,7 +4666,7 @@ impl VdslMcpServer {
         let dir_name =
             resolve_model_dir(&req.source_target).map_err(|e| McpError::invalid_params(e, None))?;
 
-        let comfy_base = resolve_storage_comfy_base(req.comfy_base.as_deref(), &req.pod_id).await?;
+        let comfy_base = resolve_comfy_base(req.comfy_base.as_deref(), &req.pod_id).await?;
         let models_base = format!("{comfy_base}/models");
         let source = match req.filename {
             Some(ref f) => format!("{models_base}/{dir_name}/{f}"),
@@ -4732,7 +4744,7 @@ impl VdslMcpServer {
         let dir_name =
             resolve_model_dir(&req.source_target).map_err(|e| McpError::invalid_params(e, None))?;
 
-        let comfy_base = resolve_storage_comfy_base(req.comfy_base.as_deref(), &req.pod_id).await?;
+        let comfy_base = resolve_comfy_base(req.comfy_base.as_deref(), &req.pod_id).await?;
         let source_path = format!("{comfy_base}/models/{dir_name}/{}", req.filename);
         let dest_path = req.dest_path.as_deref().unwrap_or("").trim_matches('/');
         let remote_dir = if dest_path.is_empty() {

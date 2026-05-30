@@ -13,6 +13,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **`vdsl_batch_generate` — `n` / `seed_sweep` per-workflow** — Same parameters applied as a cartesian product (`workflows × seed_sweep`). Each workflow in the batch is submitted for every seed in `seed_sweep` (or N times for `n`).
 - **`apply_seed_to_workflow` internal helper** — Writes a given seed value into all KSampler-class nodes' `inputs.seed` in a workflow JSON value. Returns `true` if at least one node was updated; emits a warning log line when no KSampler node is found.
 - **auto-mkdir in `download_images_to_dir` / `download_batch_images_labeled`** — `save_dir` is now created automatically via `tokio::fs::create_dir_all` inside both download helpers; callers no longer need a prior `mkdir` step. On permission failure the helper returns an empty `DownloadResult` with a `FAILED to create save_dir` log entry instead of panicking.
+- **`vdsl_download` — optional `comfy_base` override** — explicitly pin the pod's ComfyUI install base for a single download (symmetry with the storage tools' `comfy_base`). Omit to use live-pod resolution (see Fixed below).
+
+### Fixed
+
+- **`vdsl_download` now targets the live pod's ComfyUI tree** — previously the destination was built from the static `DEFAULT_COMFYUI_BASE` (`/workspace/runpod-slim/ComfyUI`, the official `runpod/comfyui` image layout) via `comfyui_models_base()`, with no detection. On Profile-installed pods, where ComfyUI lives under `/workspace/ComfyUI`, downloads silently landed in a sibling tree the running ComfyUI never scans — the model appeared downloaded but stayed invisible to generation. `download` now resolves the base through the same detection-backed resolver as the storage tools (`resolve_comfy_base`: explicit `comfy_base` → cached `vdsl_connect` value → fresh SSH detection of the running `main.py`'s install dir), so models always land in the live ComfyUI's `models/` tree. The shared resolver was renamed from `resolve_storage_comfy_base` to `resolve_comfy_base` since it now serves download as well as storage.
 
 ## [0.6.0] - 2026-05-06
 
