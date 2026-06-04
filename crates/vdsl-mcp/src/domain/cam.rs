@@ -551,8 +551,8 @@ mod tests {
         let td = setup();
         let root = td.path().to_path_buf();
 
-        let result =
-            scaffold_cam_lua("persona_a", "default scene", None, None, &root, false, None).expect("scaffold");
+        let result = scaffold_cam_lua("persona_a", "default scene", None, None, &root, false, None)
+            .expect("scaffold");
 
         let file_name = result
             .script_file
@@ -593,8 +593,8 @@ mod tests {
         let root = td.path().to_path_buf();
 
         scaffold_cam_lua("persona_a", "scene", None, Some("test"), &root, false, None).expect("first");
-        let result =
-            scaffold_cam_lua("persona_a", "scene", None, Some("test"), &root, true, None).expect("overwrite");
+        let result = scaffold_cam_lua("persona_a", "scene", None, Some("test"), &root, true, None)
+            .expect("overwrite");
 
         assert!(
             !result.file_created,
@@ -610,11 +610,12 @@ mod tests {
         let td = setup();
         let root = td.path().to_path_buf();
 
-        let err = scaffold_cam_lua("", "scene", None, Some("t"), &root, false, None).expect_err("empty");
+        let err =
+            scaffold_cam_lua("", "scene", None, Some("t"), &root, false, None).expect_err("empty");
         assert!(matches!(err, CamLuaScaffoldError::InvalidPersonaId(_)));
 
-        let err =
-            scaffold_cam_lua("foo/bar", "scene", None, Some("t"), &root, false, None).expect_err("slash");
+        let err = scaffold_cam_lua("foo/bar", "scene", None, Some("t"), &root, false, None)
+            .expect_err("slash");
         assert!(matches!(err, CamLuaScaffoldError::InvalidPersonaId(_)));
     }
 

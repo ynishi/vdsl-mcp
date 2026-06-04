@@ -1456,9 +1456,7 @@ fn build_service_launch_cmd(platform: &ServicePlatform) -> Result<String, Profil
                     )));
                 }
             }
-            let mut cmd = format!(
-                "(cd \"{repo_dir}\" && \"{py}\" server_fastapi.py --port {port}"
-            );
+            let mut cmd = format!("(cd \"{repo_dir}\" && \"{py}\" server_fastapi.py --port {port}");
             for a in extra_args {
                 cmd.push(' ');
                 cmd.push_str(a);

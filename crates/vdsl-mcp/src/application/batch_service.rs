@@ -396,10 +396,7 @@ async fn dispatch_exec_bg(
         let mut poll_err = None;
         let mut status_text = String::new();
         for attempt in 0..=MAX_POLL_RETRIES {
-            match server
-                .task_status(Parameters(status_req.clone()))
-                .await
-            {
+            match server.task_status(Parameters(status_req.clone())).await {
                 Ok(result) => match extract_result(result) {
                     Ok(text) => {
                         status_text = text;
