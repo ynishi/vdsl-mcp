@@ -810,13 +810,19 @@ fn disk_check_path() -> String {
 /// generous: pulling a single SDXL checkpoint is ~7 GB, but a Profile apply
 /// commonly stages 5-10+ models plus working set, and shrinking a RunPod
 /// network volume after the fact is impossible.
+///
+/// `min_gb_override` lets callers (e.g. `vdsl_profile_apply` with a
+/// `disk_avail_min_gb` request field) supply a per-call threshold without
+/// touching the env. Precedence: override > env (`VDSL_DISK_AVAIL_MIN_GB`) >
+/// `DEFAULT_DISK_AVAIL_MIN_GB`.
 async fn precheck_disk_avail(
     svc: &PodService,
     pod_id: &str,
     ssh_key: &str,
+    min_gb_override: Option<u32>,
 ) -> Result<(), McpError> {
     let path = disk_check_path();
-    let min_gb = disk_avail_min_gb();
+    let min_gb = min_gb_override.unwrap_or_else(disk_avail_min_gb);
     let df_cmd = format!(
         "df -BG {} | tail -1 | awk '{{print $4}}' | sed 's/G$//'",
         path
@@ -2105,6 +2111,19 @@ pub struct VdslProfileApplyRequest {
     /// `vdsl_profile_apply_status(task_id)`.
     #[serde(default)]
     pub dry_run: bool,
+
+    /// Per-call override for the SSH disk precheck threshold (GB on
+    /// `/workspace`, or `VDSL_DISK_CHECK_PATH`). When `None`, the env
+    /// (`VDSL_DISK_AVAIL_MIN_GB`) or the built-in default (300 GB) applies.
+    ///
+    /// Use a smaller value (e.g. 50) when the target Profile is known to fit
+    /// in a 100 GB workspace (cam_base v5: ~20 GB of checkpoints + venv +
+    /// custom_nodes). The built-in 300 GB default is sized for multi-LoRA /
+    /// multi-checkpoint stacks where shrinking a RunPod network volume after
+    /// the fact is impossible — keep that as the default, override
+    /// per-Profile when smaller is known-safe.
+    #[serde(default)]
+    pub disk_avail_min_gb: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -4604,7 +4623,7 @@ impl VdslMcpServer {
         let dir_name =
             resolve_model_dir(&req.target).map_err(|e| McpError::invalid_params(e, None))?;
 
-        precheck_disk_avail(&svc, &req.pod_id, &ssh_key).await?;
+        precheck_disk_avail(&svc, &req.pod_id, &ssh_key, None).await?;
 
         let comfy_base = resolve_comfy_base(req.comfy_base.as_deref(), &req.pod_id).await?;
         let dest = format!("{comfy_base}/models/{dir_name}/");
@@ -6323,7 +6342,7 @@ impl VdslMcpServer {
         if !req.dry_run {
             let pod_svc = Self::pod_service()?;
             let ssh_key = resolve_ssh_key(None);
-            precheck_disk_avail(&pod_svc, &req.pod_id, &ssh_key).await?;
+            precheck_disk_avail(&pod_svc, &req.pod_id, &ssh_key, req.disk_avail_min_gb).await?;
         }
 
         let svc = BatchService::new(self.clone());
@@ -11144,6 +11163,23 @@ mod tests {
         assert!(req.manifest.is_none());
         assert!(req.script_file.is_none());
         assert!(req.code.is_some());
+    }
+
+    #[test]
+    fn profile_apply_request_disk_avail_min_gb_parses() {
+        // Per-call override for the SSH disk precheck threshold.
+        let req: VdslProfileApplyRequest = serde_json::from_str(
+            r#"{"script_file":"/tmp/profile.lua","pod_id":"pod_abc","disk_avail_min_gb":50}"#,
+        )
+        .unwrap();
+        assert_eq!(req.disk_avail_min_gb, Some(50));
+
+        // Omitted field defaults to None (env / built-in default applies).
+        let req: VdslProfileApplyRequest = serde_json::from_str(
+            r#"{"script_file":"/tmp/profile.lua","pod_id":"pod_abc"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.disk_avail_min_gb, None);
     }
 
     #[test]
