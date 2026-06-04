@@ -11175,10 +11175,9 @@ mod tests {
         assert_eq!(req.disk_avail_min_gb, Some(50));
 
         // Omitted field defaults to None (env / built-in default applies).
-        let req: VdslProfileApplyRequest = serde_json::from_str(
-            r#"{"script_file":"/tmp/profile.lua","pod_id":"pod_abc"}"#,
-        )
-        .unwrap();
+        let req: VdslProfileApplyRequest =
+            serde_json::from_str(r#"{"script_file":"/tmp/profile.lua","pod_id":"pod_abc"}"#)
+                .unwrap();
         assert_eq!(req.disk_avail_min_gb, None);
     }
 
