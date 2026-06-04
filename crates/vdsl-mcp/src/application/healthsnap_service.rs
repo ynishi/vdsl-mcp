@@ -20,12 +20,17 @@ const DEFAULT_WIDTH: u32 = 1024;
 const DEFAULT_HEIGHT: u32 = 1024;
 const DEFAULT_STEPS: u32 = 20;
 const DEFAULT_SEED: u64 = 1;
-const DEFAULT_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_TIMEOUT_SECS: u64 = 90;
+const DEFAULT_ATTEMPTS: u32 = 3;
 const POLL_INTERVAL_SECS: u64 = 1;
+const RETRY_BACKOFF_SECS: u64 = 2;
 const HEALTHSNAP_FILENAME_PREFIX: &str = "ComfyUI_healthsnap";
 
 /// Structured failure mode. Each variant maps to one Driver Loop step so
-/// callers can route on the cause without parsing free text.
+/// callers can route on the cause without parsing free text. Variants are
+/// split into "retriable" (transient ComfyUI / pod state) and "fatal"
+/// (caller error or pod state that won't change between attempts); the
+/// retry loop in [`run_healthsnap`] uses [`HealthsnapError::is_retriable`].
 #[derive(Debug, thiserror::Error)]
 pub enum HealthsnapError {
     #[error("system_stats fail: {0}")]
@@ -53,6 +58,35 @@ pub enum HealthsnapError {
     DownloadFail(String),
     #[error("save_dir create fail: {0}")]
     SaveDirFail(String),
+    #[error("all {attempts} attempts failed; last error: {last}")]
+    AllAttemptsFailed {
+        attempts: u32,
+        last: Box<HealthsnapError>,
+    },
+}
+
+impl HealthsnapError {
+    /// Whether this error should be retried on a subsequent attempt.
+    ///
+    /// Retriable: transient ComfyUI / pod state (timeout, HTTP fail, mid-run
+    /// exceptions like BrokenPipeError in tqdm).
+    ///
+    /// Fatal: caller error or pod state that won't change between attempts —
+    /// checkpoint not found, no checkpoints on pod, save_dir creation fail,
+    /// or already an `AllAttemptsFailed` (don't double-wrap).
+    pub fn is_retriable(&self) -> bool {
+        matches!(
+            self,
+            HealthsnapError::SystemStatsFail(_)
+                | HealthsnapError::ObjectInfoFail(_)
+                | HealthsnapError::WorkflowFail(_)
+                | HealthsnapError::HistoryPollFail(_)
+                | HealthsnapError::GenerateTimeout(_)
+                | HealthsnapError::GenerateError(_)
+                | HealthsnapError::NoOutputImage
+                | HealthsnapError::DownloadFail(_)
+        )
+    }
 }
 
 /// Parameters for one health-check shot, with all defaults resolved.
@@ -66,7 +100,10 @@ pub struct HealthsnapParams {
     pub width: u32,
     pub height: u32,
     pub steps: u32,
+    /// Per-attempt timeout (queue accept → generate → download).
     pub timeout_secs: u64,
+    /// Total number of attempts. `1` disables retry. Default `3`.
+    pub attempts: u32,
 }
 
 impl HealthsnapParams {
@@ -82,6 +119,7 @@ impl HealthsnapParams {
         height: Option<u32>,
         steps: Option<u32>,
         timeout_secs: Option<u64>,
+        attempts: Option<u32>,
     ) -> Self {
         Self {
             prompt: prompt.unwrap_or_else(|| DEFAULT_PROMPT.to_string()),
@@ -95,6 +133,7 @@ impl HealthsnapParams {
             height: height.unwrap_or(DEFAULT_HEIGHT),
             steps: steps.unwrap_or(DEFAULT_STEPS),
             timeout_secs: timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+            attempts: attempts.unwrap_or(DEFAULT_ATTEMPTS).max(1),
         }
     }
 }
@@ -238,6 +277,10 @@ pub fn first_output_image(entry: &serde_json::Value) -> Option<(String, String)>
 }
 
 /// Inspect a history `status` block for an `execution_error` message.
+///
+/// The message tuple is `[event_name, data]` per ComfyUI `add_message` calls
+/// in `execution.py`. We extract the data half so callers see `node_id`,
+/// `exception_type`, `exception_message`, and `traceback`.
 pub fn extract_execution_error(status: &serde_json::Value) -> Option<String> {
     status
         .get("messages")
@@ -254,14 +297,47 @@ pub fn extract_execution_error(status: &serde_json::Value) -> Option<String> {
         })
 }
 
-/// Run one healthsnap end-to-end against an already-resolved ComfyUI client.
+/// Decision per ComfyUI history entry's `status` block. Returns
+/// `Some(Ok(()))` for terminal success, `Some(Err(_))` for terminal failure,
+/// `None` when still in flight (caller keeps polling).
+///
+/// Canonical authority: ComfyUI `execution.py` `ExecutionStatus` —
+/// `status_str: Literal['success', 'error']`. The `completed` boolean is
+/// false on error, so callers that key on `completed` alone silently miss
+/// terminal failures (root cause of the previous false-GenerateTimeout
+/// behavior). Unknown `status_str` values are treated as not-yet-terminal so
+/// a future ComfyUI extension doesn't crash older clients.
+pub fn status_terminal(status: &serde_json::Value) -> Option<Result<(), HealthsnapError>> {
+    let status_str = status.get("status_str").and_then(|s| s.as_str())?;
+    match status_str {
+        "success" => Some(Ok(())),
+        "error" => {
+            let detail = extract_execution_error(status).unwrap_or_else(|| {
+                format!("status_str=error (no execution_error message); status: {status}")
+            });
+            Some(Err(HealthsnapError::GenerateError(detail)))
+        }
+        _ => None,
+    }
+}
+
+/// Run one healthsnap end-to-end with retry semantics.
+///
+/// Pre-checks (system_stats, object_info, checkpoint pick) run **once** and
+/// their failures short-circuit without retry (they're caller error or pod
+/// configuration — they won't change between attempts). Queue → poll →
+/// download runs up to `params.attempts` times with `RETRY_BACKOFF_SECS`
+/// between attempts. Retry is governed by [`HealthsnapError::is_retriable`].
+/// A non-retriable failure surfaces immediately; an exhausted retriable
+/// failure is wrapped in [`HealthsnapError::AllAttemptsFailed`] so callers
+/// can distinguish "0 ≤ N attempts succeeded" from "first attempt fatal".
 pub async fn run_healthsnap(
     client: &ComfyUiClient,
     params: &HealthsnapParams,
 ) -> Result<HealthsnapResult, HealthsnapError> {
     let started = std::time::Instant::now();
 
-    // 1. system_stats — proves ComfyUI is up and parseable.
+    // Pre-checks (no retry).
     let stats = client
         .system_stats()
         .await
@@ -273,7 +349,6 @@ pub async fn run_healthsnap(
         .unwrap_or("unknown")
         .to_string();
 
-    // 2. checkpoint — explicit request wins, else first available.
     let info = client
         .object_info()
         .await
@@ -281,7 +356,6 @@ pub async fn run_healthsnap(
     let available = extract_checkpoints(&info);
     let checkpoint = pick_checkpoint(params.checkpoint.as_deref(), &available)?;
 
-    // 3. workflow.
     let workflow = build_workflow_json(
         &checkpoint,
         &params.prompt,
@@ -292,9 +366,53 @@ pub async fn run_healthsnap(
         params.seed,
     );
 
-    // 4. queue.
+    // Retry loop over queue → poll → download.
+    for attempt in 1..=params.attempts {
+        match run_attempt(client, &workflow, params).await {
+            Ok((image_path, _)) => {
+                return Ok(HealthsnapResult {
+                    checkpoint,
+                    prompt: params.prompt.clone(),
+                    image_path,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    comfyui_version,
+                });
+            }
+            Err(e) => {
+                if !e.is_retriable() {
+                    return Err(e);
+                }
+                if attempt == params.attempts {
+                    return Err(HealthsnapError::AllAttemptsFailed {
+                        attempts: params.attempts,
+                        last: Box::new(e),
+                    });
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(RETRY_BACKOFF_SECS)).await;
+            }
+        }
+    }
+
+    // Unreachable: `attempts >= 1` per HealthsnapParams::build.
+    Err(HealthsnapError::WorkflowFail(
+        "internal: retry loop exited without verdict".into(),
+    ))
+}
+
+/// One attempt: POST /prompt → poll history → download image.
+///
+/// Returns `(image_path, prompt_id)` on success. Each call gets its own
+/// prompt_id (ComfyUI doesn't share state between re-submissions); after
+/// the first attempt the checkpoint should be warm-cached and the second
+/// attempt typically completes in <30 s on A40-class hardware.
+async fn run_attempt(
+    client: &ComfyUiClient,
+    workflow: &serde_json::Value,
+    params: &HealthsnapParams,
+) -> Result<(PathBuf, String), HealthsnapError> {
+    // Queue.
     let resp = client
-        .post_prompt(&workflow)
+        .post_prompt(workflow)
         .await
         .map_err(|e| HealthsnapError::WorkflowFail(e.to_string()))?;
     let prompt_id = resp["prompt_id"]
@@ -302,7 +420,7 @@ pub async fn run_healthsnap(
         .ok_or_else(|| HealthsnapError::WorkflowFail(format!("no prompt_id in response: {resp}")))?
         .to_string();
 
-    // 5. poll history for completion.
+    // Poll history.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(params.timeout_secs);
     let interval = std::time::Duration::from_secs(POLL_INTERVAL_SECS);
     let entry = loop {
@@ -312,10 +430,8 @@ pub async fn run_healthsnap(
             .map_err(|e| HealthsnapError::HistoryPollFail(e.to_string()))?;
         if let Some(entry) = history.get(&prompt_id) {
             if let Some(status) = entry.get("status") {
-                if status["completed"].as_bool().unwrap_or(false) {
-                    if let Some(err_msg) = extract_execution_error(status) {
-                        return Err(HealthsnapError::GenerateError(err_msg));
-                    }
+                if let Some(verdict) = status_terminal(status) {
+                    verdict?;
                     break entry.clone();
                 }
             }
@@ -326,15 +442,13 @@ pub async fn run_healthsnap(
         tokio::time::sleep(interval).await;
     };
 
-    // 6. find the output image.
+    // Output image.
     let (filename, subfolder) = first_output_image(&entry).ok_or(HealthsnapError::NoOutputImage)?;
 
-    // 7. ensure save_dir.
+    // Save dir + download.
     tokio::fs::create_dir_all(&params.save_dir)
         .await
         .map_err(|e| HealthsnapError::SaveDirFail(e.to_string()))?;
-
-    // 8. download.
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let safe_name = filename.replace(['/', '\\'], "_");
     let dest = params.save_dir.join(format!("healthsnap_{ts}_{safe_name}"));
@@ -343,13 +457,7 @@ pub async fn run_healthsnap(
         .await
         .map_err(|e| HealthsnapError::DownloadFail(e.to_string()))?;
 
-    Ok(HealthsnapResult {
-        checkpoint,
-        prompt: params.prompt.clone(),
-        image_path: dest,
-        duration_ms: started.elapsed().as_millis() as u64,
-        comfyui_version,
-    })
+    Ok((dest, prompt_id))
 }
 
 #[cfg(test)]
@@ -527,7 +635,7 @@ mod tests {
 
     #[test]
     fn params_build_applies_all_defaults_when_none() {
-        let p = HealthsnapParams::build(None, None, None, None, None, None, None, None, None);
+        let p = HealthsnapParams::build(None, None, None, None, None, None, None, None, None, None);
         assert_eq!(p.prompt, DEFAULT_PROMPT);
         assert_eq!(p.negative, DEFAULT_NEGATIVE);
         assert!(p.checkpoint.is_none());
@@ -536,6 +644,7 @@ mod tests {
         assert_eq!(p.height, DEFAULT_HEIGHT);
         assert_eq!(p.steps, DEFAULT_STEPS);
         assert_eq!(p.timeout_secs, DEFAULT_TIMEOUT_SECS);
+        assert_eq!(p.attempts, DEFAULT_ATTEMPTS);
         assert!(p.save_dir.ends_with("vdsl_healthsnap"));
     }
 
@@ -551,6 +660,7 @@ mod tests {
             Some(768),
             Some(10),
             Some(60),
+            Some(5),
         );
         assert_eq!(p.prompt, "custom prompt");
         assert_eq!(p.negative, "custom negative");
@@ -561,5 +671,122 @@ mod tests {
         assert_eq!(p.height, 768);
         assert_eq!(p.steps, 10);
         assert_eq!(p.timeout_secs, 60);
+        assert_eq!(p.attempts, 5);
+    }
+
+    #[test]
+    fn params_build_clamps_zero_attempts_to_one() {
+        // attempts == 0 is meaningless (the retry loop would never run) and
+        // would unreachable-panic; build() floors at 1.
+        let p = HealthsnapParams::build(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(0),
+        );
+        assert_eq!(p.attempts, 1);
+    }
+
+    #[test]
+    fn status_terminal_success_returns_ok() {
+        let status = serde_json::json!({
+            "status_str": "success",
+            "completed": true,
+            "messages": [["execution_start", {}], ["execution_success", {}]]
+        });
+        let verdict = status_terminal(&status).expect("terminal");
+        assert!(verdict.is_ok());
+    }
+
+    #[test]
+    fn status_terminal_error_returns_generate_error_with_detail() {
+        // ComfyUI sets completed=false on error; we must still classify as terminal.
+        let status = serde_json::json!({
+            "status_str": "error",
+            "completed": false,
+            "messages": [
+                ["execution_start", {}],
+                ["execution_error", {
+                    "prompt_id": "abc",
+                    "node_id": "5",
+                    "node_type": "KSampler",
+                    "exception_type": "BrokenPipeError",
+                    "exception_message": "[Errno 32] Broken pipe"
+                }]
+            ]
+        });
+        let verdict = status_terminal(&status).expect("terminal");
+        match verdict {
+            Err(HealthsnapError::GenerateError(msg)) => {
+                assert!(msg.contains("execution_error"));
+                assert!(msg.contains("BrokenPipeError"));
+                assert!(msg.contains("KSampler"));
+            }
+            other => panic!("expected GenerateError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_terminal_error_without_message_falls_back_to_status_snapshot() {
+        let status = serde_json::json!({
+            "status_str": "error",
+            "completed": false,
+            "messages": []
+        });
+        let verdict = status_terminal(&status).expect("terminal");
+        match verdict {
+            Err(HealthsnapError::GenerateError(msg)) => {
+                assert!(msg.contains("status_str=error"));
+            }
+            other => panic!("expected GenerateError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_terminal_in_flight_returns_none() {
+        let status = serde_json::json!({ "completed": false });
+        assert!(status_terminal(&status).is_none());
+    }
+
+    #[test]
+    fn status_terminal_unknown_status_str_returns_none() {
+        // Forward-compat: an unfamiliar status_str (e.g. ComfyUI adds a
+        // 'cancelled' variant in the future) should not crash older clients;
+        // we keep polling and let the deadline catch it.
+        let status = serde_json::json!({ "status_str": "cancelled", "completed": false });
+        assert!(status_terminal(&status).is_none());
+    }
+
+    #[test]
+    fn is_retriable_classifies_each_variant_correctly() {
+        // Retriable: transient pod / ComfyUI state.
+        assert!(HealthsnapError::SystemStatsFail("x".into()).is_retriable());
+        assert!(HealthsnapError::ObjectInfoFail("x".into()).is_retriable());
+        assert!(HealthsnapError::WorkflowFail("x".into()).is_retriable());
+        assert!(HealthsnapError::HistoryPollFail("x".into()).is_retriable());
+        assert!(HealthsnapError::GenerateTimeout(90).is_retriable());
+        assert!(HealthsnapError::GenerateError("x".into()).is_retriable());
+        assert!(HealthsnapError::NoOutputImage.is_retriable());
+        assert!(HealthsnapError::DownloadFail("x".into()).is_retriable());
+
+        // Fatal: caller error / pod config — retrying won't help.
+        assert!(!HealthsnapError::NoCheckpoint.is_retriable());
+        assert!(!HealthsnapError::CheckpointNotFound {
+            requested: "x".into(),
+            available: "".into()
+        }
+        .is_retriable());
+        assert!(!HealthsnapError::SaveDirFail("x".into()).is_retriable());
+        assert!(!HealthsnapError::AllAttemptsFailed {
+            attempts: 3,
+            last: Box::new(HealthsnapError::NoOutputImage)
+        }
+        .is_retriable());
     }
 }

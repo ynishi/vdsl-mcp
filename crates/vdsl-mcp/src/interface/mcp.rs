@@ -1662,8 +1662,17 @@ pub struct VdslHealthsnapRequest {
     /// KSampler steps. Default: 20.
     pub steps: Option<u32>,
 
-    /// End-to-end timeout in seconds (queue + generate + download). Default: 120.
+    /// Per-attempt timeout in seconds (queue + generate + download for one
+    /// attempt). Default: 90. With 3 attempts that gives a 270 s wall-clock
+    /// ceiling; on a warm pod the second attempt typically completes in
+    /// <30 s because the checkpoint is already cached.
     pub timeout_secs: Option<u64>,
+
+    /// Number of attempts (>=1). Default: 3 — if all three retriable
+    /// failures hit in a row the call returns `AllAttemptsFailed`; fatal
+    /// failures (no checkpoint, save_dir create fail, ...) short-circuit
+    /// after the first attempt regardless of this value.
+    pub attempts: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3478,12 +3487,14 @@ impl VdslMcpServer {
             no custom nodes. If `checkpoint` is omitted, the first checkpoint \
             reported by /object_info on the pod is used. \
             Defaults: prompt=\"a single flower in a vase, simple background\", 1024×1024, 20 steps, \
-            seed=1, timeout=120s, save_dir=<temp_dir>/vdsl_healthsnap. \
-            Every step (system_stats / object_info / queue / poll / download) maps to a distinct \
-            structured error; callers should not retry / install dependencies / mutate pod state on \
-            failure — just report and decide upstream. \
-            Use case: 'is the pod actually producing images right now?' readiness check before \
-            committing to a heavier workflow.",
+            seed=1, timeout_secs=90 per attempt, attempts=3, save_dir=<temp_dir>/vdsl_healthsnap. \
+            Terminal detection follows ComfyUI canonical semantics: \
+            ExecutionStatus.status_str ∈ {'success', 'error'} (execution.py); 'error' is treated \
+            as terminal regardless of status.completed. Per-step structured errors \
+            (SystemStatsFail / NoCheckpoint / WorkflowFail / GenerateTimeout / GenerateError / \
+            AllAttemptsFailed); retriable errors retry up to `attempts` times, fatal errors \
+            short-circuit. Use case: 'is the pod actually producing images right now?' readiness \
+            check — if 3 attempts in a row fail the pod / endpoint is genuinely broken.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3507,6 +3518,7 @@ impl VdslMcpServer {
             req.height,
             req.steps,
             req.timeout_secs,
+            req.attempts,
         );
 
         let result = healthsnap_service::run_healthsnap(&client, &params)
