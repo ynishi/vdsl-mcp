@@ -21,6 +21,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
+use crate::application::healthsnap_service::{self, HealthsnapParams};
 use crate::application::pod_service::{resolve_api_key, PodService};
 use crate::application::storage_service::{self, StorageService, RCLONE_OP_TIMEOUT_SECS};
 use crate::domain::models::{
@@ -1624,6 +1625,45 @@ pub struct VdslGenerateRequest {
     /// rejected at runtime with McpError::invalid_params; when only one is Some,
     /// that one is honored).
     pub seed_sweep: Option<Vec<i64>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VdslHealthsnapRequest {
+    /// ComfyUI URL (e.g. "https://pod_id-8188.proxy.runpod.net").
+    pub url: Option<String>,
+
+    /// RunPod pod ID. Proxy URL is auto-constructed. Takes precedence over url.
+    pub pod_id: Option<String>,
+
+    /// Positive prompt. Default: "a single flower in a vase, simple background".
+    pub prompt: Option<String>,
+
+    /// Negative prompt. Default: "blurry, low quality, watermark, text".
+    pub negative: Option<String>,
+
+    /// Checkpoint to use. If omitted, the first checkpoint reported by
+    /// `/object_info` on the pod is chosen. If specified but missing on pod,
+    /// the call fails with a structured CheckpointNotFound error.
+    pub checkpoint: Option<String>,
+
+    /// Local directory to save the resulting PNG. Default:
+    /// `<temp_dir>/vdsl_healthsnap`. Created if missing.
+    pub save_dir: Option<String>,
+
+    /// KSampler seed. Default: 1.
+    pub seed: Option<u64>,
+
+    /// Image width. Default: 1024.
+    pub width: Option<u32>,
+
+    /// Image height. Default: 1024.
+    pub height: Option<u32>,
+
+    /// KSampler steps. Default: 20.
+    pub steps: Option<u32>,
+
+    /// End-to-end timeout in seconds (queue + generate + download). Default: 120.
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3428,6 +3468,62 @@ impl VdslMcpServer {
         ));
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    #[tool(
+        name = "vdsl_healthsnap",
+        description = "[gen] Render one image with a minimal SDXL workflow against a ComfyUI \
+            endpoint. Pure smoke test: 7 native ComfyUI nodes (CheckpointLoader → CLIPTextEncode × 2 → \
+            EmptyLatentImage → KSampler → VAEDecode → SaveImage), no VDSL Lua DSL, no catalog, \
+            no custom nodes. If `checkpoint` is omitted, the first checkpoint \
+            reported by /object_info on the pod is used. \
+            Defaults: prompt=\"a single flower in a vase, simple background\", 1024×1024, 20 steps, \
+            seed=1, timeout=120s, save_dir=<temp_dir>/vdsl_healthsnap. \
+            Every step (system_stats / object_info / queue / poll / download) maps to a distinct \
+            structured error; callers should not retry / install dependencies / mutate pod state on \
+            failure — just report and decide upstream. \
+            Use case: 'is the pod actually producing images right now?' readiness check before \
+            committing to a heavier workflow.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn healthsnap(
+        &self,
+        Parameters(req): Parameters<VdslHealthsnapRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let url = self.resolve_comfyui_url(req.pod_id.as_deref(), req.url.as_deref())?;
+        let client = Self::comfyui_client(url.clone())?;
+
+        let params = HealthsnapParams::build(
+            req.prompt,
+            req.negative,
+            req.checkpoint,
+            req.save_dir,
+            req.seed,
+            req.width,
+            req.height,
+            req.steps,
+            req.timeout_secs,
+        );
+
+        let result = healthsnap_service::run_healthsnap(&client, &params)
+            .await
+            .map_err(|e| McpError::internal_error(format!("vdsl_healthsnap: {e}"), None))?;
+
+        let response = serde_json::json!({
+            "url": url,
+            "checkpoint": result.checkpoint,
+            "prompt": result.prompt,
+            "image_path": result.image_path.display().to_string(),
+            "duration_ms": result.duration_ms,
+            "comfyui_version": result.comfyui_version,
+        });
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&response).unwrap_or_else(|_| format!("{response:?}")),
+        )]))
     }
 
     #[tool(
@@ -11163,6 +11259,53 @@ mod tests {
         assert!(req.manifest.is_none());
         assert!(req.script_file.is_none());
         assert!(req.code.is_some());
+    }
+
+    #[test]
+    fn healthsnap_request_minimum_fields_parse() {
+        // url only — all other fields optional, defaults applied at service layer.
+        let req: VdslHealthsnapRequest =
+            serde_json::from_str(r#"{"url":"https://pod_abc-8188.proxy.runpod.net"}"#).unwrap();
+        assert_eq!(
+            req.url.as_deref(),
+            Some("https://pod_abc-8188.proxy.runpod.net")
+        );
+        assert!(req.prompt.is_none());
+        assert!(req.checkpoint.is_none());
+        assert!(req.save_dir.is_none());
+        assert!(req.seed.is_none());
+        assert!(req.timeout_secs.is_none());
+    }
+
+    #[test]
+    fn healthsnap_request_full_payload_parses() {
+        let req: VdslHealthsnapRequest = serde_json::from_str(
+            r#"{
+                "pod_id":"pod_abc",
+                "prompt":"a robot reading a book",
+                "negative":"blurry, deformed",
+                "checkpoint":"waiIllustrious_v16.safetensors",
+                "save_dir":"/tmp/myhealth",
+                "seed":42,
+                "width":768,
+                "height":768,
+                "steps":15,
+                "timeout_secs":60
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(req.pod_id.as_deref(), Some("pod_abc"));
+        assert_eq!(req.prompt.as_deref(), Some("a robot reading a book"));
+        assert_eq!(
+            req.checkpoint.as_deref(),
+            Some("waiIllustrious_v16.safetensors")
+        );
+        assert_eq!(req.save_dir.as_deref(), Some("/tmp/myhealth"));
+        assert_eq!(req.seed, Some(42));
+        assert_eq!(req.width, Some(768));
+        assert_eq!(req.height, Some(768));
+        assert_eq!(req.steps, Some(15));
+        assert_eq!(req.timeout_secs, Some(60));
     }
 
     #[test]

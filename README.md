@@ -27,6 +27,7 @@ RunPod GPU provisioning, ComfyUI orchestration, and model management — all acc
 | **Generation** | |
 | `vdsl_generate` | Queue a workflow JSON and wait for completion; supports `n` (repeat N times) and `seed_sweep` (seed list) for multi-shot generation — returns a flat `saved_paths` list; `save_dir` is auto-created if missing |
 | `vdsl_batch_generate` | Submit multiple workflows, poll all, download outputs; supports `n` and `seed_sweep` applied as a cartesian product per workflow; `save_dir` is auto-created if missing |
+| `vdsl_healthsnap` | Render one image with a minimal 7-node SDXL workflow as a smoke test; no Lua DSL / catalog / custom nodes; default prompt = "a single flower in a vase, simple background"; if no `checkpoint` given, the first one reported by `/object_info` is used. Per-step structured errors (`SystemStatsFail`, `NoCheckpoint`, `WorkflowFail`, `GenerateTimeout`, ...) — callers should not retry / install dependencies / mutate pod state on failure |
 | `vdsl_run` | Compile Lua script → ComfyUI workflow → generate (supports pipelines, judge gates); runs in background by default |
 | `vdsl_run_status` | Poll the status of a background `vdsl_run` job |
 | `vdsl_run_script` | Run a Lua script (no generation — script-only execution) |

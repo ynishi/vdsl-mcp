@@ -1,6 +1,7 @@
 pub mod apply_registry;
 pub mod batch_service;
 pub mod error;
+pub mod healthsnap_service;
 pub mod pod_service;
 pub mod profile_service;
 pub mod run_registry;
