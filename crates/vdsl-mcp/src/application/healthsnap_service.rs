@@ -323,60 +323,31 @@ pub fn status_terminal(status: &serde_json::Value) -> Option<Result<(), Healthsn
 
 /// Run one healthsnap end-to-end with retry semantics.
 ///
-/// Pre-checks (system_stats, object_info, checkpoint pick) run **once** and
-/// their failures short-circuit without retry (they're caller error or pod
-/// configuration — they won't change between attempts). Queue → poll →
-/// download runs up to `params.attempts` times with `RETRY_BACKOFF_SECS`
-/// between attempts. Retry is governed by [`HealthsnapError::is_retriable`].
-/// A non-retriable failure surfaces immediately; an exhausted retriable
-/// failure is wrapped in [`HealthsnapError::AllAttemptsFailed`] so callers
-/// can distinguish "0 ≤ N attempts succeeded" from "first attempt fatal".
+/// Each attempt runs the **full pipeline** — system_stats, object_info,
+/// checkpoint pick, queue, poll, download. A cold pod whose proxy returns
+/// HTTP 502 during warmup is a `SystemStatsFail` (retriable), so the retry
+/// loop will catch it and try again after `RETRY_BACKOFF_SECS`. Caller error
+/// / pod configuration failures (NoCheckpoint, CheckpointNotFound,
+/// SaveDirFail) are `is_retriable() == false` and short-circuit on the
+/// first attempt regardless of `attempts`. Exhausted retriable failures
+/// surface as [`HealthsnapError::AllAttemptsFailed`] carrying the last
+/// underlying error for diagnostics.
+///
+/// The redundant HTTP cost of re-running pre-checks per attempt (one
+/// `/system_stats` + one `/object_info`) is ~200 ms on a warm pod and only
+/// paid on retry; the alternative (compute-once-outside-loop) silently
+/// short-circuited warmup-transient failures and was removed.
 pub async fn run_healthsnap(
     client: &ComfyUiClient,
     params: &HealthsnapParams,
 ) -> Result<HealthsnapResult, HealthsnapError> {
     let started = std::time::Instant::now();
 
-    // Pre-checks (no retry).
-    let stats = client
-        .system_stats()
-        .await
-        .map_err(|e| HealthsnapError::SystemStatsFail(e.to_string()))?;
-    let comfyui_version = stats
-        .get("system")
-        .and_then(|s| s.get("comfyui_version"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    let info = client
-        .object_info()
-        .await
-        .map_err(|e| HealthsnapError::ObjectInfoFail(e.to_string()))?;
-    let available = extract_checkpoints(&info);
-    let checkpoint = pick_checkpoint(params.checkpoint.as_deref(), &available)?;
-
-    let workflow = build_workflow_json(
-        &checkpoint,
-        &params.prompt,
-        &params.negative,
-        params.width,
-        params.height,
-        params.steps,
-        params.seed,
-    );
-
-    // Retry loop over queue → poll → download.
     for attempt in 1..=params.attempts {
-        match run_attempt(client, &workflow, params).await {
-            Ok((image_path, _)) => {
-                return Ok(HealthsnapResult {
-                    checkpoint,
-                    prompt: params.prompt.clone(),
-                    image_path,
-                    duration_ms: started.elapsed().as_millis() as u64,
-                    comfyui_version,
-                });
+        match run_attempt(client, params).await {
+            Ok(mut result) => {
+                result.duration_ms = started.elapsed().as_millis() as u64;
+                return Ok(result);
             }
             Err(e) => {
                 if !e.is_retriable() {
@@ -399,20 +370,52 @@ pub async fn run_healthsnap(
     ))
 }
 
-/// One attempt: POST /prompt → poll history → download image.
+/// One full pipeline attempt: pre-checks → workflow build → queue → poll →
+/// download. Pre-checks live inside the attempt (and therefore inside the
+/// retry loop) so that warmup-transient HTTP 502 / 503 from the RunPod
+/// proxy is retried rather than short-circuited.
 ///
-/// Returns `(image_path, prompt_id)` on success. Each call gets its own
-/// prompt_id (ComfyUI doesn't share state between re-submissions); after
-/// the first attempt the checkpoint should be warm-cached and the second
-/// attempt typically completes in <30 s on A40-class hardware.
+/// `duration_ms` in the returned result is **0** here; the caller
+/// ([`run_healthsnap`]) overwrites it with the total wall-clock from the
+/// outer retry loop so the value reflects what the caller actually waited.
 async fn run_attempt(
     client: &ComfyUiClient,
-    workflow: &serde_json::Value,
     params: &HealthsnapParams,
-) -> Result<(PathBuf, String), HealthsnapError> {
-    // Queue.
+) -> Result<HealthsnapResult, HealthsnapError> {
+    // 1. system_stats.
+    let stats = client
+        .system_stats()
+        .await
+        .map_err(|e| HealthsnapError::SystemStatsFail(e.to_string()))?;
+    let comfyui_version = stats
+        .get("system")
+        .and_then(|s| s.get("comfyui_version"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    // 2. object_info → checkpoint.
+    let info = client
+        .object_info()
+        .await
+        .map_err(|e| HealthsnapError::ObjectInfoFail(e.to_string()))?;
+    let available = extract_checkpoints(&info);
+    let checkpoint = pick_checkpoint(params.checkpoint.as_deref(), &available)?;
+
+    // 3. workflow.
+    let workflow = build_workflow_json(
+        &checkpoint,
+        &params.prompt,
+        &params.negative,
+        params.width,
+        params.height,
+        params.steps,
+        params.seed,
+    );
+
+    // 4. queue.
     let resp = client
-        .post_prompt(workflow)
+        .post_prompt(&workflow)
         .await
         .map_err(|e| HealthsnapError::WorkflowFail(e.to_string()))?;
     let prompt_id = resp["prompt_id"]
@@ -420,7 +423,7 @@ async fn run_attempt(
         .ok_or_else(|| HealthsnapError::WorkflowFail(format!("no prompt_id in response: {resp}")))?
         .to_string();
 
-    // Poll history.
+    // 5. poll history.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(params.timeout_secs);
     let interval = std::time::Duration::from_secs(POLL_INTERVAL_SECS);
     let entry = loop {
@@ -442,10 +445,10 @@ async fn run_attempt(
         tokio::time::sleep(interval).await;
     };
 
-    // Output image.
+    // 6. output image.
     let (filename, subfolder) = first_output_image(&entry).ok_or(HealthsnapError::NoOutputImage)?;
 
-    // Save dir + download.
+    // 7. save dir + download.
     tokio::fs::create_dir_all(&params.save_dir)
         .await
         .map_err(|e| HealthsnapError::SaveDirFail(e.to_string()))?;
@@ -457,7 +460,14 @@ async fn run_attempt(
         .await
         .map_err(|e| HealthsnapError::DownloadFail(e.to_string()))?;
 
-    Ok((dest, prompt_id))
+    Ok(HealthsnapResult {
+        checkpoint,
+        prompt: params.prompt.clone(),
+        image_path: dest,
+        // Overwritten by run_healthsnap with the outer-loop wall clock.
+        duration_ms: 0,
+        comfyui_version,
+    })
 }
 
 #[cfg(test)]
