@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+
+- **mlua backend dependencies bumped** — `mlua` 0.11 → 0.12, `mlua-batteries` 0.2 → 0.6, `mlua-isle` 0.4 → 0.6. No source changes were needed; the backend only uses `mlua::prelude` and `mlua_batteries::register_all`. MSRV follows `mlua 0.12` (Rust 1.88).
+
 ### Added
 
 - **`vdsl_cam_lua_init`** — Scaffold a new cam Lua script at `<root>/<persona_id>_cam_<topic>.lua` that calls `vdsl.cam{...}` (the render/cast loop shape lives in the vdsl runtime, not in templated Rust strings). The base subject is resolved one of two ways: (1) an explicit `identity` spec — a flat Subject (`base_text` + `traits` + `negative_traits`) emitted as a `vdsl.subject(...)` chain (`base_source: identity`); or (2) when `identity` is omitted, a persona-specific base subject snippet resolved via a 3-tier persona base fallback (cam-skill base dir → legacy snap-skill base dir → thin default) so the generated skeleton is always persona-aware. Accepts optional `shots` (`VdslCamShotSpec[]` with `name`, `seed`, `trait_dsl` — `trait_dsl` is a Lua expression such as `C.figure.clothing.t_shirt` or `vdsl.trait("...")`) and `topic`; omitting either triggers sensible defaults. Creates the target directory automatically (`std::fs::create_dir_all`) and returns the absolute `script_file` path — callers never need a prior `mkdir` step or a `Write` tool. `overwrite=false` default refuses to replace an existing file. Returns `base_source` indicating which resolution path was used (`identity`, `file:<path>`, or `fallback:default`).
